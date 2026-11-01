@@ -6,7 +6,7 @@
 !--------------------------------------------------------------------------------------------------!
 
 ! **************************************************************************************************
-!> \brief Work states, quadrature and distributed-matrix helpers for periodic RI-RS GW.
+!> \brief Green functions, screening, self-energy and Gamma correction for periodic RI-RS GW.
 !> \author Jan Wilhelm (with help of ChatGPT, GPT-6 Sol and GPT-6 Astra)
 ! **************************************************************************************************
 MODULE gw_ri_rs_small_cell_full_kp_utils
@@ -14,8 +14,7 @@ MODULE gw_ri_rs_small_cell_full_kp_utils
                                               get_atomic_kind_set
    USE basis_set_types,                 ONLY: gto_basis_set_type
    USE cell_types,                      ONLY: cell_type,&
-                                              get_cell,&
-                                              pbc
+                                              get_cell
    USE cp_blacs_env,                    ONLY: cp_blacs_env_create,&
                                               cp_blacs_env_release,&
                                               cp_blacs_env_type
@@ -54,7 +53,6 @@ MODULE gw_ri_rs_small_cell_full_kp_utils
    USE distribution_2d_types,           ONLY: distribution_2d_type
    USE gw_auto_ri_types,                ONLY: auto_ri_type
    USE gw_utils_fm,                     ONLY: local_complex_power
-   USE ieee_arithmetic,                 ONLY: ieee_is_finite
    USE input_constants,                 ONLY: do_potential_coulomb,&
                                               do_potential_short,&
                                               do_potential_truncated,&
@@ -88,27 +86,20 @@ MODULE gw_ri_rs_small_cell_full_kp_utils
                                               z_one,&
                                               z_zero
    USE mathlib,                         ONLY: diag_complex,&
-                                              diamat_all,&
                                               gemm_square,&
                                               inv_3x3
    USE message_passing,                 ONLY: mp_comm_split_type_shared,&
                                               mp_comm_type,&
                                               mp_mem_avail_per_rank_GB,&
                                               mp_para_env_release,&
-                                              mp_para_env_type,&
-                                              mp_print_mem_per_rank,&
-                                              mp_request_type,&
-                                              mp_waitall
+                                              mp_para_env_type
    USE mp2_eri_gpw,                     ONLY: mp2_eri_2c_integrate_gpw
-   USE omp_lib,                         ONLY: omp_get_max_threads,&
-                                              omp_in_parallel
+   USE omp_lib,                         ONLY: omp_get_max_threads
    USE orbital_pointers,                ONLY: indco,&
-                                              ncoset,&
-                                              nso
+                                              ncoset
    USE parallel_gemm_api,               ONLY: parallel_gemm
    USE particle_methods,                ONLY: get_particle_set
    USE particle_types,                  ONLY: particle_type
-   USE physcon,                         ONLY: angstrom
    USE post_scf_bandstructure_types,    ONLY: post_scf_bandstructure_type
    USE qs_environment_types,            ONLY: get_qs_env,&
                                               qs_environment_type
@@ -127,8 +118,10 @@ MODULE gw_ri_rs_small_cell_full_kp_utils
    USE qs_tensors,                      ONLY: build_2c_integrals,&
                                               build_2c_neighbor_lists
    USE ri_rs_grid_setup,                ONLY: setup_ri_rs_grid
-   USE ri_rs_utils,                     ONLY: evaluate_ao_basis_on_points,&
-                                              precompute_ri_rs_radii
+   USE ri_rs_kp_fitting,                ONLY: compute_Z_lP_q,&
+                                              evaluate_mu_rl_R_values,&
+                                              lattice_phase
+   USE ri_rs_utils,                     ONLY: precompute_ri_rs_radii
 #include "./base/base_uses.f90"
 
    IMPLICIT NONE
@@ -145,8 +138,8 @@ MODULE gw_ri_rs_small_cell_full_kp_utils
              get_gw_work, release_gw_work
 
    ! Blocking limits and named slots in the six existing CP2K matrix workspaces.
-   INTEGER, PARAMETER :: tile_cols = 32
-   INTEGER, PARAMETER :: target_batch_size = 8, pair_batch_size = 256
+   INTEGER, PARAMETER :: column_block_cols = 32
+   INTEGER, PARAMETER :: kpoint_batch_size = 8, pair_batch_size = 256
    INTEGER, PARAMETER :: w_chi = 1, w_metric = 2, w_coulomb = 3, &
                          w_tmp = 4, w_dielectric = 5, w_output = 6
 
@@ -199,48 +192,6 @@ MODULE gw_ri_rs_small_cell_full_kp_utils
       COMPLEX(KIND=dp), ALLOCATABLE :: values(:, :, :)
    END TYPE ri_q_matrix_block_type
 
-   TYPE :: uniform_settings_type
-      REAL(dp) :: accuracy = 0.0_dp, spacing = 0.0_dp, padding = 0.0_dp, &
-                  l_block_edge = 0.0_dp
-      INTEGER :: counts(3) = 0
-      REAL(dp) :: lower(3) = 0.0_dp, origin(3) = 0.0_dp, step(3, 3) = 0.0_dp, weight = 0.0_dp
-   END TYPE uniform_settings_type
-
-   TYPE :: l_block_partition_type
-      INTEGER :: nblocks = 0
-      INTEGER, ALLOCATABLE :: first(:), indices(:)
-      REAL(dp), ALLOCATABLE :: lower(:, :), upper(:, :)
-   END TYPE l_block_partition_type
-
-   TYPE :: ao_image_type
-      TYPE(gto_basis_set_type), POINTER :: basis => NULL()
-      REAL(dp) :: center(3) = 0.0_dp
-      REAL(dp) :: bound = 0.0_dp, decay = 0.0_dp, radius2 = HUGE(0.0_dp)
-      REAL(dp), ALLOCATABLE :: primary(:, :)
-      INTEGER, ALLOCATABLE :: primary_l(:)
-      REAL(dp), ALLOCATABLE :: envelope_exponents(:), radial_envelope(:, :)
-   END TYPE ao_image_type
-
-   ! Per-atom interpolation tables for the existing libint_potential_type
-   ! Coulomb/erfc kernel. These are numerical cache data, not another kernel.
-   TYPE :: radial_interpolation_type
-      REAL(dp), ALLOCATABLE :: short_abscissae(:)
-      REAL(dp), ALLOCATABLE :: coefficients(:, :), series(:, :, :), short_series(:, :, :), short_moments(:, :, :, :)
-      ! Radial value and derivative, indexed (2, primitive/angular channel, squared-radius index).
-      REAL(dp), ALLOCATABLE :: mesh_moments(:, :, :)
-      INTEGER, ALLOCATABLE :: mesh_first(:, :), spherical_mesh_first(:, :)
-      ! An optional exact factorization of primitive Cartesian rows through spherical RI functions.
-      REAL(dp), ALLOCATABLE :: spherical_selection(:, :), spherical_angular(:, :, :, :), &
-                               spherical_primitive(:, :, :)
-      LOGICAL :: spherical_factorized = .FALSE.
-      REAL(dp) :: mesh_spacing = 0.0_dp, mesh_offset = 0.0_dp, mesh_exponent = 0.0_dp
-      REAL(dp) :: cutoff = 0.0_dp, attenuation = 0.0_dp
-   END TYPE radial_interpolation_type
-
-   TYPE :: radial_work_type
-      REAL(dp), ALLOCATABLE :: jet(:), gaussian(:), derivative(:), bracket(:)
-   END TYPE radial_work_type
-
    ! Work data shared by the periodic GW stages; input settings remain in bs_env.
    TYPE :: gwkp_type
       REAL(KIND=dp), ALLOCATABLE                 :: eigenvalues_G(:, :, :)
@@ -248,7 +199,7 @@ MODULE gw_ri_rs_small_cell_full_kp_utils
                                                    Z_lP_q(:, :, :), Z_lP_zero(:, :, :)
       REAL(dp), ALLOCATABLE                     :: sigma_c_bands(:, :, :, :, :), sigma_x_bands(:, :, :)
       REAL(dp), ALLOCATABLE                     :: ao_values(:, :, :)
-      COMPLEX(dp), ALLOCATABLE                  :: target_orbitals(:, :, :, :)
+      COMPLEX(dp), ALLOCATABLE                  :: band_orbitals(:, :, :, :)
       TYPE(mp_para_env_type), POINTER           :: group_env => NULL()
       INTEGER                                   :: ngroups = 1, my_group = 0
       TYPE(gamma_correction_type)               :: gamma_correction
@@ -357,8 +308,8 @@ CONTAINS
          CALL optimize_periodic_auto_ri_metric(qs_env, bs_env)
       END IF
       CALL setup_ri_rs_grid(bs_env, bs_env%ri_rs%grid_points)
-      CALL compute_Z_lP_small_cell_full_kp(bs_env, bs_env%ri_rs%grid_points, &
-                                           gwkp_env%ao_values, Z_lP_q=gwkp_env%Z_lP_q, Z_lP_zero=gwkp_env%Z_lP_zero)
+      CALL compute_Z_lP_q(bs_env, bs_env%ri_rs%grid_points, &
+                          gwkp_env%ao_values, Z_lP_q=gwkp_env%Z_lP_q, Z_lP_zero=gwkp_env%Z_lP_zero)
       CALL build_all_phi_k(bs_env, gwkp_env%ao_values, phi_lmu_k)
       CALL build_all_psi_k(bs_env, phi_lmu_k, gwkp_env%psi_lm_k)
       DEALLOCATE (phi_lmu_k)
@@ -395,7 +346,7 @@ CONTAINS
       DEALLOCATE (gwkp_env%ao_values)
 
       CALL gamma_point_correction(bs_env, qs_env, gwkp_env)
-      CPASSERT(.NOT. ALLOCATED(gwkp_env%target_orbitals))
+      CPASSERT(.NOT. ALLOCATED(gwkp_env%band_orbitals))
       CALL compute_chi(bs_env, gwkp_env)
 
       CALL timestop(handle)
@@ -786,7 +737,7 @@ CONTAINS
    END SUBROUTINE compute_W0
 
 ! **************************************************************************************************
-!> \brief Evaluate exchange and prepare target orbitals for correlation.
+!> \brief Evaluate exchange and prepare band orbitals for correlation.
 !> \param bs_env Band-structure settings and physical results.
 !> \param gwkp_env Temporary periodic GW work data.
 ! **************************************************************************************************
@@ -803,11 +754,11 @@ CONTAINS
 
       CALL timeset(routineN, handle)
 
-      CALL build_cell_ao_values(bs_env, bs_env%ri_rs%grid_points, gwkp_env%ao_values)
+      CALL evaluate_mu_rl_R_values(bs_env, bs_env%ri_rs%grid_points, gwkp_env%ao_values)
       CALL build_all_phi_k(bs_env, gwkp_env%ao_values, phi_lmu_k)
       CALL build_projection_interpolation(bs_env, gwkp_env%interpolation)
-      CALL collect_target_bloch_orbitals(bs_env, gwkp_env%ao_values, &
-                                         gwkp_env%target_orbitals, phi_lmu_k)
+      CALL collect_band_bloch_orbitals(bs_env, gwkp_env%ao_values, &
+                                       gwkp_env%band_orbitals, phi_lmu_k)
       DEALLOCATE (phi_lmu_k)
       CALL compute_Sigma_x_from_V(bs_env, gwkp_env)
       DEALLOCATE (gwkp_env%ao_values)
@@ -1541,7 +1492,7 @@ CONTAINS
 !>
 !> Each group owns τ = group + 1, group + 1 + ngroups, ... . Within a group,
 !> orbitals use owner MOD(k-1,g), whereas Z and W use owner MOD(q,g).
-!> W remains in the auxiliary basis. A single q panel is broadcast during this
+!> W remains in the auxiliary basis. A single q block is broadcast during this
 !> one-time redistribution; each auxiliary W(q,τ) goes only to its owning rank.
 !> \param bs_env Band-structure settings.
 !> \param gwkp_env Work arrays and their MPI distribution.
@@ -1552,13 +1503,13 @@ CONTAINS
 
       CHARACTER(LEN=*), PARAMETER :: routineN = 'prepare_self_energy_groups'
 
-      COMPLEX(KIND=dp), ALLOCATABLE                      :: psi_group(:, :, :, :), &
-                                                            psi_panel(:, :, :), Z_group(:, :, :), &
-                                                            Z_panel(:, :)
+      COMPLEX(KIND=dp), ALLOCATABLE                      :: psi_block(:, :, :), &
+                                                            psi_group(:, :, :, :), Z_block(:, :), &
+                                                            Z_group(:, :, :)
       INTEGER :: handle, i_dest, i_group_size, i_root, i_source, i_tag, ik, ik_local, iq, &
          iq_local, it, it_local, n_ao, n_aux, n_grid, n_k, n_local_k, n_local_q, n_local_time, &
          n_spin, n_stored_q, n_threads, n_time, n_world, phase_handle
-      REAL(KIND=dp) :: available_GB, budget_bytes, grid_bytes, input_bytes, n_pairs, panel_bytes, &
+      REAL(KIND=dp) :: available_GB, block_bytes, budget_bytes, grid_bytes, input_bytes, n_pairs, &
          peak_bytes, persistent_bytes, result_bytes
       TYPE(mp_comm_type)                                 :: column_env
       TYPE(ri_q_matrix_block_type), ALLOCATABLE          :: W_group(:)
@@ -1582,7 +1533,7 @@ CONTAINS
       ! World inputs remain alive during redistribution. Count the complete new
       ! group storage in addition to measured usage; retain a library reserve.
       budget_bytes = MAX(0.0_dp, available_GB - MAX(1.0_dp, 0.1_dp*available_GB))*1.0E9_dp
-      panel_bytes = 16.0_dp*REAL(n_grid, dp)*REAL(n_ao*n_spin + n_aux, dp)
+      block_bytes = 16.0_dp*REAL(n_grid, dp)*REAL(n_ao*n_spin + n_aux, dp)
       result_bytes = 32.0_dp*REAL(n_ao, dp)*REAL(SIZE(bs_env%eigenval_scf, 2), dp)* &
                      REAL(n_time*n_spin, dp)
       DO i_group_size = MIN(2, MAX(1, n_world/2)), n_world
@@ -1596,14 +1547,14 @@ CONTAINS
                                      REAL(n_aux, dp)**2*REAL(n_stored_q*n_local_time, dp))
          n_pairs = REAL(CEILING(REAL(n_grid, dp)**2/REAL(i_group_size, dp), KIND=int_8), dp)
          ! G(k), gwkp_env%W_PQ_tau(R), and Σ(R) coexist: 16 + 8 + 8 bytes per pair and mesh point.
-         ! q matrices, band projection, and Green panels belong to separate stages.
+         ! q matrices, band projection, and Green blocks belong to separate stages.
          grid_bytes = n_pairs*32.0_dp*REAL(n_k, dp) + &
                       MAX(16.0_dp*REAL(n_grid, dp)**2*REAL(n_local_k, dp) + &
                           16.0_dp*REAL(n_aux, dp)**2*REAL(n_local_k, dp) + &
                           16.0_dp*REAL(n_threads*n_grid*(n_ao + n_aux), dp), &
                           projection_workspace_bytes(n_grid, n_pairs, n_k, n_ao, n_threads)) + &
                       32.0_dp*REAL(n_threads*n_k, dp) + 256.0_dp*1024.0_dp**2
-         peak_bytes = MAX(persistent_bytes + panel_bytes, &
+         peak_bytes = MAX(persistent_bytes + block_bytes, &
                           persistent_bytes - input_bytes + grid_bytes + result_bytes)
          IF (gwkp_env%ngroups == 1) peak_bytes = grid_bytes + result_bytes
          IF (peak_bytes <= budget_bytes) EXIT
@@ -1635,7 +1586,7 @@ CONTAINS
       n_local_time = (n_time - gwkp_env%my_group + gwkp_env%ngroups - 1)/gwkp_env%ngroups
       ALLOCATE (psi_group(n_grid, n_ao, n_local_k, n_spin), &
                 Z_group(n_grid, n_aux, n_local_q), &
-                psi_panel(n_grid, n_ao, n_spin), Z_panel(n_grid, n_aux))
+                psi_block(n_grid, n_ao, n_spin), Z_block(n_grid, n_aux))
       ALLOCATE (W_group(n_local_q))
       ! Ranks with the same within-group index need the same k/q slices.
       ! Communicate only along this column, independently of the other columns.
@@ -1647,19 +1598,19 @@ CONTAINS
       CALL timeset('Sigma_groups_redistribute_psi', phase_handle)
       DO ik = gwkp_env%group_env%mepos + 1, n_k, i_group_size
          i_root = MODULO(ik - 1, n_world)/i_group_size
-         IF (column_env%mepos == i_root) psi_panel(:, :, :) = gwkp_env%psi_lm_k(:, :, (ik - 1)/n_world + 1, :)
-         CALL column_env%bcast(psi_panel, i_root)
+         IF (column_env%mepos == i_root) psi_block(:, :, :) = gwkp_env%psi_lm_k(:, :, (ik - 1)/n_world + 1, :)
+         CALL column_env%bcast(psi_block, i_root)
          ik_local = ik_local + 1
-         psi_group(:, :, ik_local, :) = psi_panel
+         psi_group(:, :, ik_local, :) = psi_block
       END DO
       CALL timestop(phase_handle)
       CALL timeset('Sigma_groups_redistribute_ZW', phase_handle)
       DO iq = MODULO(gwkp_env%group_env%mepos - 1, i_group_size) + 1, n_k, i_group_size
          i_root = MODULO(iq, n_world)/i_group_size
-         IF (column_env%mepos == i_root) Z_panel(:, :) = gwkp_env%Z_lP_q(:, :, (iq - 1)/n_world + 1)
-         CALL column_env%bcast(Z_panel, i_root)
+         IF (column_env%mepos == i_root) Z_block(:, :) = gwkp_env%Z_lP_q(:, :, (iq - 1)/n_world + 1)
+         CALL column_env%bcast(Z_block, i_root)
          iq_local = iq_local + 1
-         Z_group(:, :, iq_local) = Z_panel
+         Z_group(:, :, iq_local) = Z_block
          ALLOCATE (W_group(iq_local)%values(n_aux, n_aux, n_local_time))
          DO it = 1, n_time
             i_dest = MODULO(it - 1, gwkp_env%ngroups)
@@ -1684,7 +1635,7 @@ CONTAINS
       CALL MOVE_ALLOC(psi_group, gwkp_env%psi_lm_k)
       CALL MOVE_ALLOC(Z_group, gwkp_env%Z_lP_q)
       CALL MOVE_ALLOC(W_group, gwkp_env%W_PQ_tau)
-      DEALLOCATE (psi_panel, Z_panel)
+      DEALLOCATE (psi_block, Z_block)
 
       CALL timestop(handle)
 
@@ -1702,7 +1653,7 @@ CONTAINS
       CHARACTER(LEN=*), PARAMETER                        :: routineN = 'compute_chi'
 
       COMPLEX(KIND=dp), ALLOCATABLE :: chi_grid_local_q(:, :, :), chi_grid_q(:, :, :), &
-         chi_q(:, :, :), G_grid_k(:, :, :), work(:, :), Z_panel(:, :)
+         chi_q(:, :, :), G_grid_k(:, :, :), work(:, :), Z_block(:, :)
       COMPLEX(KIND=dp), ALLOCATABLE, TARGET              :: psi_time(:, :, :, :), Z_group(:, :, :)
       COMPLEX(KIND=dp), POINTER                          :: psi_values(:, :, :, :), Z_time(:, :, :)
       INTEGER :: first_row, handle, i_cell, i_group, i_q_world, i_rank, i_root, i_size, i_t, &
@@ -1723,7 +1674,7 @@ CONTAINS
 
       CPASSERT(gwkp_env%ngroups == 1 .AND. gwkp_env%my_group == 0)
       CALL build_full_cell_grid(bs_env, full_cells)
-      CPASSERT(.NOT. ALLOCATED(gwkp_env%target_orbitals))
+      CPASSERT(.NOT. ALLOCATED(gwkp_env%band_orbitals))
       n_grid = SIZE(gwkp_env%psi_lm_k, 1)
       n_aux = SIZE(gwkp_env%Z_lP_q, 2)
       n_world = gwkp_env%group_env%num_pe
@@ -1789,33 +1740,33 @@ CONTAINS
       Z_time => gwkp_env%Z_lP_q
       IF (n_groups > 1) THEN
          n_local = COUNT([(MODULO(iq, i_size) == chi_env%mepos, iq=1, bs_env%nkp_scf_desymm)])
-         ALLOCATE (Z_group(n_grid, n_aux, n_local), Z_panel(n_grid, n_aux))
+         ALLOCATE (Z_group(n_grid, n_aux, n_local), Z_block(n_grid, n_aux))
          iq_local = 0
          DO iq = MODULO(chi_env%mepos - 1, i_size) + 1, bs_env%nkp_scf_desymm, i_size
             i_root = MODULO(iq, n_world)/i_size
-            IF (column_env%mepos == i_root) Z_panel(:, :) = gwkp_env%Z_lP_q(:, :, (iq - 1)/n_world + 1)
-            CALL column_env%bcast(Z_panel, i_root)
+            IF (column_env%mepos == i_root) Z_block(:, :) = gwkp_env%Z_lP_q(:, :, (iq - 1)/n_world + 1)
+            CALL column_env%bcast(Z_block, i_root)
             iq_local = iq_local + 1
-            Z_group(:, :, iq_local) = Z_panel
+            Z_group(:, :, iq_local) = Z_block
          END DO
-         DEALLOCATE (Z_panel)
+         DEALLOCATE (Z_block)
          Z_time => Z_group
       END IF
       IF (n_groups > 1) THEN
          n_k_local = (bs_env%nkp_scf_desymm + i_size - 1 - chi_env%mepos)/i_size
          ALLOCATE (psi_time(n_grid, bs_env%n_ao, n_k_local, bs_env%n_spin))
-         ALLOCATE (Z_panel(n_grid, bs_env%n_ao))
+         ALLOCATE (Z_block(n_grid, bs_env%n_ao))
          DO ispin = 1, bs_env%n_spin
             iq_local = 0
             DO iq = chi_env%mepos + 1, bs_env%nkp_scf_desymm, i_size
                i_root = MODULO(iq - 1, n_world)/i_size
-               IF (column_env%mepos == i_root) Z_panel(:, :) = gwkp_env%psi_lm_k(:, :, (iq - 1)/n_world + 1, ispin)
-               CALL column_env%bcast(Z_panel, i_root)
+               IF (column_env%mepos == i_root) Z_block(:, :) = gwkp_env%psi_lm_k(:, :, (iq - 1)/n_world + 1, ispin)
+               CALL column_env%bcast(Z_block, i_root)
                iq_local = iq_local + 1
-               psi_time(:, :, iq_local, ispin) = Z_panel
+               psi_time(:, :, iq_local, ispin) = Z_block
             END DO
          END DO
-         DEALLOCATE (Z_panel)
+         DEALLOCATE (Z_block)
          psi_values => psi_time
       ELSE
          psi_values => gwkp_env%psi_lm_k
@@ -3236,7 +3187,7 @@ CONTAINS
 
          CALL self_energy_RS_to_Bloch(bs_env, Sigma_grid_k, first_row, last_row, ispin, &
                                       gwkp_env%sigma_x_bands(:, :, ispin), gwkp_env%interpolation, &
-                                      gwkp_env%target_orbitals)
+                                      gwkp_env%band_orbitals)
          DEALLOCATE (Sigma_grid_k)
       END DO
 
@@ -3272,7 +3223,7 @@ CONTAINS
 
       CALL timeset(routineN, handle)
 
-      CPASSERT(ALLOCATED(gwkp_env%target_orbitals))
+      CPASSERT(ALLOCATED(gwkp_env%band_orbitals))
       IF (ALLOCATED(gwkp_env%sigma_c_bands)) DEALLOCATE (gwkp_env%sigma_c_bands)
       CALL build_full_cell_grid(bs_env, full_cells)
       n_grid = SIZE(gwkp_env%psi_lm_k, 1)
@@ -3305,8 +3256,8 @@ CONTAINS
       ALLOCATE (step_times(bs_env%num_time_freq_points), SOURCE=0.0_dp)
       gwkp_env%sigma_c_bands = 0.0_dp
       NULLIFY (scf_values)
-      IF (orbitals_cover_scf(bs_env, gwkp_env%target_orbitals)) THEN
-         scf_values => gwkp_env%target_orbitals
+      IF (orbitals_cover_scf(bs_env, gwkp_env%band_orbitals)) THEN
+         scf_values => gwkp_env%band_orbitals
       ELSE
          CALL collect_scf_grid_orbitals(bs_env, gwkp_env%psi_lm_k, gwkp_env%group_env, scf_orbitals)
          IF (ALLOCATED(scf_orbitals)) scf_values => scf_orbitals
@@ -3354,7 +3305,7 @@ CONTAINS
                                             G_grid_k, 0, W_plan%first_pair)
             CALL timestop(phase_handle)
             CALL self_energy_pairs_to_Bloch(bs_env, G_grid_k, W_plan%first_pair, ispin, &
-                                            sigma_band, gwkp_env%group_env, gwkp_env%interpolation, gwkp_env%target_orbitals)
+                                            sigma_band, gwkp_env%group_env, gwkp_env%interpolation, gwkp_env%band_orbitals)
             IF (gwkp_env%group_env%mepos == 0) gwkp_env%sigma_c_bands(:, :, i_t, 2, ispin) = sigma_band
 
             CALL timeset('Sigma_c_green_pairs_to_k', phase_handle)
@@ -3368,7 +3319,7 @@ CONTAINS
                                             G_grid_k, 0, W_plan%first_pair)
             CALL timestop(phase_handle)
             CALL self_energy_pairs_to_Bloch(bs_env, G_grid_k, W_plan%first_pair, ispin, &
-                                            sigma_band, gwkp_env%group_env, gwkp_env%interpolation, gwkp_env%target_orbitals)
+                                            sigma_band, gwkp_env%group_env, gwkp_env%interpolation, gwkp_env%band_orbitals)
             IF (gwkp_env%group_env%mepos == 0) gwkp_env%sigma_c_bands(:, :, i_t, 1, ispin) = sigma_band
          END DO
          step_elapsed = m_walltime() - step_start
@@ -4066,24 +4017,6 @@ CONTAINS
    END FUNCTION momentum_transfer_point
 
 ! **************************************************************************************************
-!> \brief Return exp(i 2 pi k.R).
-!> \param kpoint ...
-!> \param cell ...
-!> \return ...
-! **************************************************************************************************
-   PURE FUNCTION lattice_phase(kpoint, cell) RESULT(phase)
-      REAL(KIND=dp), DIMENSION(3), INTENT(IN)            :: kpoint
-      INTEGER, DIMENSION(3), INTENT(IN)                  :: cell
-      COMPLEX(KIND=dp)                                   :: phase
-
-      REAL(KIND=dp)                                      :: angle
-
-      angle = twopi*SUM(kpoint*REAL(cell, dp))
-      phase = CMPLX(COS(angle), SIN(angle), KIND=dp)
-
-   END FUNCTION lattice_phase
-
-! **************************************************************************************************
 !> \brief Zero-wave-vector Fourier value of the selected RI metric kernel.
 !> \param bs_env ...
 !> \return ...
@@ -4477,7 +4410,7 @@ CONTAINS
 
 ! **************************************************************************************************
 !> \brief Compute the spectrum and inverse of H=C^T M(q) C on one MPI q group.
-!> H is Hermitian. The root supplies H in bounded column tiles; eigensolver,
+!> H is Hermitian. The root supplies H in bounded column blocks; eigensolver,
 !> Cholesky factorization and inversion use block-cyclic distributed matrices.
 !> Preserve the local path's rejection rule lambda_min <= 1e-12 lambda_max.
 !> Only the root receives H^-1 for the existing atom-block objective gradient.
@@ -4532,935 +4465,6 @@ CONTAINS
       CALL timestop(handle)
 
    END SUBROUTINE auto_ri_grouped_inverse
-
-! **************************************************************************************************
-!> \brief Build explicit-cell AO values and periodic RI-RS coefficients Z_lP(q).
-!> \param bs_env Band-structure environment.
-!> \param grid_points Reference-cell RI-RS points r_l.
-!> \param ao_values ...
-!> \param Z_lP_q Gaussian RI-RS coefficients on the shifted SCF mesh.
-!> \param Z_lP_zero ...
-! **************************************************************************************************
-   SUBROUTINE compute_Z_lP_small_cell_full_kp(bs_env, grid_points, ao_values, &
-                                              Z_lP_q, Z_lP_zero)
-      TYPE(post_scf_bandstructure_type), POINTER         :: bs_env
-      REAL(KIND=dp), DIMENSION(:, :), INTENT(IN)         :: grid_points
-      REAL(dp), ALLOCATABLE, INTENT(INOUT), TARGET       :: ao_values(:, :, :)
-      COMPLEX(KIND=dp), ALLOCATABLE, INTENT(OUT)         :: Z_lP_q(:, :, :), Z_lP_zero(:, :, :)
-
-      CHARACTER(LEN=*), PARAMETER :: routineN = 'compute_Z_lP_small_cell_full_kp'
-
-      COMPLEX(KIND=dp), ALLOCATABLE                      :: charge_lq(:, :)
-      INTEGER                                            :: first_l, handle, last_l, n_D_cells, &
-                                                            n_grid, n_target_cells
-      INTEGER, ALLOCATABLE                               :: D_cells(:, :), target_cells(:, :)
-      REAL(KIND=dp)                                      :: elapsed, start_time
-      REAL(KIND=dp), ALLOCATABLE                         :: D_llprime_A(:, :, :), &
-                                                            qpoints_head(:, :), qpoints_scf(:, :), &
-                                                            target_R(:, :, :)
-      REAL(KIND=dp), POINTER                             :: phi_lmu_R(:, :, :)
-
-      CALL timeset(routineN, handle)
-
-      start_time = m_walltime()
-      IF (bs_env%unit_nr > 0) WRITE (bs_env%unit_nr, '(T2,A)') "RI-RS: Compute Z_lP(k); required: D_ll'^R and d_lP^R"
-
-      IF (bs_env%ri_rs%tikhonov < 0.0_dp) THEN
-         CPABORT("RI_RS%TIKHONOV must not be negative")
-      END IF
-
-      n_grid = SIZE(grid_points, 2)
-      CPASSERT(n_grid > 0)
-      CPASSERT(bs_env%nkp_scf_desymm > 0)
-
-      CALL build_cell_ao_values(bs_env, grid_points, ao_values)
-      phi_lmu_R => ao_values
-      CALL build_target_cell_set(bs_env, grid_points, target_cells)
-      CALL build_D_cell_set(bs_env, phi_lmu_R, D_cells)
-      n_target_cells = SIZE(target_cells, 2)
-      n_D_cells = SIZE(D_cells, 2)
-      CPASSERT(n_target_cells > 0)
-      CPASSERT(n_D_cells > 0)
-      IF (bs_env%unit_nr > 0) THEN
-         WRITE (bs_env%unit_nr, '(T2,A,T72,I9)') 'RI-RS d_lP^R cells R:', n_target_cells
-         WRITE (bs_env%unit_nr, '(T2,A,T72,I9)') "RI-RS D_ll'^R cells R:", n_D_cells
-         FLUSH (bs_env%unit_nr)
-      END IF
-
-      ! Each rank stores a rectangular (l,l') block for every translation A.
-      first_l = (n_grid*bs_env%para_env%mepos)/bs_env%para_env%num_pe + 1
-      last_l = (n_grid*(bs_env%para_env%mepos + 1))/bs_env%para_env%num_pe
-      ALLOCATE (D_llprime_A(last_l - first_l + 1, n_grid, n_D_cells))
-      CALL build_D_llprime_lattice(bs_env, D_cells, phi_lmu_R, first_l, last_l, D_llprime_A)
-      CALL mp_print_mem_per_rank(bs_env%para_env, bs_env%unit_nr, "After distribution of D_ll'^R:")
-      IF (bs_env%unit_nr > 0) THEN
-         WRITE (bs_env%unit_nr, '(T2,A)') 'RI-RS three-center projection d_lP^R: starting'
-         FLUSH (bs_env%unit_nr)
-      END IF
-      ALLOCATE (qpoints_scf(3, bs_env%nkp_scf_desymm))
-      qpoints_scf(:, :) = bs_env%kpoints_chi_eps_W%xkp(:, 1:bs_env%nkp_scf_desymm)
-      ALLOCATE (qpoints_head(3, 1), SOURCE=0.0_dp)
-      CALL build_dlp_selected(bs_env, grid_points, target_cells, target_R, qpoints_head, charge_lq)
-      CALL mp_print_mem_per_rank(bs_env%para_env, bs_env%unit_nr, 'After RI-RS three-center projection d_lP^R')
-
-      CALL solve_Z_mesh(bs_env, D_cells, target_cells, D_llprime_A, target_R, first_l, last_l, qpoints_scf, &
-                        Z_lP_q, distributed=.TRUE.)
-      CALL solve_Z_mesh(bs_env, D_cells, target_cells, D_llprime_A, target_R, first_l, last_l, &
-                        qpoints_head, Z_lP_zero, distributed=.FALSE., charge_lq=charge_lq)
-
-      DEALLOCATE (target_cells, D_cells, D_llprime_A, qpoints_scf, target_R)
-      DEALLOCATE (qpoints_head)
-
-      elapsed = m_walltime() - start_time
-      CALL bs_env%para_env%max(elapsed)
-      IF (bs_env%unit_nr > 0) WRITE (bs_env%unit_nr, '(T2,A,T69,F10.1,A)') &
-         'Completed computing Z_lP(q), Exec. time:', elapsed, ' s'
-      IF (bs_env%unit_nr > 0) FLUSH (bs_env%unit_nr)
-
-      CALL timestop(handle)
-
-   END SUBROUTINE compute_Z_lP_small_cell_full_kp
-
-! **************************************************************************************************
-!> \brief Reconstruct the same cutoff AO lattice images without repeating the RI solve.
-!> \param bs_env ...
-!> \param grid_points ...
-!> \param ao_values ...
-! **************************************************************************************************
-   SUBROUTINE build_cell_ao_values(bs_env, grid_points, ao_values)
-      TYPE(post_scf_bandstructure_type), POINTER         :: bs_env
-      REAL(KIND=dp), INTENT(IN)                          :: grid_points(:, :)
-      REAL(dp), ALLOCATABLE, INTENT(INOUT), TARGET       :: ao_values(:, :, :)
-
-      CHARACTER(LEN=*), PARAMETER :: routineN = 'build_cell_ao_values'
-
-      INTEGER                                            :: handle, i_cell, ready
-      REAL(dp)                                           :: available_GB, required_bytes
-      TYPE(mp_comm_type)                                 :: node_comm
-
-      CALL timeset(routineN, handle)
-
-      CPASSERT(.NOT. ALLOCATED(ao_values))
-      required_bytes = 8.0_dp*REAL(SIZE(grid_points, 2), dp)*REAL(bs_env%n_ao, dp)* &
-                       REAL(SIZE(bs_env%index_to_cell_3c, 2), dp)
-      CALL mp_mem_avail_per_rank_GB(bs_env%para_env, available_GB)
-      ready = MERGE(1, 0, required_bytes <= 0.5_dp*MAX(0.0_dp, available_GB)*1.0E9_dp)
-      CALL bs_env%para_env%min(ready)
-      IF (ready == 0) CPABORT('Insufficient memory for per-rank periodic AO grid')
-      ALLOCATE (ao_values(SIZE(grid_points, 2), bs_env%n_ao, SIZE(bs_env%index_to_cell_3c, 2)))
-      CALL node_comm%from_split_type(bs_env%para_env, mp_comm_split_type_shared, key=bs_env%para_env%mepos)
-      IF (node_comm%mepos == 0) THEN
-         CALL fill_ao_translations(bs_env, grid_points, bs_env%index_to_cell_3c, ao_values)
-      END IF
-      DO i_cell = 1, SIZE(ao_values, 3)
-         CALL node_comm%bcast(ao_values(:, :, i_cell))
-      END DO
-      CALL node_comm%free()
-
-      CALL timestop(handle)
-
-   END SUBROUTINE build_cell_ao_values
-
-! **************************************************************************************************
-!> \brief Solve the periodic RI-RS equations at the supplied momentum-transfer points.
-!> At zero Tikhonov parameter the Hermitian D matrix is solved in the
-!> Moore-Penrose sense, yielding the minimum-norm unregularized fit.
-!> \param bs_env ...
-!> \param D_cells ...
-!> \param target_cells ...
-!> \param D_llprime_A ...
-!> \param target_R ...
-!> \param first_l ...
-!> \param last_l ...
-!> \param qpoints ...
-!> \param Z_lP_q ...
-!> \param distributed ...
-!> \param charge_lq ...
-! **************************************************************************************************
-   SUBROUTINE solve_Z_mesh(bs_env, D_cells, target_cells, D_llprime_A, target_R, first_l, last_l, qpoints, &
-                           Z_lP_q, distributed, charge_lq)
-      TYPE(post_scf_bandstructure_type), POINTER         :: bs_env
-      INTEGER, DIMENSION(:, :), INTENT(IN)               :: D_cells, target_cells
-      REAL(KIND=dp), DIMENSION(:, :, :), INTENT(IN)      :: D_llprime_A
-      REAL(KIND=dp), CONTIGUOUS, INTENT(IN)              :: target_R(:, :, :)
-      INTEGER, INTENT(IN)                                :: first_l, last_l
-      REAL(KIND=dp), DIMENSION(:, :), INTENT(IN)         :: qpoints
-      COMPLEX(KIND=dp), ALLOCATABLE, INTENT(OUT)         :: Z_lP_q(:, :, :)
-      LOGICAL, INTENT(IN)                                :: distributed
-      COMPLEX(KIND=dp), INTENT(IN), OPTIONAL             :: charge_lq(:, :)
-
-      CHARACTER(LEN=*), PARAMETER                        :: routineN = 'solve_Z_mesh'
-
-      COMPLEX(KIND=dp)                                   :: phase
-      COMPLEX(KIND=dp), ALLOCATABLE :: D_llprime_q(:, :), D_llprime_q_local(:, :), &
-         D_llprime_q_packed(:), rhs(:, :), target_q(:, :), target_q_reference(:, :)
-      INTEGER :: first_l_rank, handle, i_A, i_batch, i_rank, info, iq, iq_batch, iq_local, &
-         iq_store, l, last_l_rank, lp, n_grid, n_q, n_q_local, n_RI, n_RI_reference, n_RI_solve, &
-         next_progress
-      INTEGER(KIND=int_8)                                :: n_done, n_local
-      INTEGER, ALLOCATABLE                               :: displs(:), recvcounts(:)
-      LOGICAL, ALLOCATABLE                               :: active_grid_point(:), required_q(:)
-      REAL(KIND=dp)                                      :: antihermitian_error, &
-                                                            diagonal_imag_error, max_scale, &
-                                                            metric_head, progress_start, &
-                                                            qpoint(3), volume
-      REAL(KIND=dp), ALLOCATABLE                         :: scale(:)
-
-      CALL timeset(routineN, handle)
-
-      n_grid = SIZE(D_llprime_A, 2)
-      n_RI = bs_env%n_RI
-      n_RI_solve = n_RI
-      IF (PRESENT(charge_lq)) THEN
-         IF (bs_env%ri_metric%potential_type /= do_potential_truncated) THEN
-            IF (bs_env%ri_metric%potential_type /= do_potential_short) THEN
-               CPABORT('Unsupported RI metric')
-            END IF
-         END IF
-         n_RI_solve = n_RI + 1
-      END IF
-      n_RI_reference = n_RI
-      CPASSERT(SIZE(qpoints, 1) >= 3)
-      n_q = SIZE(qpoints, 2)
-      IF (PRESENT(charge_lq)) THEN
-         CPASSERT(SIZE(charge_lq, 1) == n_grid)
-         CPASSERT(SIZE(charge_lq, 2) == n_q)
-      END IF
-      ! Fit every Gaussian transfer point; the Gamma-correction scalar head is fitted at Gamma.
-      ALLOCATE (required_q(n_q), SOURCE=.TRUE.)
-      IF (distributed) THEN
-         IF (bs_env%para_env%mepos == 0) THEN
-            n_q_local = n_q/bs_env%para_env%num_pe
-         ELSE IF (bs_env%para_env%mepos <= n_q) THEN
-            n_q_local = (n_q - bs_env%para_env%mepos)/bs_env%para_env%num_pe + 1
-         ELSE
-            n_q_local = 0
-         END IF
-      ELSE
-         n_q_local = n_q
-      END IF
-      ALLOCATE (Z_lP_q(n_grid, n_RI_solve, n_q_local))
-      ALLOCATE (D_llprime_q(n_grid, n_grid), D_llprime_q_local(last_l - first_l + 1, n_grid), &
-                D_llprime_q_packed(n_grid*n_grid), recvcounts(bs_env%para_env%num_pe), &
-                displs(bs_env%para_env%num_pe), &
-                target_q(n_grid, n_RI_solve), target_q_reference(n_grid, n_RI_reference), &
-                rhs(n_grid, n_RI_solve))
-      DO i_rank = 0, bs_env%para_env%num_pe - 1
-         first_l_rank = (n_grid*i_rank)/bs_env%para_env%num_pe + 1
-         last_l_rank = (n_grid*(i_rank + 1))/bs_env%para_env%num_pe
-         recvcounts(i_rank + 1) = (last_l_rank - first_l_rank + 1)*n_grid
-         displs(i_rank + 1) = SUM(recvcounts(1:i_rank))
-      END DO
-      ALLOCATE (SCALE(n_grid), active_grid_point(n_grid))
-      Z_lP_q = z_zero
-
-      progress_start = m_walltime()
-      next_progress = 1
-      n_done = 0_int_8
-      n_local = 0_int_8
-      IF (bs_env%para_env%mepos == 0) THEN
-         DO iq = MERGE(bs_env%para_env%num_pe, 1, distributed), n_q, bs_env%para_env%num_pe
-            IF (required_q(iq)) n_local = n_local + 1_int_8
-         END DO
-      END IF
-      iq_local = 0
-      DO i_batch = 0, (n_q - 1)/bs_env%para_env%num_pe
-         ! D_ll'(q) = sum_A exp(i q.A) D_ll'^A; gather only on the q rank.
-         DO iq_batch = i_batch*bs_env%para_env%num_pe + 1, &
-            MIN(n_q, (i_batch + 1)*bs_env%para_env%num_pe)
-            IF (.NOT. required_q(iq_batch)) CYCLE
-            D_llprime_q_local = z_zero
-            DO i_A = 1, SIZE(D_cells, 2)
-               phase = lattice_phase(qpoints(:, iq_batch), D_cells(1:3, i_A))
-               D_llprime_q_local(:, :) = D_llprime_q_local(:, :) + phase*D_llprime_A(:, :, i_A)
-            END DO
-            i_rank = MODULO(iq_batch - 1, bs_env%para_env%num_pe)
-            IF (distributed) i_rank = MODULO(iq_batch, bs_env%para_env%num_pe)
-            CALL bs_env%para_env%gatherv(RESHAPE(D_llprime_q_local, [SIZE(D_llprime_q_local)]), &
-                                         D_llprime_q_packed, recvcounts, displs, i_rank)
-            IF (bs_env%para_env%mepos == i_rank) THEN
-               DO l = 0, bs_env%para_env%num_pe - 1
-                  first_l_rank = (n_grid*l)/bs_env%para_env%num_pe + 1
-                  last_l_rank = (n_grid*(l + 1))/bs_env%para_env%num_pe
-                  D_llprime_q(first_l_rank:last_l_rank, :) = RESHAPE( &
-                                                          D_llprime_q_packed(displs(l + 1) + 1:displs(l + 1) + recvcounts(l + 1)), &
-                                                             [last_l_rank - first_l_rank + 1, n_grid])
-               END DO
-            END IF
-         END DO
-         CALL dlp_target_q_batch(bs_env, target_cells, target_R, qpoints, i_batch, &
-                                 distributed, required_q, target_q_reference, iq)
-         IF (iq > n_q) CYCLE
-         iq_local = iq_local + 1
-         IF (.NOT. required_q(iq)) CYCLE
-         IF (distributed) THEN
-            iq_store = iq_local
-         ELSE
-            iq_store = iq
-         END IF
-         qpoint = qpoints(:, iq)
-         IF (PRESENT(charge_lq)) THEN
-            ! The Gamma-correction scalar head is separate. Keep the full Gaussian target.
-            CPASSERT(n_RI_reference == n_RI)
-            target_q(:, 2:) = target_q_reference
-            volume = bs_env%ri_rs%cell%deth
-            IF (ALL(bs_env%periodic == [1, 1, 0])) THEN
-               ! The separated 2D charge channel is normalized by layer area,
-               ! independent of the vacuum-cell height.
-               volume = SQRT(SUM([bs_env%hmat(2, 1)*bs_env%hmat(3, 2) - &
-                                  bs_env%hmat(3, 1)*bs_env%hmat(2, 2), &
-                                  bs_env%hmat(3, 1)*bs_env%hmat(1, 2) - &
-                                  bs_env%hmat(1, 1)*bs_env%hmat(3, 2), &
-                                  bs_env%hmat(1, 1)*bs_env%hmat(2, 2) - &
-                                  bs_env%hmat(2, 1)*bs_env%hmat(1, 2)]**2))
-            END IF
-            CPASSERT(volume > 0.0_dp)
-            IF (bs_env%ri_metric%potential_type == do_potential_short) THEN
-               metric_head = pi/bs_env%ri_metric%omega**2
-            ELSE
-               metric_head = 2.0_dp*pi*bs_env%ri_metric%cutoff_radius**2
-            END IF
-            target_q(:, 1) = metric_head/SQRT(volume)*charge_lq(:, iq)
-         ELSE
-            CPASSERT(n_RI_reference == n_RI)
-            target_q(:, :) = target_q_reference
-         END IF
-
-         antihermitian_error = MAXVAL(ABS(D_llprime_q - CONJG(TRANSPOSE(D_llprime_q))))
-         diagonal_imag_error = 0.0_dp
-         DO l = 1, n_grid
-            diagonal_imag_error = MAX(diagonal_imag_error, ABS(AIMAG(D_llprime_q(l, l))))
-         END DO
-         IF (antihermitian_error > 100.0_dp*bs_env%eps_filter .OR. &
-             diagonal_imag_error > 100.0_dp*bs_env%eps_filter) THEN
-            CPABORT("Non-Hermitian periodic RI-RS D(q)")
-         END IF
-         D_llprime_q(:, :) = 0.5_dp*(D_llprime_q(:, :) + CONJG(TRANSPOSE(D_llprime_q(:, :))))
-
-         DO l = 1, n_grid
-            IF (REAL(D_llprime_q(l, l), KIND=dp) < -100.0_dp*bs_env%eps_filter) THEN
-               CPABORT("Periodic RI-RS D(q) has a negative diagonal element")
-            END IF
-            SCALE(l) = SQRT(MAX(REAL(D_llprime_q(l, l), KIND=dp), TINY(1.0_dp)))
-         END DO
-         max_scale = MAXVAL(scale)
-         active_grid_point(:) = scale > &
-                                SQRT(MAX(bs_env%eps_filter, EPSILON(1.0_dp)))*max_scale
-         IF (.NOT. ANY(active_grid_point)) THEN
-            CPABORT("Periodic RI-RS D(q) has no active grid points")
-         END IF
-
-         ! Form D'_ll'(q) = D_ll'(q)/(s_l s_l') + eta delta_ll'.
-         DO lp = 1, n_grid
-            DO l = 1, n_grid
-               IF (active_grid_point(l) .AND. active_grid_point(lp)) THEN
-                  D_llprime_q(l, lp) = D_llprime_q(l, lp)/(SCALE(l)*SCALE(lp))
-               ELSE
-                  D_llprime_q(l, lp) = z_zero
-               END IF
-            END DO
-         END DO
-         DO l = 1, n_grid
-            D_llprime_q(l, l) = D_llprime_q(l, l) + bs_env%ri_rs%tikhonov*z_one
-            IF (active_grid_point(l)) THEN
-               rhs(l, :) = target_q(l, :)/SCALE(l)
-            ELSE
-               rhs(l, :) = z_zero
-               SCALE(l) = 1.0_dp
-            END IF
-         END DO
-
-         IF (bs_env%ri_rs%tikhonov <= 0.0_dp) THEN
-            CALL solve_unregularized_D(D_llprime_q, rhs)
-         ELSE
-            CALL zpotrf('L', n_grid, D_llprime_q, n_grid, info)
-            IF (info == 0) CALL zpotrs('L', n_grid, n_RI_solve, D_llprime_q, n_grid, rhs, n_grid, info)
-            IF (info /= 0) CPABORT("Periodic RI-RS regularized solve failed")
-         END IF
-
-         DO l = 1, n_grid
-            Z_lP_q(l, :, iq_store) = rhs(l, :)/SCALE(l)
-         END DO
-         IF (bs_env%para_env%mepos == 0 .AND. n_local > 1) THEN
-            n_done = n_done + 1_int_8
-            CALL write_ri_rs_phase_progress(bs_env%unit_nr, 'Z_lP(q) q-point', &
-                                            n_done, n_local, next_progress, progress_start)
-         END IF
-      END DO
-      IF (distributed) THEN
-         CPASSERT(iq_local == n_q_local)
-      END IF
-      IF (.NOT. distributed) CALL bs_env%para_env%sum(Z_lP_q)
-      DEALLOCATE (D_llprime_q, D_llprime_q_local, D_llprime_q_packed, recvcounts, displs, &
-                  target_q, target_q_reference, rhs, scale, active_grid_point, required_q)
-
-      CALL timestop(handle)
-
-   END SUBROUTINE solve_Z_mesh
-
-! **************************************************************************************************
-!> \brief Solve a possibly rank-deficient Hermitian D matrix without Tikhonov regularization.
-!> Only eigenvalues indistinguishable from zero at matrix-roundoff precision
-!> are excluded from the Moore-Penrose inverse.
-!> \param D_llprime_q ...
-!> \param rhs ...
-! **************************************************************************************************
-   SUBROUTINE solve_unregularized_D(D_llprime_q, rhs)
-      COMPLEX(KIND=dp), DIMENSION(:, :), INTENT(INOUT)   :: D_llprime_q, rhs
-
-      COMPLEX(KIND=dp), ALLOCATABLE                      :: projected_rhs(:, :), work(:)
-      INTEGER                                            :: ieigenvalue, info, ngrid
-      REAL(KIND=dp)                                      :: rank_tolerance
-      REAL(KIND=dp), ALLOCATABLE                         :: eigenvalues(:), rwork(:)
-
-      ngrid = SIZE(D_llprime_q, 1)
-      CPASSERT(ngrid > 0)
-      CPASSERT(SIZE(D_llprime_q, 2) == ngrid)
-      CPASSERT(SIZE(rhs, 1) == ngrid)
-      ALLOCATE (eigenvalues(ngrid), rwork(MAX(1, 3*ngrid - 2)), &
-                work(MAX(1, 2*ngrid - 1)), projected_rhs(ngrid, SIZE(rhs, 2)))
-      CALL zheev('V', 'L', ngrid, D_llprime_q, ngrid, eigenvalues, work, SIZE(work), rwork, info)
-      IF (info /= 0) CPABORT('Unregularized periodic RI-RS eigensolver failed')
-      rank_tolerance = EPSILON(1.0_dp)*REAL(ngrid, dp)*MAXVAL(ABS(eigenvalues))
-      IF (MINVAL(eigenvalues) < -10.0_dp*rank_tolerance) THEN
-         CPABORT('Unregularized RI-RS D matrix is not positive semidefinite')
-      END IF
-      IF (.NOT. ANY(eigenvalues > rank_tolerance)) THEN
-         CPABORT('Unregularized RI-RS D matrix has zero numerical rank')
-      END IF
-
-      projected_rhs(:, :) = MATMUL(CONJG(TRANSPOSE(D_llprime_q)), rhs)
-      DO ieigenvalue = 1, ngrid
-         IF (eigenvalues(ieigenvalue) > rank_tolerance) THEN
-            projected_rhs(ieigenvalue, :) = &
-               projected_rhs(ieigenvalue, :)/eigenvalues(ieigenvalue)
-         ELSE
-            projected_rhs(ieigenvalue, :) = z_zero
-         END IF
-      END DO
-      rhs(:, :) = MATMUL(D_llprime_q, projected_rhs)
-   END SUBROUTINE solve_unregularized_D
-
-! **************************************************************************************************
-!> \brief Fill an existing AO array using translated basis values.
-!> \param bs_env ...
-!> \param grid_points ...
-!> \param cells ...
-!> \param phi_lmu_R ...
-! **************************************************************************************************
-   SUBROUTINE fill_ao_translations(bs_env, grid_points, cells, phi_lmu_R)
-      TYPE(post_scf_bandstructure_type), POINTER         :: bs_env
-      REAL(KIND=dp), DIMENSION(:, :), INTENT(IN)         :: grid_points
-      INTEGER, DIMENSION(:, :), INTENT(IN)               :: cells
-      REAL(KIND=dp), INTENT(OUT)                         :: phi_lmu_R(:, :, :)
-
-      INTEGER                                            :: first_ao, i_atom, i_cell, i_kind, last_ao
-      REAL(KIND=dp)                                      :: cutoff_squared, source_position(3)
-      TYPE(cell_type), POINTER                           :: cell
-      TYPE(gto_basis_set_type), POINTER                  :: basis
-      TYPE(particle_type), DIMENSION(:), POINTER         :: particle_set
-
-      cell => bs_env%ri_rs%cell
-      particle_set => bs_env%ri_rs%particle_set
-      phi_lmu_R = 0.0_dp
-
-      DO i_cell = 1, SIZE(cells, 2)
-         DO i_atom = 1, bs_env%n_atom
-            i_kind = particle_set(i_atom)%atomic_kind%kind_number
-            basis => bs_env%basis_set_AO(i_kind)%gto_basis_set
-            first_ao = bs_env%i_ao_start_from_atom(i_atom)
-            last_ao = bs_env%i_ao_end_from_atom(i_atom)
-            source_position = pbc(particle_set(i_atom)%r, cell) + &
-                              MATMUL(bs_env%hmat, REAL(cells(:, i_cell), dp))
-            cutoff_squared = bs_env%ri_rs%radius_ao_per_atom(i_atom)**2
-            IF (bs_env%ri_rs%cutoff_radius_ri_ao > 0.0_dp) THEN
-               cutoff_squared = bs_env%ri_rs%cutoff_radius_ri_ao**2
-            END IF
-            CALL evaluate_ao_basis_on_points(phi_lmu_R(:, first_ao:last_ao, i_cell), &
-                                             grid_points, basis, source_position, cell, &
-                                             cutoff_squared=cutoff_squared, minimum_image=.FALSE.)
-         END DO
-      END DO
-
-   END SUBROUTINE fill_ao_translations
-
-! **************************************************************************************************
-!> \brief Enumerate translations T that survive the R_cut^(lP) criterion for at least one (l,P).
-!> \param bs_env ...
-!> \param grid_points ...
-!> \param target_cells ...
-! **************************************************************************************************
-   SUBROUTINE build_target_cell_set(bs_env, grid_points, target_cells)
-      TYPE(post_scf_bandstructure_type), POINTER         :: bs_env
-      REAL(KIND=dp), DIMENSION(:, :), INTENT(IN)         :: grid_points
-      INTEGER, ALLOCATABLE, INTENT(OUT)                  :: target_cells(:, :)
-
-      INTEGER                                            :: cell_index(3), i_atom, i_l, ix, iy, iz, &
-                                                            n_max(3), n_target, n_work
-      INTEGER, ALLOCATABLE                               :: cells_work(:, :)
-      LOGICAL                                            :: keep
-      REAL(KIND=dp)                                      :: center(3), cutoff, max_cutoff
-      REAL(KIND=dp), ALLOCATABLE                         :: automatic_cutoffs(:)
-      TYPE(particle_type), DIMENSION(:), POINTER         :: particle_set
-
-      particle_set => bs_env%ri_rs%particle_set
-      CALL get_dlp_target_cutoffs(bs_env, automatic_cutoffs)
-      max_cutoff = MAXVAL(automatic_cutoffs)
-      DO ix = 1, 3
-         IF (bs_env%periodic(ix) == 1) THEN
-            ! If |h*T + delta| <= R, then every fractional component obeys
-            ! |T_i| <= R*|(h^-1)_i| + |(h^-1 delta)_i|.  Both the atom and the
-            ! grid point are mapped into the reference cell, so the last term
-            ! is smaller than one.  This reciprocal-vector bound remains safe
-            ! for skewed cells, unlike a bound based on direct-vector lengths.
-            n_max(ix) = CEILING(max_cutoff*NORM2(bs_env%ri_rs%cell%h_inv(ix, :))) + 1
-         ELSE
-            n_max(ix) = 0
-         END IF
-      END DO
-
-      n_work = PRODUCT(2*n_max + 1)
-      ALLOCATE (cells_work(3, n_work))
-      n_target = 0
-      DO ix = -n_max(1), n_max(1)
-         DO iy = -n_max(2), n_max(2)
-            DO iz = -n_max(3), n_max(3)
-               cell_index = [ix, iy, iz]
-               keep = .FALSE.
-               DO i_atom = 1, bs_env%n_atom
-                  cutoff = automatic_cutoffs(i_atom)
-                  center = pbc(particle_set(i_atom)%r, bs_env%ri_rs%cell) + &
-                           MATMUL(bs_env%hmat, REAL(cell_index, dp))
-                  DO i_l = 1, SIZE(grid_points, 2)
-                     IF (NORM2(center - grid_points(:, i_l)) <= cutoff) THEN
-                        keep = .TRUE.
-                        EXIT
-                     END IF
-                  END DO
-                  IF (keep) EXIT
-               END DO
-               IF (.NOT. keep) CYCLE
-               n_target = n_target + 1
-               cells_work(:, n_target) = cell_index
-            END DO
-         END DO
-      END DO
-
-      ALLOCATE (target_cells(3, n_target))
-      target_cells(:, :) = cells_work(:, 1:n_target)
-      IF (bs_env%unit_nr > 0) THEN
-         WRITE (bs_env%unit_nr, '(T2,A,T69,F10.1,A)') &
-            'Periodic RI-RS automatic R_cut^(lP):', &
-            max_cutoff*angstrom, ' Å'
-      END IF
-      DEALLOCATE (automatic_cutoffs, cells_work)
-
-   END SUBROUTINE build_target_cell_set
-
-! **************************************************************************************************
-!> \brief Enumerate the translations A required by the AO-product D matrix D_ll'^A.
-!>
-!> Unlike the right-hand side d_lP^T, D_ll'^A is independent of R_cut^(lP). A translation can
-!> contribute only if it is the difference of two image cells with nonzero AO values on the
-!> reference-cell grid. Keeping a separate cell set prevents Eq. (10) screening from truncating
-!> the least-squares metric and avoids enumerating empty three-center image cells.
-!> \param bs_env ...
-!> \param phi_lmu_R ...
-!> \param D_cells ...
-! **************************************************************************************************
-   SUBROUTINE build_D_cell_set(bs_env, phi_lmu_R, D_cells)
-      TYPE(post_scf_bandstructure_type), POINTER         :: bs_env
-      REAL(KIND=dp), DIMENSION(:, :, :), INTENT(IN)      :: phi_lmu_R
-      INTEGER, ALLOCATABLE, INTENT(OUT)                  :: D_cells(:, :)
-
-      INTEGER                                            :: cell_index(3), i, i_R, i_R_prime, &
-                                                            n_active, n_D_cells
-      INTEGER, ALLOCATABLE                               :: active_cells(:), cells_work(:, :)
-      LOGICAL                                            :: found
-
-      ALLOCATE (active_cells(SIZE(phi_lmu_R, 3)))
-      n_active = 0
-      DO i_R = 1, SIZE(phi_lmu_R, 3)
-         IF (.NOT. ANY(phi_lmu_R(:, :, i_R) /= 0.0_dp)) CYCLE
-         n_active = n_active + 1
-         active_cells(n_active) = i_R
-      END DO
-      CPASSERT(n_active > 0)
-
-      ALLOCATE (cells_work(3, n_active*n_active))
-      n_D_cells = 0
-      DO i_R = 1, n_active
-         DO i_R_prime = 1, n_active
-            cell_index = bs_env%index_to_cell_3c(:, active_cells(i_R)) - &
-                         bs_env%index_to_cell_3c(:, active_cells(i_R_prime))
-            found = .FALSE.
-            DO i = 1, n_D_cells
-               IF (ALL(cell_index == cells_work(:, i))) THEN
-                  found = .TRUE.
-                  EXIT
-               END IF
-            END DO
-            IF (.NOT. found) THEN
-               n_D_cells = n_D_cells + 1
-               cells_work(:, n_D_cells) = cell_index
-            END IF
-         END DO
-      END DO
-
-      ALLOCATE (D_cells(3, n_D_cells))
-      D_cells(:, :) = cells_work(:, 1:n_D_cells)
-      DEALLOCATE (active_cells, cells_work)
-
-   END SUBROUTINE build_D_cell_set
-
-! **************************************************************************************************
-!> \brief Construct D_ll'^R = [Σ_{S-S'=R,μ} ϕ_μ^S(r_L) ϕ_μ^S'(r_L')]².
-!> The progress count enumerates pairs of active cell images (S,S'), not Gaussian pairs.
-!> \param bs_env ...
-!> \param D_cells ...
-!> \param phi_lmu_R ...
-!> \param first_l ...
-!> \param last_l ...
-!> \param D_llprime_A ...
-! **************************************************************************************************
-   SUBROUTINE build_D_llprime_lattice(bs_env, D_cells, phi_lmu_R, first_l, last_l, D_llprime_A)
-      TYPE(post_scf_bandstructure_type), POINTER         :: bs_env
-      INTEGER, DIMENSION(:, :), INTENT(IN)               :: D_cells
-      REAL(KIND=dp), INTENT(IN)                          :: phi_lmu_R(:, :, :)
-      INTEGER, INTENT(IN)                                :: first_l, last_l
-      REAL(KIND=dp), CONTIGUOUS, INTENT(OUT)             :: D_llprime_A(:, :, :)
-
-      INTEGER                                            :: cell_A(3), handle, i_A, i_R, i_R_prime, &
-                                                            next_progress, nrows
-      INTEGER(KIND=int_8)                                :: n_done, n_total
-      LOGICAL                                            :: found
-      LOGICAL, ALLOCATABLE                               :: active_cell(:)
-      REAL(KIND=dp)                                      :: progress_start
-      REAL(KIND=dp), ALLOCATABLE                         :: phi_local(:, :)
-      INTERFACE
-         SUBROUTINE dgemm(transa, transb, m, n, k, alpha, a, lda, b, ldb, beta, c, ldc)
-            IMPORT dp
-            CHARACTER(LEN=1), INTENT(IN) :: transa, transb
-            INTEGER, INTENT(IN) :: m, n, k, lda, ldb, ldc
-            REAL(dp), INTENT(IN) :: alpha, beta, a(lda, *), b(ldb, *)
-            REAL(dp), INTENT(INOUT) :: c(ldc, *)
-         END SUBROUTINE dgemm
-      END INTERFACE
-
-      CALL timeset('build_D_llprime_lattice', handle)
-
-      ALLOCATE (active_cell(SIZE(phi_lmu_R, 3)), SOURCE=.FALSE.)
-      DO i_R = 1, SIZE(phi_lmu_R, 3)
-         active_cell(i_R) = ANY(phi_lmu_R(:, :, i_R) /= 0.0_dp)
-      END DO
-      progress_start = m_walltime()
-      next_progress = 1
-      n_done = 0_int_8
-      n_total = INT(COUNT(active_cell), int_8)**2
-      ! Sum the AO images for each owned (l,l') rectangle before squaring.
-      D_llprime_A = 0.0_dp
-      nrows = MAX(0, last_l - first_l + 1)
-      ALLOCATE (phi_local(nrows, SIZE(phi_lmu_R, 2)))
-      IF (first_l <= last_l) THEN
-         DO i_R = 1, SIZE(phi_lmu_R, 3)
-            IF (.NOT. active_cell(i_R)) CYCLE
-            phi_local(:, :) = phi_lmu_R(first_l:last_l, :, i_R)
-            DO i_R_prime = 1, SIZE(phi_lmu_R, 3)
-               IF (.NOT. active_cell(i_R_prime)) CYCLE
-               IF (n_done > 0) CALL write_ri_rs_phase_progress(bs_env%unit_nr, "D_ll'^R Cell-image pairs", &
-                                                               n_done, n_total, next_progress, progress_start)
-               n_done = n_done + 1
-               cell_A = bs_env%index_to_cell_3c(:, i_R) - &
-                        bs_env%index_to_cell_3c(:, i_R_prime)
-               CALL find_cell(cell_A, D_cells, found, i_A)
-               IF (.NOT. found) CYCLE
-               CALL dgemm('N', 'T', nrows, SIZE(phi_lmu_R, 1), SIZE(phi_lmu_R, 2), &
-                          1.0_dp, phi_local, MAX(1, nrows), phi_lmu_R(:, :, i_R_prime), &
-                          MAX(1, SIZE(phi_lmu_R, 1)), 1.0_dp, D_llprime_A(:, :, i_A), &
-                          MAX(1, nrows))
-            END DO
-         END DO
-      END IF
-      IF (first_l <= last_l) CALL write_ri_rs_phase_progress(bs_env%unit_nr, "D_ll'^R Cell-image pairs", &
-                                                             n_done, n_total, next_progress, progress_start)
-      DO i_A = 1, SIZE(D_llprime_A, 3)
-         D_llprime_A(:, :, i_A) = D_llprime_A(:, :, i_A)*D_llprime_A(:, :, i_A)
-      END DO
-      DEALLOCATE (active_cell, phi_local)
-
-      CALL timestop(handle)
-
-   END SUBROUTINE build_D_llprime_lattice
-
-! **************************************************************************************************
-!> \brief Find a lattice triplet in an explicit image-cell list.
-!> \param cell ...
-!> \param index_to_cell ...
-!> \param found ...
-!> \param index ...
-! **************************************************************************************************
-   SUBROUTINE find_cell(cell, index_to_cell, found, index)
-      INTEGER, DIMENSION(3), INTENT(IN)                  :: cell
-      INTEGER, DIMENSION(:, :), INTENT(IN)               :: index_to_cell
-      LOGICAL, INTENT(OUT)                               :: found
-      INTEGER, INTENT(OUT)                               :: index
-
-      INTEGER                                            :: i
-
-      found = .FALSE.
-      index = 0
-      DO i = 1, SIZE(index_to_cell, 2)
-         IF (ALL(cell == index_to_cell(:, i))) THEN
-            found = .TRUE.
-            index = i
-            RETURN
-         END IF
-      END DO
-
-   END SUBROUTINE find_cell
-
-! **************************************************************************************************
-!> \brief Distribute individual l rows evenly across MPI ranks; empty ranges are valid.
-!> \param n_grid Number of RI-RS grid points.
-!> \param n_ranks Number of MPI ranks.
-!> \param i_rank MPI rank.
-!> \param first_l First locally owned grid row.
-!> \param last_l Last locally owned grid row.
-! **************************************************************************************************
-   SUBROUTINE dlp_l_range(n_grid, n_ranks, i_rank, first_l, last_l)
-      INTEGER, INTENT(IN)                                :: n_grid, n_ranks, i_rank
-      INTEGER, INTENT(OUT)                               :: first_l, last_l
-
-      CPASSERT(i_rank >= 0 .AND. i_rank < n_ranks)
-      first_l = INT(INT(n_grid, int_8)*INT(i_rank, int_8)/INT(n_ranks, int_8)) + 1
-      last_l = INT(INT(n_grid, int_8)*INT(i_rank + 1, int_8)/INT(n_ranks, int_8))
-   END SUBROUTINE dlp_l_range
-
-! **************************************************************************************************
-!> \brief Transform local l rows to target q and gather rows for the q-local solves.
-!> d_lP(q)=Σ_T exp(iqT)d_lP(T); two send buffers overlap transfer with the next target transform.
-!> Each rank holds all P and T for its l interval; each destination receives one complete q.
-!> \param bs_env ...
-!> \param target_cells ...
-!> \param target_R ...
-!> \param qpoints ...
-!> \param i_batch ...
-!> \param distributed ...
-!> \param required_q ...
-!> \param target_q ...
-!> \param iq ...
-! **************************************************************************************************
-   SUBROUTINE dlp_target_q_batch(bs_env, target_cells, target_R, qpoints, i_batch, distributed, &
-                                 required_q, target_q, iq)
-      TYPE(post_scf_bandstructure_type), POINTER         :: bs_env
-      INTEGER, INTENT(IN)                                :: target_cells(:, :)
-      REAL(dp), CONTIGUOUS, INTENT(IN), TARGET           :: target_R(:, :, :)
-      REAL(dp), INTENT(IN)                               :: qpoints(:, :)
-      INTEGER, INTENT(IN)                                :: i_batch
-      LOGICAL, INTENT(IN)                                :: distributed, required_q(:)
-      COMPLEX(dp), ASYNCHRONOUS, CONTIGUOUS, INTENT(OUT) :: target_q(:, :)
-      INTEGER, INTENT(OUT)                               :: iq
-
-      COMPLEX(dp)                                        :: phase
-      COMPLEX(dp), ALLOCATABLE, ASYNCHRONOUS             :: receive_q(:), send_q(:, :, :)
-      INTEGER :: cell_index(3), first_l, handle, i_dest, i_grid, i_l, i_P, i_q, i_rank, i_slot, &
-         i_T, last_l, local_first_l, local_last_l, n_active_q, n_grid_P, n_l, n_P, n_ranks, &
-         n_recv, position, q_column, q_offset
-      INTEGER(KIND=int_8)                                :: work_bytes
-      INTEGER, ALLOCATABLE                               :: q_indices(:)
-      LOGICAL                                            :: receiving, sending(2), use_blas
-      REAL(dp)                                           :: qpoint(3)
-      REAL(dp), ALLOCATABLE                              :: phase_imag(:, :), phase_real(:, :), &
-                                                            result_imag(:, :), result_real(:, :)
-      REAL(dp), CONTIGUOUS, POINTER                      :: target_matrix(:, :)
-      TYPE(mp_request_type)                              :: send_requests(2)
-      TYPE(mp_request_type), ALLOCATABLE                 :: recv_requests(:)
-      INTERFACE
-         SUBROUTINE dgemm(transa, transb, m, n, k, alpha, a, lda, b, ldb, beta, c, ldc)
-            IMPORT dp
-            CHARACTER(LEN=1), INTENT(IN) :: transa, transb
-            INTEGER, INTENT(IN) :: m, n, k, lda, ldb, ldc
-            REAL(dp), INTENT(IN) :: alpha, beta, a(lda, *), b(ldb, *)
-            REAL(dp), INTENT(INOUT) :: c(ldc, *)
-         END SUBROUTINE dgemm
-      END INTERFACE
-
-      CALL timeset('d_lP_T_to_q', handle)
-
-      n_ranks = bs_env%para_env%num_pe
-      i_rank = bs_env%para_env%mepos
-      CPASSERT(SIZE(required_q) == SIZE(qpoints, 2))
-      q_offset = 0
-      IF (distributed) q_offset = 1
-      iq = i_batch*n_ranks + MODULO(i_rank - q_offset, n_ranks) + 1
-      CALL dlp_l_range(SIZE(target_q, 1), n_ranks, i_rank, local_first_l, local_last_l)
-      CPASSERT(SIZE(target_R, 1) == local_last_l - local_first_l + 1)
-      CPASSERT(SIZE(target_R, 2) == SIZE(target_q, 2))
-      CPASSERT(SIZE(target_q, KIND=int_8) <= INT(HUGE(0), int_8))
-      n_P = SIZE(target_q, 2)
-      ALLOCATE (recv_requests(n_ranks), send_q(SIZE(target_R, 1), SIZE(target_R, 2), 2))
-      target_q = z_zero
-      n_recv = 0
-      receiving = .FALSE.
-      IF (iq <= SIZE(qpoints, 2)) receiving = required_q(iq)
-      IF (receiving) THEN
-         ! Packed rank blocks: offset=(first_l-1)*n_P, followed by local (l,P) order.
-         ! Receive into contiguous storage before assigning the noncontiguous output rows.
-         ALLOCATE (receive_q(SIZE(target_q)))
-         DO i_dest = 0, n_ranks - 1
-            IF (i_dest == i_rank) CYCLE
-            CALL dlp_l_range(SIZE(target_q, 1), n_ranks, i_dest, first_l, last_l)
-            IF (last_l < first_l .OR. n_P == 0) CYCLE
-            n_recv = n_recv + 1
-            CALL bs_env%para_env%irecv(receive_q((first_l - 1)*n_P + 1:last_l*n_P), &
-                                       i_dest, recv_requests(n_recv), tag=29571)
-         END DO
-      END IF
-      ! Form several Fourier sums from the locally owned l rows using real BLAS.
-      ! Bound the additional storage; large cases retain the two-buffer path.
-      n_active_q = 0
-      ALLOCATE (q_indices(n_ranks))
-      DO i_dest = 0, n_ranks - 1
-         i_q = i_batch*n_ranks + MODULO(i_dest - q_offset, n_ranks) + 1
-         IF (i_q > SIZE(qpoints, 2)) CYCLE
-         IF (.NOT. required_q(i_q)) CYCLE
-         n_active_q = n_active_q + 1
-         q_indices(n_active_q) = i_q
-      END DO
-      work_bytes = INT(SIZE(target_R, 1), int_8)*INT(SIZE(target_R, 2), int_8)
-      use_blas = work_bytes > 0_int_8 .AND. work_bytes <= INT(HUGE(n_grid_P), int_8)
-      IF (use_blas) THEN
-         n_grid_P = INT(work_bytes)
-         work_bytes = 16_int_8*INT(n_active_q, int_8)* &
-                      (work_bytes + INT(SIZE(target_cells, 2), int_8))
-         use_blas = n_active_q >= 4 .AND. SIZE(target_cells, 2) >= 32 .AND. &
-                    work_bytes <= 64_int_8*1024_int_8*1024_int_8
-      END IF
-      IF (use_blas) THEN
-         ALLOCATE (phase_real(SIZE(target_cells, 2), n_active_q), &
-                   phase_imag(SIZE(target_cells, 2), n_active_q), &
-                   result_real(n_grid_P, n_active_q), result_imag(n_grid_P, n_active_q))
-         DO q_column = 1, n_active_q
-            qpoint(:) = qpoints(1:3, q_indices(q_column))
-            DO i_T = 1, SIZE(target_cells, 2)
-               cell_index(:) = target_cells(1:3, i_T)
-               phase = lattice_phase(qpoint, cell_index)
-               phase_real(i_T, q_column) = REAL(phase, KIND=dp)
-               phase_imag(i_T, q_column) = AIMAG(phase)
-            END DO
-         END DO
-         target_matrix(1:n_grid_P, 1:SIZE(target_cells, 2)) => target_R
-         CALL dgemm('N', 'N', n_grid_P, n_active_q, SIZE(target_cells, 2), &
-                    1.0_dp, target_matrix, n_grid_P, phase_real, SIZE(target_cells, 2), &
-                    0.0_dp, result_real, n_grid_P)
-         CALL dgemm('N', 'N', n_grid_P, n_active_q, SIZE(target_cells, 2), &
-                    1.0_dp, target_matrix, n_grid_P, phase_imag, SIZE(target_cells, 2), &
-                    0.0_dp, result_imag, n_grid_P)
-      END IF
-      sending = .FALSE.
-      q_column = 0
-      IF (SIZE(target_R, 1) > 0 .AND. SIZE(target_R, 2) > 0) THEN
-         DO i_dest = 0, n_ranks - 1
-            i_q = i_batch*n_ranks + MODULO(i_dest - q_offset, n_ranks) + 1
-            IF (i_q > SIZE(qpoints, 2)) CYCLE
-            IF (.NOT. required_q(i_q)) CYCLE
-            q_column = q_column + 1
-            i_slot = MODULO(i_dest, 2) + 1
-            IF (sending(i_slot)) CALL mp_waitall(send_requests(i_slot:i_slot))
-            sending(i_slot) = .FALSE.
-            IF (use_blas) THEN
-               DO i_P = 1, SIZE(target_R, 2)
-                  DO i_grid = 1, SIZE(target_R, 1)
-                     i_T = (i_P - 1)*SIZE(target_R, 1) + i_grid
-                     send_q(i_grid, i_P, i_slot) = &
-                        CMPLX(result_real(i_T, q_column), result_imag(i_T, q_column), KIND=dp)
-                  END DO
-               END DO
-            ELSE
-               send_q(:, :, i_slot) = z_zero
-               DO i_T = 1, SIZE(target_cells, 2)
-                  send_q(:, :, i_slot) = send_q(:, :, i_slot) + &
-                                         lattice_phase(qpoints(:, i_q), target_cells(:, i_T))*target_R(:, :, i_T)
-               END DO
-            END IF
-            IF (i_dest == i_rank) THEN
-               target_q(local_first_l:local_last_l, :) = send_q(:, :, i_slot)
-            ELSE
-               CALL bs_env%para_env%isend(send_q(:, :, i_slot), i_dest, send_requests(i_slot), tag=29571)
-               sending(i_slot) = .TRUE.
-            END IF
-         END DO
-      END IF
-      DO i_slot = 1, 2
-         IF (sending(i_slot)) CALL mp_waitall(send_requests(i_slot:i_slot))
-      END DO
-      IF (n_recv > 0) CALL mp_waitall(recv_requests(:n_recv))
-      IF (receiving) THEN
-         DO i_dest = 0, n_ranks - 1
-            IF (i_dest == i_rank) CYCLE
-            CALL dlp_l_range(SIZE(target_q, 1), n_ranks, i_dest, first_l, last_l)
-            n_l = last_l - first_l + 1
-            DO i_P = 1, n_P
-               position = (first_l - 1)*n_P + (i_P - 1)*n_l
-               DO i_l = 1, n_l
-                  target_q(first_l + i_l - 1, i_P) = receive_q(position + i_l)
-               END DO
-            END DO
-         END DO
-         DEALLOCATE (receive_q)
-      END IF
-      DEALLOCATE (send_q, recv_requests)
-
-      CALL timestop(handle)
-
-   END SUBROUTINE dlp_target_q_batch
-
-! **************************************************************************************************
-!> \brief Evaluate d_lP^T by real-space numerical quadrature.
-!> \param bs_env ...
-!> \param grid_points ...
-!> \param target_cells ...
-!> \param target_R ...
-!> \param qpoints ...
-!> \param charge_lq ...
-! **************************************************************************************************
-   SUBROUTINE build_dlp_selected(bs_env, grid_points, target_cells, target_R, &
-                                 qpoints, charge_lq)
-      TYPE(post_scf_bandstructure_type), POINTER         :: bs_env
-      REAL(dp), INTENT(IN)                               :: grid_points(:, :)
-      INTEGER, INTENT(IN)                                :: target_cells(:, :)
-      REAL(dp), ALLOCATABLE, INTENT(OUT)                 :: target_R(:, :, :)
-      REAL(dp), INTENT(IN), OPTIONAL                     :: qpoints(:, :)
-      COMPLEX(dp), ALLOCATABLE, INTENT(OUT), OPTIONAL    :: charge_lq(:, :)
-
-      INTEGER                                            :: first_l, handle, last_l, n_P
-
-      IF (bs_env%unit_nr > 0) THEN
-         WRITE (bs_env%unit_nr, '(T2,A,T72,A9)') 'd_lP method', 'NUMERICAL'
-      END IF
-      CALL dlp_l_range(SIZE(grid_points, 2), bs_env%para_env%num_pe, &
-                       bs_env%para_env%mepos, first_l, last_l)
-      n_P = bs_env%n_RI
-      IF (bs_env%auto_ri%enabled) n_P = SUM(bs_env%auto_ri%sizes_opt_RI)
-      ALLOCATE (target_R(last_l - first_l + 1, n_P, SIZE(target_cells, 2)))
-
-      CALL timeset("d_lP_uniform_grid", handle)
-
-      IF (PRESENT(charge_lq)) THEN
-         CPASSERT(PRESENT(qpoints))
-         ALLOCATE (charge_lq(SIZE(grid_points, 2), SIZE(qpoints, 2)))
-         CALL build_uniform_dlp(bs_env, grid_points, target_cells, target_R, first_l, &
-                                qpoints, charge_lq)
-      ELSE
-         CALL build_uniform_dlp(bs_env, grid_points, target_cells, target_R, first_l)
-      END IF
-
-      CALL timestop(handle)
-
-      IF (.NOT. ALL(ieee_is_finite(target_R))) THEN
-         CPABORT("Nonfinite DLP cell value")
-      END IF
-   END SUBROUTINE build_dlp_selected
 
 ! **************************************************************************************************
 !> \brief Cache Gamma-correction response in imaginary time, distributed by RI-RS grid rows.
@@ -5708,7 +4712,7 @@ CONTAINS
       COMPLEX(KIND=dp), INTENT(IN)                       :: orbitals(:, :), gamma_corr(:, :, :)
       INTEGER, INTENT(IN)                                :: k, spin, owner
 
-      COMPLEX(KIND=dp), ALLOCATABLE                      :: go(:, :), gv(:, :), panel(:, :), &
+      COMPLEX(KIND=dp), ALLOCATABLE                      :: block(:, :), go(:, :), gv(:, :), &
                                                             scaled(:, :)
       INTEGER                                            :: a, c, d, first, i, last, ng, no, nr, nv, &
                                                             t
@@ -5727,7 +4731,7 @@ CONTAINS
       mid = 0.5_dp*(gwkp_env%eigenvalues_G(no, k, spin) + gwkp_env%eigenvalues_G(no + 1, k, spin))
       weight = bs_env%spin_degeneracy*bs_env%kpoints_scf_desymm%wkp(k)
       ALLOCATE (occ_factor(no), vir_factor(nv), scaled(nr, no + nv))
-      ALLOCATE (go(nr, ng), gv(nr, ng), panel(nr, no))
+      ALLOCATE (go(nr, ng), gv(nr, ng), block(nr, no))
       DO t = 1, bs_env%num_time_freq_points
          tau = bs_env%time_frequency_grid%imaginary_time(t)
          DO i = 1, no
@@ -5746,9 +4750,9 @@ CONTAINS
             state%chi_tau(:, :, t) = state%chi_tau(:, :, t) + weight*CONJG(go)*gv
             DO c = 1, 3
                CALL zgemm('N', 'T', nr, no, nv, z_one, scaled(1, no + 1), nr, &
-                          gamma_corr(:, :, c), no, z_zero, panel, nr)
+                          gamma_corr(:, :, c), no, z_zero, block, nr)
                state%wing_tau(:, c, t) = state%wing_tau(:, c, t) + &
-                                         weight*SUM(CONJG(scaled(:, 1:no))*panel, DIM=2)
+                                         weight*SUM(CONJG(scaled(:, 1:no))*block, DIM=2)
             END DO
          END IF
          IF (bs_env%para_env%mepos == owner) THEN
@@ -5765,7 +4769,7 @@ CONTAINS
             END DO
          END IF
       END DO
-      DEALLOCATE (occ_factor, vir_factor, scaled, go, gv, panel)
+      DEALLOCATE (occ_factor, vir_factor, scaled, go, gv, block)
    END SUBROUTINE accumulate_k_time_rows
 
 ! **************************************************************************************************
@@ -6626,27 +5630,27 @@ CONTAINS
    END SUBROUTINE add_gamma_corr_pair_cell
 
 ! **************************************************************************************************
-!> \brief Form target Bloch orbitals once instead of communicating them for every self-energy.
+!> \brief Form band Bloch orbitals once instead of communicating them for every self-energy.
 !> \param bs_env ...
 !> \param phi_R ...
 !> \param orbitals ...
 !> \param phi_native_k ...
 ! **************************************************************************************************
-   SUBROUTINE collect_target_bloch_orbitals(bs_env, phi_R, orbitals, phi_native_k)
+   SUBROUTINE collect_band_bloch_orbitals(bs_env, phi_R, orbitals, phi_native_k)
       TYPE(post_scf_bandstructure_type), POINTER         :: bs_env
       REAL(KIND=dp), INTENT(IN)                          :: phi_R(:, :, :)
       COMPLEX(dp), ALLOCATABLE, INTENT(INOUT)            :: orbitals(:, :, :, :)
       COMPLEX(dp), INTENT(IN), OPTIONAL                  :: phi_native_k(:, :, :)
 
-      CHARACTER(LEN=*), PARAMETER :: routineN = 'collect_target_bloch_orbitals'
+      CHARACTER(LEN=*), PARAMETER :: routineN = 'collect_band_bloch_orbitals'
       REAL(dp), PARAMETER :: progress_fraction(9) = [0.001_dp, 0.003_dp, 0.01_dp, 0.03_dp, 0.1_dp, &
          0.3_dp, 0.6_dp, 0.9_dp, 1.0_dp]
 
       COMPLEX(KIND=dp)                                   :: phase
       COMPLEX(KIND=dp), ALLOCATABLE                      :: coefficients(:, :, :, :), phi_k(:, :), &
                                                             phi_plane(:, :), psi_k(:, :)
-      INTEGER :: handle, i_local, i_native, i_node, i_owned, i_progress, i_R, i_root, i_row, &
-         i_target, ispin, n_grid, n_local, n_local_max, n_node, n_owned
+      INTEGER :: handle, i_kp_eval, i_local, i_native, i_node, i_owned, i_progress, i_R, i_root, &
+         i_row, ispin, n_grid, n_local, n_local_max, n_node, n_owned
       REAL(KIND=dp)                                      :: available_GB, delta_k(3), orbital_bytes, &
                                                             start_time
       TYPE(mp_comm_type)                                 :: node_comm
@@ -6667,7 +5671,7 @@ CONTAINS
       CPASSERT(bs_env%para_env%mepos >= 0)
       CPASSERT(bs_env%para_env%mepos < bs_env%para_env%num_pe)
       CPASSERT(.NOT. ALLOCATED(orbitals))
-      CALL collect_target_mo_coefficients(bs_env, coefficients)
+      CALL collect_band_mo_coefficients(bs_env, coefficients)
       CALL node_comm%from_split_type(bs_env%para_env, mp_comm_split_type_shared, key=bs_env%para_env%mepos)
       n_node = node_comm%num_pe
       i_node = node_comm%mepos
@@ -6693,7 +5697,7 @@ CONTAINS
             'GW band-path orbitals: GB per rank', 16.0_dp*REAL(SIZE(orbitals, KIND=int_8), dp)*1.0E-9_dp
          FLUSH (bs_env%unit_nr)
       END IF
-      ! Node-local ranks compute disjoint rows and exchange each completed target.
+      ! Node-local ranks compute disjoint rows and exchange each completed band.
       IF (PRESENT(phi_native_k)) ALLOCATE (phi_plane(n_grid, bs_env%n_ao))
       start_time = m_walltime()
       i_progress = 1
@@ -6701,11 +5705,11 @@ CONTAINS
          WRITE (bs_env%unit_nr, '(T2,A)') 'GW: evaluating band-path orbitals on the RI-RS grid'
          FLUSH (bs_env%unit_nr)
       END IF
-      DO i_target = 1, bs_env%nkp_bs_and_DOS
+      DO i_kp_eval = 1, bs_env%nkp_bs_and_DOS
          i_native = 0
-         IF (PRESENT(phi_native_k) .AND. i_target <= bs_env%nkp_scf_desymm) THEN
-            delta_k = bs_env%kpoints_DOS%xkp(:, i_target) - bs_env%kpoints_scf_desymm%xkp(:, i_target)
-            IF (MAXVAL(ABS(delta_k - ANINT(delta_k))) <= 64.0_dp*EPSILON(1.0_dp)) i_native = i_target
+         IF (PRESENT(phi_native_k) .AND. i_kp_eval <= bs_env%nkp_scf_desymm) THEN
+            delta_k = bs_env%kpoints_DOS%xkp(:, i_kp_eval) - bs_env%kpoints_scf_desymm%xkp(:, i_kp_eval)
+            IF (MAXVAL(ABS(delta_k - ANINT(delta_k))) <= 64.0_dp*EPSILON(1.0_dp)) i_native = i_kp_eval
          END IF
          phi_k = z_zero
          IF (i_native > 0) THEN
@@ -6719,7 +5723,7 @@ CONTAINS
             END DO
          ELSE
             DO i_R = 1, SIZE(phi_R, 3)
-               phase = EXP(CMPLX(0.0_dp, twopi*SUM(bs_env%kpoints_DOS%xkp(:, i_target)* &
+               phase = EXP(CMPLX(0.0_dp, twopi*SUM(bs_env%kpoints_DOS%xkp(:, i_kp_eval)* &
                                                    bs_env%index_to_cell_3c(:, i_R)), KIND=dp))
                DO i_local = 1, n_local
                   i_row = i_node + 1 + (i_local - 1)*n_node
@@ -6730,27 +5734,27 @@ CONTAINS
          IF (n_local > 0) THEN
             DO ispin = 1, bs_env%n_spin
                CALL zgemm('N', 'N', n_local, bs_env%n_ao, bs_env%n_ao, z_one, phi_k, n_local, &
-                          coefficients(:, :, i_target, ispin), bs_env%n_ao, z_zero, psi_k, n_local)
+                          coefficients(:, :, i_kp_eval, ispin), bs_env%n_ao, z_zero, psi_k, n_local)
                DO i_local = 1, n_local
                   i_row = i_node + 1 + (i_local - 1)*n_node
-                  orbitals(i_row, :, i_target, ispin) = psi_k(i_local, :)
+                  orbitals(i_row, :, i_kp_eval, ispin) = psi_k(i_local, :)
                END DO
             END DO
          END IF
          DO ispin = 1, bs_env%n_spin
-            CALL node_comm%sum(orbitals(:, :, i_target, ispin))
+            CALL node_comm%sum(orbitals(:, :, i_kp_eval, ispin))
          END DO
          IF (i_progress <= SIZE(progress_fraction)) THEN
-            IF (REAL(i_target, dp) >= progress_fraction(i_progress)*REAL(bs_env%nkp_bs_and_DOS, dp)) THEN
+            IF (REAL(i_kp_eval, dp) >= progress_fraction(i_progress)*REAL(bs_env%nkp_bs_and_DOS, dp)) THEN
             IF (bs_env%unit_nr > 0) THEN
                WRITE (bs_env%unit_nr, '(T2,A,T26,I5,A,I0,T40,F5.1,A,T55,A,T69,F10.1,A)') &
-                  'GW band-path k-points ', i_target, ' / ', bs_env%nkp_bs_and_DOS, &
-                  100.0_dp*REAL(i_target, dp)/REAL(bs_env%nkp_bs_and_DOS, dp), ' %', &
+                  'GW band-path k-points ', i_kp_eval, ' / ', bs_env%nkp_bs_and_DOS, &
+                  100.0_dp*REAL(i_kp_eval, dp)/REAL(bs_env%nkp_bs_and_DOS, dp), ' %', &
                   'Total time:', m_walltime() - start_time, ' s'
                FLUSH (bs_env%unit_nr)
             END IF
             DO WHILE (i_progress <= SIZE(progress_fraction))
-               IF (REAL(i_target, dp) < progress_fraction(i_progress)*REAL(bs_env%nkp_bs_and_DOS, dp)) EXIT
+               IF (REAL(i_kp_eval, dp) < progress_fraction(i_progress)*REAL(bs_env%nkp_bs_and_DOS, dp)) EXIT
                i_progress = i_progress + 1
             END DO
             END IF
@@ -6762,10 +5766,10 @@ CONTAINS
 
       CALL timestop(handle)
 
-   END SUBROUTINE collect_target_bloch_orbitals
+   END SUBROUTINE collect_band_bloch_orbitals
 
 ! **************************************************************************************************
-!> \brief Build the target/q interpolation geometry once for all imaginary-time projections.
+!> \brief Build the band/q interpolation geometry once for all imaginary-time projections.
 !> \param bs_env ...
 !> \param interpolation ...
 ! **************************************************************************************************
@@ -6775,7 +5779,7 @@ CONTAINS
 
       CHARACTER(LEN=*), PARAMETER :: routineN = 'build_projection_interpolation'
 
-      INTEGER                                            :: handle, i_target, iq, n_offmesh, &
+      INTEGER                                            :: handle, i_kp_eval, iq, n_offmesh, &
                                                             native_iq
       REAL(KIND=dp)                                      :: delta_k(3)
 
@@ -6786,17 +5790,17 @@ CONTAINS
       interpolation%native_iq = 0
       interpolation%offmesh_index = 0
       n_offmesh = 0
-      DO i_target = 1, bs_env%nkp_bs_and_DOS
+      DO i_kp_eval = 1, bs_env%nkp_bs_and_DOS
          native_iq = 0
-         IF (i_target <= bs_env%nkp_scf_desymm) THEN
-            delta_k = bs_env%kpoints_DOS%xkp(:, i_target) - &
-                      bs_env%kpoints_scf_desymm%xkp(:, i_target)
+         IF (i_kp_eval <= bs_env%nkp_scf_desymm) THEN
+            delta_k = bs_env%kpoints_DOS%xkp(:, i_kp_eval) - &
+                      bs_env%kpoints_scf_desymm%xkp(:, i_kp_eval)
             IF (MAXVAL(ABS(delta_k - ANINT(delta_k))) <= 64.0_dp*EPSILON(1.0_dp)) THEN
-               native_iq = i_target
+               native_iq = i_kp_eval
             END IF
          ELSE
             DO iq = 1, bs_env%nkp_scf_desymm
-               delta_k = bs_env%kpoints_DOS%xkp(:, i_target) - &
+               delta_k = bs_env%kpoints_DOS%xkp(:, i_kp_eval) - &
                          bs_env%kpoints_scf_desymm%xkp(:, iq)
                IF (MAXVAL(ABS(delta_k - ANINT(delta_k))) <= 64.0_dp*EPSILON(1.0_dp)) THEN
                   native_iq = iq
@@ -6804,20 +5808,20 @@ CONTAINS
                END IF
             END DO
          END IF
-         interpolation%native_iq(i_target) = native_iq
+         interpolation%native_iq(i_kp_eval) = native_iq
          IF (native_iq == 0) THEN
             n_offmesh = n_offmesh + 1
-            interpolation%offmesh_index(i_target) = n_offmesh
+            interpolation%offmesh_index(i_kp_eval) = n_offmesh
          END IF
       END DO
       ! Bound the replicated geometry cache; large band paths keep the original evaluation.
       IF (8.0_dp*REAL(bs_env%nkp_scf_desymm, dp)*REAL(n_offmesh, dp) <= 256.0_dp*1024.0_dp**2) THEN
          ALLOCATE (interpolation%weights(bs_env%nkp_scf_desymm, n_offmesh))
-         DO i_target = 1, bs_env%nkp_bs_and_DOS
-            IF (interpolation%offmesh_index(i_target) == 0) CYCLE
+         DO i_kp_eval = 1, bs_env%nkp_bs_and_DOS
+            IF (interpolation%offmesh_index(i_kp_eval) == 0) CYCLE
             DO iq = 1, bs_env%nkp_scf_desymm
-               interpolation%weights(iq, interpolation%offmesh_index(i_target)) = &
-                  cardinal_weight(bs_env%kpoints_DOS%xkp(:, i_target) - &
+               interpolation%weights(iq, interpolation%offmesh_index(i_kp_eval)) = &
+                  cardinal_weight(bs_env%kpoints_DOS%xkp(:, i_kp_eval) - &
                                   bs_env%kpoints_scf_desymm%xkp(:, iq), &
                                   bs_env%kpoints_scf_desymm%nkp_grid)
             END DO
@@ -6829,49 +5833,49 @@ CONTAINS
    END SUBROUTINE build_projection_interpolation
 
 ! **************************************************************************************************
-!> \brief Replicate target-k MO coefficients once before imaginary-time work is split into groups.
+!> \brief Replicate band-k MO coefficients once before imaginary-time work is split into groups.
 !> \param bs_env ...
-!> \param target_coefficients ...
+!> \param band_coefficients ...
 ! **************************************************************************************************
-   SUBROUTINE collect_target_mo_coefficients(bs_env, target_coefficients)
+   SUBROUTINE collect_band_mo_coefficients(bs_env, band_coefficients)
       TYPE(post_scf_bandstructure_type), POINTER         :: bs_env
-      COMPLEX(KIND=dp), ALLOCATABLE, INTENT(OUT) :: target_coefficients(:, :, :, :)
+      COMPLEX(KIND=dp), ALLOCATABLE, INTENT(OUT)         :: band_coefficients(:, :, :, :)
 
-      CHARACTER(LEN=*), PARAMETER :: routineN = 'collect_target_mo_coefficients'
+      CHARACTER(LEN=*), PARAMETER :: routineN = 'collect_band_mo_coefficients'
 
-      INTEGER                                            :: handle, i_col, i_row, i_target, ispin, &
+      INTEGER                                            :: handle, i_col, i_kp_eval, i_row, ispin, &
                                                             ncol_local, nrow_local
       INTEGER, POINTER                                   :: col_indices(:), row_indices(:)
 
       CALL timeset(routineN, handle)
 
-      ALLOCATE (target_coefficients(bs_env%n_ao, bs_env%n_ao, &
-                                    bs_env%nkp_bs_and_DOS, bs_env%n_spin))
-      target_coefficients = z_zero
+      ALLOCATE (band_coefficients(bs_env%n_ao, bs_env%n_ao, &
+                                  bs_env%nkp_bs_and_DOS, bs_env%n_spin))
+      band_coefficients = z_zero
       DO ispin = 1, bs_env%n_spin
-         DO i_target = 1, bs_env%nkp_bs_and_DOS
-            CALL cp_cfm_get_info(bs_env%cfm_mo_coeff_kp(i_target, ispin), &
+         DO i_kp_eval = 1, bs_env%nkp_bs_and_DOS
+            CALL cp_cfm_get_info(bs_env%cfm_mo_coeff_kp(i_kp_eval, ispin), &
                                  nrow_local=nrow_local, ncol_local=ncol_local, &
                                  row_indices=row_indices, col_indices=col_indices)
             DO i_col = 1, ncol_local
                DO i_row = 1, nrow_local
-                  target_coefficients(row_indices(i_row), col_indices(i_col), i_target, ispin) = &
-                     bs_env%cfm_mo_coeff_kp(i_target, ispin)%local_data(i_row, i_col)
+                  band_coefficients(row_indices(i_row), col_indices(i_col), i_kp_eval, ispin) = &
+                     bs_env%cfm_mo_coeff_kp(i_kp_eval, ispin)%local_data(i_row, i_col)
                END DO
             END DO
          END DO
       END DO
-      CALL bs_env%para_env%sum(target_coefficients)
+      CALL bs_env%para_env%sum(band_coefficients)
 
       CALL timestop(handle)
 
-   END SUBROUTINE collect_target_mo_coefficients
+   END SUBROUTINE collect_band_mo_coefficients
 
 ! **************************************************************************************************
-!> \brief Interpolate Σx_ll′(k) and project onto target Bloch orbitals, Eqs. (10)-(12).
+!> \brief Interpolate Σx_ll′(k) and project onto band Bloch orbitals, Eqs. (10)-(12).
 !> Σx_nn(k) = Σ_ll′ ψ_nk(r_l)* Σx_ll′(k) ψ_nk(r_l′).
 !> Native mesh points use their existing matrix; off-mesh points use the
-!> pair-centred cardinal interpolation prepared for the requested targets.
+!> pair-centred cardinal interpolation prepared for the requested bands.
 !> \param bs_env ...
 !> \param sigma_grid ...
 !> \param first_row ...
@@ -6879,54 +5883,54 @@ CONTAINS
 !> \param ispin ...
 !> \param sigma_band ...
 !> \param interpolation ...
-!> \param target_orbitals ...
+!> \param band_orbitals ...
 ! **************************************************************************************************
    SUBROUTINE self_energy_RS_to_Bloch(bs_env, sigma_grid, first_row, last_row, ispin, sigma_band, &
-                                      interpolation, target_orbitals)
+                                      interpolation, band_orbitals)
       TYPE(post_scf_bandstructure_type), POINTER         :: bs_env
       COMPLEX(dp), INTENT(IN)                            :: sigma_grid(:, :, :)
       INTEGER, INTENT(IN)                                :: first_row, last_row, ispin
       REAL(dp), INTENT(OUT)                              :: sigma_band(:, :)
       TYPE(projection_interpolation_type), INTENT(IN)    :: interpolation
-      COMPLEX(dp), INTENT(IN)                            :: target_orbitals(:, :, :, :)
+      COMPLEX(dp), INTENT(IN)                            :: band_orbitals(:, :, :, :)
 
       CHARACTER(LEN=*), PARAMETER :: routineN = 'self_energy_RS_to_Bloch'
 
       COMPLEX(dp), ALLOCATABLE                           :: psi(:, :), sigma_k(:, :), work(:, :)
       INTEGER                                            :: handle, i_band, i_batch, i_first, &
-                                                            i_last, i_target, n_batch, n_grid, &
+                                                            i_kp_eval, i_last, n_batch, n_grid, &
                                                             native_iq, nrows, phase_handle
       LOGICAL                                            :: valid_layout
 
       CALL timeset(routineN, handle)
 
-      n_grid = SIZE(target_orbitals, 1)
+      n_grid = SIZE(band_orbitals, 1)
       nrows = last_row - first_row + 1
       CPASSERT(first_row >= 1 .AND. last_row <= n_grid .AND. nrows >= 0)
       valid_layout = SIZE(sigma_grid, 1) == nrows .AND. SIZE(sigma_grid, 2) == n_grid
       CPASSERT(valid_layout)
       CPASSERT(SIZE(sigma_grid, 3) == bs_env%nkp_scf_desymm)
-      CPASSERT(SIZE(target_orbitals, 2) == bs_env%n_ao)
-      CPASSERT(SIZE(target_orbitals, 3) == bs_env%nkp_bs_and_DOS)
-      CPASSERT(SIZE(target_orbitals, 4) == bs_env%n_spin)
+      CPASSERT(SIZE(band_orbitals, 2) == bs_env%n_ao)
+      CPASSERT(SIZE(band_orbitals, 3) == bs_env%nkp_bs_and_DOS)
+      CPASSERT(SIZE(band_orbitals, 4) == bs_env%n_spin)
       CPASSERT(SIZE(sigma_band, 1) == bs_env%n_ao)
       CPASSERT(SIZE(sigma_band, 2) == bs_env%nkp_bs_and_DOS)
       n_batch = MIN(16, bs_env%n_ao)
       ALLOCATE (sigma_k(nrows, n_grid), psi(n_grid, n_batch), work(nrows, n_batch))
       sigma_band = 0.0_dp
-      DO i_target = 1, bs_env%nkp_bs_and_DOS
+      DO i_kp_eval = 1, bs_env%nkp_bs_and_DOS
          CALL timeset(routineN//'_q_interpolation', phase_handle)
-         native_iq = interpolation%native_iq(i_target)
+         native_iq = interpolation%native_iq(i_kp_eval)
          IF (native_iq > 0) THEN
             sigma_k(:, :) = sigma_grid(:, :, native_iq)
          ELSE
-            CALL interpolate_self_energy_rows(bs_env, sigma_grid, first_row, i_target, sigma_k, interpolation)
+            CALL interpolate_self_energy_rows(bs_env, sigma_grid, first_row, i_kp_eval, sigma_k, interpolation)
          END IF
          CALL timestop(phase_handle)
          DO i_first = 1, bs_env%n_ao, n_batch
             i_last = MIN(i_first + n_batch - 1, bs_env%n_ao)
             psi = z_zero
-            psi(:, 1:i_last - i_first + 1) = target_orbitals(:, i_first:i_last, i_target, ispin)
+            psi(:, 1:i_last - i_first + 1) = band_orbitals(:, i_first:i_last, i_kp_eval, ispin)
             CALL timeset(routineN//'_apply_sigma', phase_handle)
             IF (nrows > 0) CALL zgemm('N', 'N', nrows, n_batch, n_grid, z_one, &
                                       sigma_k, nrows, psi, n_grid, z_zero, work, nrows)
@@ -6934,7 +5938,7 @@ CONTAINS
             CALL timeset(routineN//'_band_contraction', phase_handle)
             DO i_band = i_first, i_last
                i_batch = i_band - i_first + 1
-               sigma_band(i_band, i_target) = REAL(SUM(CONJG(psi(first_row:last_row, i_batch))*work(:, i_batch)), dp)
+               sigma_band(i_band, i_kp_eval) = REAL(SUM(CONJG(psi(first_row:last_row, i_batch))*work(:, i_batch)), dp)
             END DO
             CALL timestop(phase_handle)
          END DO
@@ -6949,11 +5953,11 @@ CONTAINS
    END SUBROUTINE self_energy_RS_to_Bloch
 
 ! **************************************************************************************************
-!> \brief Project ordered local Σ(l,l') pairs with cached target Bloch orbitals.
+!> \brief Project ordered local Σ(l,l') pairs with cached band Bloch orbitals.
 !>
 !> Each owned pair contributes Re[ψ_n(l)* Σ_ll'(k) ψ_n(l')]. Missing entries
-!> in the rank-local column panel are zero. Batched matrix products retain
-!> dense kernels without allocating a pair-by-target-by-band tensor.
+!> in the rank-local column block are zero. Batched matrix products retain
+!> dense kernels without allocating a pair-by-band-by-band tensor.
 !> \param bs_env ...
 !> \param sigma_pairs ...
 !> \param first_pair ...
@@ -6961,39 +5965,39 @@ CONTAINS
 !> \param sigma_band ...
 !> \param sum_env ...
 !> \param interpolation ...
-!> \param target_orbitals ...
+!> \param band_orbitals ...
 ! **************************************************************************************************
    SUBROUTINE self_energy_pairs_to_Bloch(bs_env, sigma_pairs, first_pair, ispin, sigma_band, &
-                                         sum_env, interpolation, target_orbitals)
+                                         sum_env, interpolation, band_orbitals)
       TYPE(post_scf_bandstructure_type), POINTER         :: bs_env
       COMPLEX(KIND=dp), INTENT(IN)                       :: sigma_pairs(:, :, :)
       INTEGER, INTENT(IN)                                :: first_pair, ispin
       REAL(KIND=dp), INTENT(OUT)                         :: sigma_band(:, :)
       TYPE(mp_para_env_type), POINTER                    :: sum_env
       TYPE(projection_interpolation_type), INTENT(IN)    :: interpolation
-      COMPLEX(dp), ALLOCATABLE, INTENT(IN)               :: target_orbitals(:, :, :, :)
+      COMPLEX(dp), ALLOCATABLE, INTENT(IN)               :: band_orbitals(:, :, :, :)
 
       CHARACTER(LEN=*), PARAMETER :: routineN = 'self_energy_pairs_to_Bloch'
 
       COMPLEX(KIND=dp), ALLOCATABLE                      :: sigma_columns(:, :), sigma_local(:, :), &
                                                             work(:, :)
-      INTEGER :: first_col, handle, i_band, i_batch, i_first, i_l, i_local, i_lp, i_target, &
-         i_target_first, i_target_last, i_target_local, image_offset(126), last_col, last_pair, &
+      INTEGER :: first_col, first_kp_eval, handle, i_band, i_batch, i_first, i_kp_eval, i_l, &
+         i_local, i_lp, image_offset(126), last_col, last_kp_eval, last_pair, local_kp_eval, &
          n_batch, n_grid, n_local, phase_handle
       INTEGER, ALLOCATABLE                               :: pair_order(:)
       LOGICAL                                            :: valid_layout
 
       CALL timeset(routineN, handle)
 
-      CPASSERT(ALLOCATED(target_orbitals))
-      n_grid = SIZE(target_orbitals, 1)
+      CPASSERT(ALLOCATED(band_orbitals))
+      n_grid = SIZE(band_orbitals, 1)
       n_local = SIZE(sigma_pairs, 1)
       CPASSERT(SIZE(sigma_pairs, 2) == 1)
       CPASSERT(SIZE(sigma_pairs, 3) == bs_env%nkp_scf_desymm)
-      CPASSERT(SIZE(target_orbitals, 2) == bs_env%n_ao)
-      valid_layout = SIZE(target_orbitals, 3) >= bs_env%nkp_bs_and_DOS
+      CPASSERT(SIZE(band_orbitals, 2) == bs_env%n_ao)
+      valid_layout = SIZE(band_orbitals, 3) >= bs_env%nkp_bs_and_DOS
       CPASSERT(valid_layout)
-      CPASSERT(SIZE(target_orbitals, 4) == bs_env%n_spin)
+      CPASSERT(SIZE(band_orbitals, 4) == bs_env%n_spin)
       valid_layout = first_pair >= 1 .AND. first_pair + n_local - 1 <= n_grid*n_grid
       CPASSERT(valid_layout)
       CPASSERT(SIZE(sigma_band, 1) == bs_env%n_ao)
@@ -7007,36 +6011,36 @@ CONTAINS
          n_batch = MIN(16, bs_env%n_ao)
          CALL order_pair_images(bs_env, first_pair, n_local, pair_order, image_offset)
          !$OMP PARALLEL DEFAULT(NONE) &
-         !$OMP SHARED(bs_env, sigma_pairs, first_pair, ispin, sigma_band, interpolation, target_orbitals, &
+         !$OMP SHARED(bs_env, sigma_pairs, first_pair, ispin, sigma_band, interpolation, band_orbitals, &
          !$OMP        n_grid, n_local, first_col, last_col, n_batch, pair_order, image_offset) &
-         !$OMP PRIVATE(sigma_columns, sigma_local, work, i_target, phase_handle, i_target_first, i_target_last, i_target_local, &
+         !$OMP PRIVATE(sigma_columns, sigma_local, work, i_kp_eval, phase_handle, first_kp_eval, last_kp_eval, local_kp_eval, &
          !$OMP         i_local, i_l, i_lp, i_first, i_band, i_batch)
          ALLOCATE (sigma_columns(n_grid, last_col - first_col + 1), &
-                   sigma_local(n_local, target_batch_size), work(n_grid, n_batch))
+                   sigma_local(n_local, kpoint_batch_size), work(n_grid, n_batch))
          !$OMP DO SCHEDULE(STATIC, 1)
-         DO i_target_first = 1, bs_env%nkp_bs_and_DOS, target_batch_size
-            i_target_last = MIN(i_target_first + target_batch_size - 1, bs_env%nkp_bs_and_DOS)
+         DO first_kp_eval = 1, bs_env%nkp_bs_and_DOS, kpoint_batch_size
+            last_kp_eval = MIN(first_kp_eval + kpoint_batch_size - 1, bs_env%nkp_bs_and_DOS)
             CALL timeset(routineN//'_q_interpolation', phase_handle)
-            CALL interpolate_target_batch(bs_env, sigma_pairs, i_target_first, i_target_last, &
-                                          pair_order, image_offset, sigma_local, interpolation)
+            CALL interpolate_band_self_energy(bs_env, sigma_pairs, first_kp_eval, last_kp_eval, &
+                                              pair_order, image_offset, sigma_local, interpolation)
             CALL timestop(phase_handle)
-            DO i_target = i_target_first, i_target_last
-               i_target_local = i_target - i_target_first + 1
+            DO i_kp_eval = first_kp_eval, last_kp_eval
+               local_kp_eval = i_kp_eval - first_kp_eval + 1
                sigma_columns = z_zero
                DO i_local = 1, n_local
                   i_l = MODULO(first_pair + i_local - 2, n_grid) + 1
                   i_lp = (first_pair + i_local - 2)/n_grid + 1
-                  sigma_columns(i_l, i_lp - first_col + 1) = sigma_local(i_local, i_target_local)
+                  sigma_columns(i_l, i_lp - first_col + 1) = sigma_local(i_local, local_kp_eval)
                END DO
                DO i_first = 1, bs_env%n_ao, n_batch
                   CALL timeset(routineN//'_band_contraction', phase_handle)
-                  CALL project_target_columns(n_grid, last_col - first_col + 1, &
-                                              MIN(n_batch, bs_env%n_ao - i_first + 1), first_col, i_first, &
-                                              sigma_columns, target_orbitals(:, :, i_target, ispin), work)
+                  CALL project_self_energy_columns(n_grid, last_col - first_col + 1, &
+                                                   MIN(n_batch, bs_env%n_ao - i_first + 1), first_col, i_first, &
+                                                   sigma_columns, band_orbitals(:, :, i_kp_eval, ispin), work)
                   DO i_band = i_first, MIN(i_first + n_batch - 1, bs_env%n_ao)
                      i_batch = i_band - i_first + 1
-                     sigma_band(i_band, i_target) = &
-                        REAL(SUM(CONJG(target_orbitals(:, i_band, i_target, ispin))* &
+                     sigma_band(i_band, i_kp_eval) = &
+                        REAL(SUM(CONJG(band_orbitals(:, i_band, i_kp_eval, ispin))* &
                                  work(:, i_batch)), dp)
                   END DO
                   CALL timestop(phase_handle)
@@ -7085,14 +6089,14 @@ CONTAINS
 !> \brief Build Eq. (1)'s image phases, averaging adjacent images at half-cell boundaries.
 !> Index 1+(2s_x+2)+5(2s_y+2)+25(2s_z+2) includes integer shifts and half-image averages.
 !> \param bs_env ...
-!> \param i_target ...
+!> \param i_kp_eval ...
 !> \param factors ...
 !> \param fractional_grid ...
 !> \param interpolation ...
 ! **************************************************************************************************
-   SUBROUTINE interpolation_pair_factors(bs_env, i_target, factors, fractional_grid, interpolation)
+   SUBROUTINE interpolation_pair_factors(bs_env, i_kp_eval, factors, fractional_grid, interpolation)
       TYPE(post_scf_bandstructure_type), POINTER         :: bs_env
-      INTEGER, INTENT(IN)                                :: i_target
+      INTEGER, INTENT(IN)                                :: i_kp_eval
       COMPLEX(KIND=dp), ALLOCATABLE, INTENT(OUT)         :: factors(:, :)
       REAL(KIND=dp), ALLOCATABLE, INTENT(OUT)            :: fractional_grid(:, :)
       TYPE(projection_interpolation_type), INTENT(IN), &
@@ -7113,10 +6117,10 @@ CONTAINS
       END DO
       ALLOCATE (factors(125, bs_env%nkp_scf_desymm))
       DO iq = 1, bs_env%nkp_scf_desymm
-         delta_k = bs_env%kpoints_DOS%xkp(:, i_target) - bs_env%kpoints_scf_desymm%xkp(:, iq)
+         delta_k = bs_env%kpoints_DOS%xkp(:, i_kp_eval) - bs_env%kpoints_scf_desymm%xkp(:, iq)
          IF (PRESENT(interpolation)) THEN
             IF (ALLOCATED(interpolation%weights)) THEN
-               weight = interpolation%weights(iq, interpolation%offmesh_index(i_target))
+               weight = interpolation%weights(iq, interpolation%offmesh_index(i_kp_eval))
             ELSE
                weight = cardinal_weight(delta_k, bs_env%kpoints_scf_desymm%nkp_grid)
             END IF
@@ -7188,14 +6192,14 @@ CONTAINS
 !> \param bs_env ...
 !> \param sigma_grid ...
 !> \param first_row ...
-!> \param i_target ...
+!> \param i_kp_eval ...
 !> \param sigma_k ...
 !> \param interpolation ...
 ! **************************************************************************************************
-   SUBROUTINE interpolate_self_energy_rows(bs_env, sigma_grid, first_row, i_target, sigma_k, interpolation)
+   SUBROUTINE interpolate_self_energy_rows(bs_env, sigma_grid, first_row, i_kp_eval, sigma_k, interpolation)
       TYPE(post_scf_bandstructure_type), POINTER         :: bs_env
       COMPLEX(KIND=dp), INTENT(IN)                       :: sigma_grid(:, :, :)
-      INTEGER, INTENT(IN)                                :: first_row, i_target
+      INTEGER, INTENT(IN)                                :: first_row, i_kp_eval
       COMPLEX(KIND=dp), INTENT(OUT)                      :: sigma_k(:, :)
       TYPE(projection_interpolation_type), INTENT(IN), &
          OPTIONAL                                        :: interpolation
@@ -7205,7 +6209,7 @@ CONTAINS
       INTEGER, ALLOCATABLE                               :: pair_image(:)
       REAL(KIND=dp), ALLOCATABLE                         :: fractional_grid(:, :)
 
-      CALL interpolation_pair_factors(bs_env, i_target, factors, fractional_grid, interpolation)
+      CALL interpolation_pair_factors(bs_env, i_kp_eval, factors, fractional_grid, interpolation)
       ALLOCATE (pair_image(SIZE(sigma_grid, 1)))
       sigma_k = z_zero
       DO icol = 1, SIZE(sigma_grid, 2)
@@ -7220,8 +6224,8 @@ CONTAINS
    END SUBROUTINE interpolate_self_energy_rows
 
 ! **************************************************************************************************
-!> \brief Bound simultaneous target interpolation and band-projection storage in bytes.
-!> Shared image labels and thread-private packed Σ, factors and output panels are included.
+!> \brief Bound simultaneous band interpolation and band-projection storage in bytes.
+!> Shared image labels and thread-private packed Σ, factors and output blocks are included.
 !> \param n_grid ...
 !> \param n_pairs ...
 !> \param n_k ...
@@ -7236,14 +6240,14 @@ CONTAINS
       REAL(dp)                                           :: bytes
 
       bytes = 4.0_dp*n_pairs + 24.0_dp*REAL(n_grid, dp) + 4096.0_dp + &
-              REAL(n_threads, dp)*(16.0_dp*(REAL(target_batch_size + 1, dp)*n_pairs + &
+              REAL(n_threads, dp)*(16.0_dp*(REAL(kpoint_batch_size + 1, dp)*n_pairs + &
                                             REAL(n_grid, dp)*REAL(MIN(16, n_ao) + 2, dp) + &
-                                       REAL(n_k, dp)*REAL(125*target_batch_size + pair_batch_size + target_batch_size + 125, dp) + &
-                                            REAL(pair_batch_size*target_batch_size, dp)) + 24.0_dp*REAL(n_grid, dp) + 4096.0_dp)
+                                       REAL(n_k, dp)*REAL(125*kpoint_batch_size + pair_batch_size + kpoint_batch_size + 125, dp) + &
+                                            REAL(pair_batch_size*kpoint_batch_size, dp)) + 24.0_dp*REAL(n_grid, dp) + 4096.0_dp)
    END FUNCTION projection_workspace_bytes
 
 ! **************************************************************************************************
-!> \brief Partition owned pairs by Eq. (1)'s 125 image classes once for all target k-points.
+!> \brief Partition owned pairs by Eq. (1)'s 125 image classes once for all band k-points.
 !> \param bs_env ...
 !> \param first_pair ...
 !> \param n_local ...
@@ -7294,53 +6298,53 @@ CONTAINS
    END SUBROUTINE order_pair_images
 
 ! **************************************************************************************************
-!> \brief Evaluate Eq. (1) for bounded pair and target batches with the same image factors.
-!> Native targets are copied unchanged; each image class uses Σ_(pair,q) times factors_(q,k).
+!> \brief Evaluate Eq. (1) for bounded pair and band batches with the same image factors.
+!> Native bands are copied unchanged; each image class uses Σ_(pair,q) times factors_(q,k).
 !> \param bs_env ...
 !> \param sigma_pairs ...
-!> \param first_target ...
-!> \param last_target ...
+!> \param first_kp_eval ...
+!> \param last_kp_eval ...
 !> \param pair_order ...
 !> \param image_offset ...
 !> \param sigma_k ...
 !> \param interpolation ...
 ! **************************************************************************************************
-   SUBROUTINE interpolate_target_batch(bs_env, sigma_pairs, first_target, last_target, &
-                                       pair_order, image_offset, sigma_k, interpolation)
+   SUBROUTINE interpolate_band_self_energy(bs_env, sigma_pairs, first_kp_eval, last_kp_eval, &
+                                           pair_order, image_offset, sigma_k, interpolation)
       TYPE(post_scf_bandstructure_type), POINTER         :: bs_env
       COMPLEX(dp), INTENT(IN)                            :: sigma_pairs(:, :, :)
-      INTEGER, INTENT(IN)                                :: first_target, last_target, &
+      INTEGER, INTENT(IN)                                :: first_kp_eval, last_kp_eval, &
                                                             pair_order(:), image_offset(126)
       COMPLEX(dp), INTENT(OUT)                           :: sigma_k(:, :)
       TYPE(projection_interpolation_type), INTENT(IN)    :: interpolation
 
-      COMPLEX(dp), ALLOCATABLE                           :: factors(:, :, :), panel(:, :), &
-                                                            PRODUCT(:, :), target_factors(:, :), &
+      COMPLEX(dp), ALLOCATABLE                           :: band_factors(:, :), block(:, :), &
+                                                            factors(:, :, :), PRODUCT(:, :), &
                                                             weights(:, :)
-      INTEGER                                            :: i_class, i_first, i_off, i_pair, &
-                                                            i_target, iq, n_off, n_pairs, n_q, &
+      INTEGER                                            :: i_class, i_first, i_kp_eval, i_off, &
+                                                            i_pair, iq, n_off, n_pairs, n_q, &
                                                             native_iq, &
-                                                            off_target(target_batch_size)
+                                                            offmesh_kp(kpoint_batch_size)
       REAL(dp), ALLOCATABLE                              :: fractional_grid(:, :)
 
       n_off = 0
-      DO i_target = first_target, last_target
-         native_iq = interpolation%native_iq(i_target)
+      DO i_kp_eval = first_kp_eval, last_kp_eval
+         native_iq = interpolation%native_iq(i_kp_eval)
          IF (native_iq > 0) THEN
-            sigma_k(:, i_target - first_target + 1) = sigma_pairs(:, 1, native_iq)
+            sigma_k(:, i_kp_eval - first_kp_eval + 1) = sigma_pairs(:, 1, native_iq)
          ELSE
             n_off = n_off + 1
-            off_target(n_off) = i_target
+            offmesh_kp(n_off) = i_kp_eval
          END IF
       END DO
       IF (n_off == 0) RETURN
       n_q = SIZE(sigma_pairs, 3)
-      ALLOCATE (factors(125, n_q, n_off), panel(pair_batch_size, n_q), &
+      ALLOCATE (factors(125, n_q, n_off), block(pair_batch_size, n_q), &
                 weights(n_q, n_off), PRODUCT(pair_batch_size, n_off))
       DO i_off = 1, n_off
-         CALL interpolation_pair_factors(bs_env, off_target(i_off), target_factors, fractional_grid, interpolation)
-         factors(:, :, i_off) = target_factors
-         DEALLOCATE (target_factors, fractional_grid)
+         CALL interpolation_pair_factors(bs_env, offmesh_kp(i_off), band_factors, fractional_grid, interpolation)
+         factors(:, :, i_off) = band_factors
+         DEALLOCATE (band_factors, fractional_grid)
       END DO
       DO i_class = 1, 125
          IF (image_offset(i_class) == image_offset(i_class + 1)) CYCLE
@@ -7351,28 +6355,28 @@ CONTAINS
             n_pairs = MIN(pair_batch_size, image_offset(i_class + 1) - i_first)
             DO iq = 1, n_q
                DO i_pair = 1, n_pairs
-                  panel(i_pair, iq) = sigma_pairs(pair_order(i_first + i_pair - 1), 1, iq)
+                  block(i_pair, iq) = sigma_pairs(pair_order(i_first + i_pair - 1), 1, iq)
                END DO
             END DO
-            CALL zgemm('N', 'N', n_pairs, n_off, n_q, z_one, panel, pair_batch_size, &
+            CALL zgemm('N', 'N', n_pairs, n_off, n_q, z_one, block, pair_batch_size, &
                        weights, n_q, z_zero, product, pair_batch_size)
             DO i_off = 1, n_off
                DO i_pair = 1, n_pairs
-                  sigma_k(pair_order(i_first + i_pair - 1), off_target(i_off) - first_target + 1) = &
+                  sigma_k(pair_order(i_first + i_pair - 1), offmesh_kp(i_off) - first_kp_eval + 1) = &
                      PRODUCT(i_pair, i_off)
                END DO
             END DO
          END DO
       END DO
-      DEALLOCATE (factors, panel, weights, product)
-   END SUBROUTINE interpolate_target_batch
+      DEALLOCATE (factors, block, weights, product)
+   END SUBROUTINE interpolate_band_self_energy
 
 ! **************************************************************************************************
 !> \brief Transform a periodic lattice product in a cell centred on each physical grid pair.
 !> Products of two half-shifted lattice transforms are periodic. For s nearest to
 !> H^{-1}(r_l-r_l'), F_ll'(k)=exp(2πiks) Σ_R exp(2πikR) F_ll'(R+s).
 !> The even-mesh Nyquist endpoints and half-cell choices of s are averaged symmetrically.
-!> On integer/half-shifted target meshes these averages are real separable endpoint weights,
+!> On integer/half-shifted band meshes these averages are real separable endpoint weights,
 !> allowing one FFT and one cell-vector scratch. values_R is consumed in place.
 !> first_pair>0 denotes flattened column-major pairs; otherwise first_row denotes owned rows.
 !> \param bs_env ...
@@ -7541,7 +6545,7 @@ CONTAINS
    END SUBROUTINE product_pair_shift
 
 ! **************************************************************************************************
-!> \brief Contract a contiguous column block of Σ with strided target Bloch orbitals.
+!> \brief Contract a contiguous column block of Σ with strided band Bloch orbitals.
 !> \param n_grid ...
 !> \param n_columns ...
 !> \param n_bands ...
@@ -7551,7 +6555,7 @@ CONTAINS
 !> \param orbitals ...
 !> \param work ...
 ! **************************************************************************************************
-   SUBROUTINE project_target_columns(n_grid, n_columns, n_bands, first_col, i_first, sigma_columns, orbitals, work)
+   SUBROUTINE project_self_energy_columns(n_grid, n_columns, n_bands, first_col, i_first, sigma_columns, orbitals, work)
       INTEGER, INTENT(IN)                                :: n_grid, n_columns, n_bands, first_col, &
                                                             i_first
       COMPLEX(dp), INTENT(IN) :: sigma_columns(n_grid, n_columns), orbitals(n_grid, *)
@@ -7559,7 +6563,7 @@ CONTAINS
 
       CALL zgemm('N', 'N', n_grid, n_bands, n_columns, z_one, sigma_columns, n_grid, &
                  orbitals(first_col, i_first), n_grid, z_zero, work, n_grid)
-   END SUBROUTINE project_target_columns
+   END SUBROUTINE project_self_energy_columns
 
 ! **************************************************************************************************
 !> \brief Accumulate one term of X_PQ(q,j)=sum_i T_ji Y_PQ(q,i).
@@ -8078,7 +7082,7 @@ CONTAINS
 
 ! **************************************************************************************************
 !> \brief Generate the active peer-stream fragment of L R† or L V R†.
-!> Scratch consists of a bounded row tile and, for V, its auxiliary-space intermediate.
+!> Scratch consists of a bounded matrix block and, for V, its auxiliary-space intermediate.
 !> No complete grid-pair matrix is allocated on the q owner before redistribution.
 !> \param transfer ...
 !> \param i_dest ...
@@ -8098,7 +7102,7 @@ CONTAINS
       INTEGER, INTENT(IN)                                :: i_q_local, max_rows
       COMPLEX(KIND=dp), INTENT(IN), OPTIONAL             :: interaction(:, :)
 
-      COMPLEX(KIND=dp), ALLOCATABLE                      :: tile(:, :), work(:, :)
+      COMPLEX(KIND=dp), ALLOCATABLE                      :: column_block(:, :), work(:, :)
       INTEGER                                            :: i_buffer, i_col, i_first, i_last, i_row, &
                                                             n_col, n_rank, n_row, n_rows
       INTEGER(KIND=int_8)                                :: hi, i_element, lo, n_matrix, stream_start
@@ -8123,7 +7127,7 @@ CONTAINS
          IF (i_row == 0 .AND. n_row == n_rows) THEN
             n_col = INT(MIN(INT(n_grid - i_col + 1, int_8), (hi - stream_start - i_element)/n_rows))
          END IF
-         ALLOCATE (tile(n_row, n_col))
+         ALLOCATE (column_block(n_row, n_col))
          IF (PRESENT(interaction)) THEN
             IF (.NOT. (SIZE(interaction, 1) == n_inner .AND. SIZE(interaction, 2) == n_inner)) THEN
                CPABORT("Internal GW array shape mismatch")
@@ -8132,14 +7136,14 @@ CONTAINS
             CALL zgemm('N', 'N', n_row, n_inner, n_inner, z_one, left(i_first + i_row, 1), n_grid, &
                        interaction, n_inner, z_zero, work, n_row)
             CALL zgemm('N', 'C', n_row, n_col, n_inner, z_one, work, n_row, &
-                       right(i_col, 1), n_grid, z_zero, tile, n_row)
+                       right(i_col, 1), n_grid, z_zero, column_block, n_row)
             DEALLOCATE (work)
          ELSE
             CALL zgemm('N', 'C', n_row, n_col, n_inner, z_one, left(i_first + i_row, 1), n_grid, &
-                       right(i_col, 1), n_grid, z_zero, tile, n_row)
+                       right(i_col, 1), n_grid, z_zero, column_block, n_row)
          END IF
-         transfer%send_buffer(i_buffer:i_buffer + n_row*n_col - 1) = RESHAPE(tile, [n_row*n_col])
-         DEALLOCATE (tile)
+         transfer%send_buffer(i_buffer:i_buffer + n_row*n_col - 1) = RESHAPE(column_block, [n_row*n_col])
+         DEALLOCATE (column_block)
          i_buffer = i_buffer + n_row*n_col
          i_element = i_element + INT(n_row, int_8)*n_col
       END DO
@@ -8284,21 +7288,21 @@ CONTAINS
       TYPE(mp_para_env_type), INTENT(INOUT)              :: group_env
       INTEGER, INTENT(IN)                                :: root, n
 
-      COMPLEX(KIND=dp), ALLOCATABLE                      :: tile(:, :)
+      COMPLEX(KIND=dp), ALLOCATABLE                      :: column_block(:, :)
       INTEGER                                            :: first, width
 
       IF (group_env%mepos == root) THEN
          CPASSERT(ALL(SHAPE(owner_matrix) == [n, n]))
       END IF
-      ALLOCATE (tile(n, tile_cols))
-      DO first = 1, n, tile_cols
-         width = MIN(tile_cols, n - first + 1)
-         IF (group_env%mepos == root) tile(:, 1:width) = owner_matrix(:, first:first + width - 1)
-         CALL group_env%bcast(tile(:, 1:width), root)
-         CALL cp_cfm_set_submatrix(distributed, tile(:, 1:width), &
+      ALLOCATE (column_block(n, column_block_cols))
+      DO first = 1, n, column_block_cols
+         width = MIN(column_block_cols, n - first + 1)
+         IF (group_env%mepos == root) column_block(:, 1:width) = owner_matrix(:, first:first + width - 1)
+         CALL group_env%bcast(column_block(:, 1:width), root)
+         CALL cp_cfm_set_submatrix(distributed, column_block(:, 1:width), &
                                    start_row=1, start_col=first)
       END DO
-      DEALLOCATE (tile)
+      DEALLOCATE (column_block)
    END SUBROUTINE set_owner_matrix
 
 ! **************************************************************************************************
@@ -8315,313 +7319,21 @@ CONTAINS
       TYPE(mp_para_env_type), INTENT(INOUT)              :: group_env
       INTEGER, INTENT(IN)                                :: root, n
 
-      COMPLEX(KIND=dp), ALLOCATABLE                      :: tile(:, :)
+      COMPLEX(KIND=dp), ALLOCATABLE                      :: column_block(:, :)
       INTEGER                                            :: first, width
 
       IF (group_env%mepos == root) THEN
          CPASSERT(ALL(SHAPE(owner_matrix) == [n, n]))
       END IF
-      ALLOCATE (tile(n, tile_cols))
-      DO first = 1, n, tile_cols
-         width = MIN(tile_cols, n - first + 1)
-         CALL cp_cfm_get_submatrix(distributed, tile(:, 1:width), &
+      ALLOCATE (column_block(n, column_block_cols))
+      DO first = 1, n, column_block_cols
+         width = MIN(column_block_cols, n - first + 1)
+         CALL cp_cfm_get_submatrix(distributed, column_block(:, 1:width), &
                                    start_row=1, start_col=first)
-         IF (group_env%mepos == root) owner_matrix(:, first:first + width - 1) = tile(:, 1:width)
+         IF (group_env%mepos == root) owner_matrix(:, first:first + width - 1) = column_block(:, 1:width)
       END DO
-      DEALLOCATE (tile)
+      DEALLOCATE (column_block)
    END SUBROUTINE get_owner_matrix
-
-! **************************************************************************************************
-!> \brief Print one rank-local RI-RS work milestone without synchronizing MPI ranks.
-!> Percentages count completed local units; time is the elapsed wall time since the phase began.
-!> \param unit_nr ...
-!> \param phase ...
-!> \param n_done ...
-!> \param n_total ...
-!> \param next_progress ...
-!> \param phase_start ...
-! **************************************************************************************************
-   SUBROUTINE write_ri_rs_phase_progress(unit_nr, phase, n_done, n_total, next_progress, phase_start)
-      INTEGER, INTENT(IN)                                :: unit_nr
-      CHARACTER(LEN=*), INTENT(IN)                       :: phase
-      INTEGER(KIND=int_8), INTENT(IN)                    :: n_done, n_total
-      INTEGER, INTENT(INOUT)                             :: next_progress
-      REAL(KIND=dp), INTENT(IN)                          :: phase_start
-
-      REAL(KIND=dp), PARAMETER :: milestones(9) = [0.1_dp, 0.3_dp, 1.0_dp, 3.0_dp, 10.0_dp, 30.0_dp&
-         , 60.0_dp, 90.0_dp, 100.0_dp]
-
-      CHARACTER(LEN=100)                                 :: progress_line
-      CHARACTER(LEN=20)                                  :: count_text
-      CHARACTER(LEN=32)                                  :: phase_text
-      CHARACTER(LEN=64)                                  :: progress_format
-      CHARACTER(LEN=8)                                   :: time_text
-      INTEGER                                            :: count_width, previous_progress
-      REAL(KIND=dp)                                      :: percent_done, phase_time
-
-      IF (unit_nr <= 0 .OR. n_total <= 0) RETURN
-      percent_done = 100.0_dp*REAL(n_done, dp)/REAL(n_total, dp)
-      previous_progress = next_progress
-      DO WHILE (next_progress <= SIZE(milestones))
-         IF (percent_done < milestones(next_progress)) EXIT
-         next_progress = next_progress + 1
-      END DO
-      IF (next_progress == previous_progress) RETURN
-      CPASSERT(LEN_TRIM(phase) <= 32)
-      WRITE (count_text, '(I0)') n_total
-      count_width = LEN_TRIM(count_text)
-      WRITE (progress_format, '(A,I0,A,I0,A)') &
-         '(A32,1X,I', count_width, ',A,I', count_width, ',1X,F5.1,A)'
-      phase_text = phase
-      WRITE (progress_line, progress_format) &
-         phase_text, n_done, ' / ', n_total, percent_done, ' %'
-      phase_time = m_walltime() - phase_start
-      WRITE (time_text, '(F8.1)') phase_time
-      IF (INDEX(time_text, '*') > 0) WRITE (time_text, '(ES8.1E3)') phase_time
-      IF (LEN_TRIM(progress_line) > 56) THEN
-         WRITE (unit_nr, '(T2,A)') TRIM(phase)
-         WRITE (unit_nr, '(T2,A)') TRIM(ADJUSTL(progress_line(34:)))
-         progress_line = ''
-      END IF
-      WRITE (unit_nr, '(T2,A,T60,A,T71,A,A)') TRIM(progress_line), 'Total time:', time_text, ' s'
-      FLUSH (unit_nr)
-   END SUBROUTINE write_ri_rs_phase_progress
-
-! **************************************************************************************************
-!> \brief Choose the smallest fitting divisor of MPI ranks with 30 percent reserve.
-!> A memory group has ngroups ranks and jointly holds all T. Corresponding T slices
-!> across memory groups divide g. Equal integration ranks
-!> share their uniquely evaluated fields across T groups. The caller's P result is already live.
-!> Use the existing node-memory estimate to bound temporary workspaces.
-!> Budget the maximum simultaneous integration, reduction and redistribution storage.
-!> The final redistribution needs an extra receive buffer as large as the live result.
-!> Selection masks remain live throughout; block masks have at most nl rows.
-!> \param comm ...
-!> \param nl ...
-!> \param bs_env ...
-!> \param nt ...
-!> \param nresult ...
-!> \param integration_comm ...
-!> \param field_comm ...
-!> \param ngroups ...
-! **************************************************************************************************
-   SUBROUTINE prepare_dlp_groups(comm, nl, bs_env, nt, nresult, integration_comm, field_comm, ngroups)
-      CLASS(mp_comm_type), INTENT(IN) :: comm
-      TYPE(post_scf_bandstructure_type), POINTER :: bs_env
-      INTEGER(int_8), INTENT(IN) :: nresult
-      INTEGER, INTENT(IN) :: nl, nt
-      TYPE(mp_comm_type), INTENT(OUT) :: integration_comm, field_comm
-      INTEGER, INTENT(OUT) :: ngroups
-
-      INTEGER :: maxnp
-      REAL(dp) :: contraction_bytes, selection_bytes, local_bytes, reduction_bytes
-      INTEGER :: np, igroup, integration_rank, nlocal_T
-      REAL(dp) :: result_bytes
-      REAL(dp) :: available_GB, cell_bytes, required_bytes, cyclic_bytes, workspace_bytes
-
-      np = bs_env%n_RI
-      IF (bs_env%auto_ri%enabled) np = SUM(bs_env%auto_ri%sizes_opt_RI)
-      CALL mp_mem_avail_per_rank_GB(comm, available_GB)
-      result_bytes = 8.0_dp*REAL(nresult, dp)
-      CALL comm%max(result_bytes)
-      cell_bytes = 8.0_dp*REAL(nl, dp)*REAL(np, dp)
-      cyclic_bytes = cell_bytes*REAL((nt + comm%num_pe - 1)/comm%num_pe, dp)
-      maxnp = MAXVAL(bs_env%i_RI_end_from_atom - bs_env%i_RI_start_from_atom + 1)
-      IF (bs_env%auto_ri%enabled) maxnp = MAXVAL(bs_env%auto_ri%sizes_opt_RI)
-      contraction_bytes = 8.0_dp*(REAL(nl, dp)*REAL(maxnp + 512, dp) + 512.0_dp*REAL(maxnp, dp))
-      workspace_bytes = 96.0_dp*1024.0_dp**2 + 40.0_dp*REAL(nl + 3, dp)*512.0_dp + &
-                        MAX(128.0_dp*1024.0_dp**2, contraction_bytes)
-      DO ngroups = 1, comm%num_pe
-         IF (MODULO(comm%num_pe, ngroups) /= 0) CYCLE
-         nlocal_T = (nt + ngroups - 1)/ngroups
-         ! The caller allocated target_R before this call. Its bytes are already
-         ! reflected in the measured free memory and must not be charged twice.
-         local_bytes = cell_bytes*REAL(nlocal_T, dp)
-         selection_bytes = 2.0_dp*REAL(STORAGE_SIZE(.TRUE.)/8, dp)* &
-                           REAL(nl, dp)*REAL(bs_env%n_atom, dp)*REAL(nlocal_T, dp)
-         selection_bytes = selection_bytes + 3.0_dp*REAL(STORAGE_SIZE(0)/8, dp)*REAL(nlocal_T, dp)
-         reduction_bytes = MAX(32.0_dp*1024.0_dp**2, cell_bytes)
-         required_bytes = 1.3_dp*(selection_bytes + &
-                                  MAX(local_bytes + workspace_bytes, &
-                                      local_bytes + cyclic_bytes + reduction_bytes, &
-                                      2.0_dp*cyclic_bytes + result_bytes + reduction_bytes))
-         IF (required_bytes <= available_GB*1.0E9_dp) EXIT
-      END DO
-      IF (ngroups > comm%num_pe) THEN
-         ngroups = comm%num_pe
-         CPWARN('d_lP workspaces exceed memory with all MPI ranks')
-      END IF
-      igroup = MODULO(comm%mepos, ngroups)
-      integration_rank = comm%mepos/ngroups
-      CALL integration_comm%from_split(comm, igroup, key=integration_rank)
-      CALL field_comm%from_split(comm, integration_rank, key=igroup)
-      IF (bs_env%unit_nr > 0) THEN
-         WRITE (bs_env%unit_nr, '(T2,A,T66,F12.1,A)') 'd_lP PSS-aware rank headroom:', available_GB, ' GB'
-         WRITE (bs_env%unit_nr, '(T2,A,T61,I20)') 'd_lP memory group size:', ngroups
-         WRITE (bs_env%unit_nr, '(T2,A,T61,I20)') 'd_lP independent integration groups:', integration_comm%num_pe
-         WRITE (bs_env%unit_nr, '(T2,A,T66,F12.1,A)') 'd_lP existing output storage:', result_bytes*1.0E-9_dp, ' GB'
-         WRITE (bs_env%unit_nr, '(T2,A,T66,F12.1,A)') 'd_lP additional memory budget:', required_bytes*1.0E-9_dp, ' GB'
-         FLUSH (bs_env%unit_nr)
-      END IF
-   END SUBROUTINE prepare_dlp_groups
-
-! **************************************************************************************************
-!> \brief Sum Eq. (2) directly onto ranks owning cyclic T cells, T=r+1+j*N.
-!> The first two indices are (L,P); contiguous T panels are pointer views, with no packing copy.
-!> Reduce-scatter retains only each rank's output cells instead of replicating the full sum.
-!> \param comm ...
-!> \param partial ...
-!> \param cells ...
-! **************************************************************************************************
-   SUBROUTINE sum_dlp_cyclic_cells(comm, partial, cells)
-      CLASS(mp_comm_type), INTENT(IN)                    :: comm
-      REAL(dp), CONTIGUOUS, TARGET, INTENT(IN)            :: partial(:, :, :)
-      REAL(dp), ALLOCATABLE, TARGET, INTENT(OUT)          :: cells(:, :, :)
-
-      INTEGER :: nl, np, nt, nranks, rank, nlocal, icycle, first_T, last_T, &
-                 round_first, round_last, first_rank, last_rank, panel_cells
-      INTEGER(int_8) :: plane_count, iround
-      INTEGER :: recv_counts(comm%num_pe)
-      REAL(dp), POINTER, CONTIGUOUS :: send_panel(:, :), receive_panel(:)
-      REAL(dp), TARGET :: empty(0)
-
-      nl = SIZE(partial, 1)
-      np = SIZE(partial, 2)
-      nt = SIZE(partial, 3)
-      nranks = comm%num_pe
-      rank = comm%mepos
-      nlocal = 0
-      IF (nt > rank) nlocal = 1 + (nt - 1 - rank)/nranks
-      ALLOCATE (cells(nl, np, nlocal))
-      IF (nl == 0 .OR. np == 0 .OR. nt == 0) RETURN
-      IF (nranks == 1) THEN
-         cells(:, :, :) = partial(:, :, :)
-         RETURN
-      END IF
-      plane_count = INT(nl, int_8)*INT(np, int_8)
-      IF (plane_count > HUGE(0)) THEN
-         CPABORT('DLP integration block exceeds the MPI count range')
-      END IF
-      panel_cells = INT(MAX(1_int_8, (32_int_8*1024_int_8**2/8_int_8)/plane_count))
-      panel_cells = MIN(panel_cells, INT(INT(HUGE(0), int_8)/plane_count))
-      icycle = 0
-      DO iround = 1_int_8, INT(nt, int_8), INT(nranks, int_8)
-         icycle = icycle + 1
-         round_first = INT(iround)
-         round_last = INT(MIN(INT(nt, int_8), iround + INT(nranks, int_8) - 1_int_8))
-         first_T = round_first
-         DO WHILE (first_T <= round_last)
-            last_T = INT(MIN(INT(round_last, int_8), INT(first_T, int_8) + INT(panel_cells, int_8) - 1_int_8))
-            first_rank = first_T - round_first
-            last_rank = last_T - round_first
-            recv_counts = 0
-            recv_counts(first_rank + 1:last_rank + 1) = INT(plane_count)
-            send_panel(1:INT(plane_count), 1:last_T - first_T + 1) => partial(:, :, first_T:last_T)
-            receive_panel => empty
-            IF (rank >= first_rank .AND. rank <= last_rank) THEN
-               receive_panel(1:INT(plane_count)) => cells(:, :, icycle)
-            END IF
-            CALL comm%sum_scatter(send_panel, receive_panel, recv_counts)
-            IF (last_T == round_last) EXIT
-            first_T = last_T + 1
-         END DO
-      END DO
-   END SUBROUTINE sum_dlp_cyclic_cells
-
-! **************************************************************************************************
-!> \brief Redistribute Eq. (2) from cyclic T cells to disjoint contiguous l rows.
-!> Rank r initially owns T=r+1+j*N. The caller owns first_l:first_l+size(target_R,1)-1.
-!> Only the local T slice and local l slice are materialized, never a global DLP replica.
-!> \param comm ...
-!> \param cell_values ...
-!> \param first_l ...
-!> \param target_R ...
-! **************************************************************************************************
-   SUBROUTINE distribute_dlp_rows(comm, cell_values, first_l, target_R)
-      CLASS(mp_comm_type), INTENT(IN)                    :: comm
-      REAL(dp), INTENT(IN)                               :: cell_values(:, :, :)
-      INTEGER, INTENT(IN)                                :: first_l
-      REAL(dp), INTENT(OUT)                              :: target_R(:, :, :)
-
-      INTEGER :: il, ip, irank, it, local_it, nl, np, nlocal_l, nlocal_T, nranks, nt, position
-      INTEGER(int_8) :: count_wide
-      INTEGER, ALLOCATABLE :: first_rows(:), row_counts(:), cell_counts(:), &
-                              send_counts(:), send_offsets(:), recv_counts(:), recv_offsets(:)
-      REAL(dp), ALLOCATABLE :: send_values(:), receive_values(:)
-
-      CHARACTER(LEN=*), PARAMETER :: routineN = 'distribute_dlp_rows'
-      INTEGER :: handle
-
-      CALL timeset(routineN, handle)
-
-      nranks = comm%num_pe
-      nl = SIZE(cell_values, 1)
-      np = SIZE(target_R, 2)
-      nlocal_l = SIZE(target_R, 1)
-      nt = SIZE(target_R, 3)
-      nlocal_T = SIZE(cell_values, 3)
-      CPASSERT(SIZE(cell_values, 2) == np)
-      ALLOCATE (first_rows(nranks), row_counts(nranks), cell_counts(nranks), &
-                send_counts(nranks), send_offsets(nranks), recv_counts(nranks), recv_offsets(nranks))
-      CALL comm%allgather(first_l, first_rows)
-      CALL comm%allgather(nlocal_l, row_counts)
-      CALL comm%allgather(nlocal_T, cell_counts)
-      CPASSERT(SUM(cell_counts) == nt)
-      CPASSERT(SUM(row_counts) == nl)
-      DO irank = 1, nranks
-         count_wide = INT(np, int_8)*INT(row_counts(irank), int_8)*INT(nlocal_T, int_8)
-         CPASSERT(count_wide <= HUGE(0))
-         count_wide = INT(np, int_8)*INT(nlocal_l, int_8)*INT(cell_counts(irank), int_8)
-         CPASSERT(count_wide <= HUGE(0))
-         send_counts(irank) = np*row_counts(irank)*nlocal_T
-         recv_counts(irank) = np*nlocal_l*cell_counts(irank)
-      END DO
-      CPASSERT(SUM(INT(send_counts, int_8)) <= HUGE(0))
-      CPASSERT(SUM(INT(recv_counts, int_8)) <= HUGE(0))
-      position = 0
-      DO irank = 1, nranks
-         send_offsets(irank) = position
-         position = position + send_counts(irank)
-      END DO
-      ALLOCATE (send_values(position))
-      position = 0
-      DO irank = 1, nranks
-         recv_offsets(irank) = position
-         position = position + recv_counts(irank)
-      END DO
-      ALLOCATE (receive_values(position))
-      DO irank = 1, nranks
-         position = send_offsets(irank)
-         DO local_it = 1, nlocal_T
-            DO ip = 1, np
-               DO il = first_rows(irank), first_rows(irank) + row_counts(irank) - 1
-                  position = position + 1
-                  send_values(position) = cell_values(il, ip, local_it)
-               END DO
-            END DO
-         END DO
-         CPASSERT(position == send_offsets(irank) + send_counts(irank))
-      END DO
-      CALL comm%alltoall(send_values, send_counts, send_offsets, &
-                         receive_values, recv_counts, recv_offsets)
-      DO irank = 1, nranks
-         position = recv_offsets(irank)
-         DO local_it = 1, cell_counts(irank)
-            it = irank + (local_it - 1)*nranks
-            CPASSERT(it <= nt)
-            DO ip = 1, np
-               DO il = 1, nlocal_l
-                  position = position + 1
-                  target_R(il, ip, it) = receive_values(position)
-               END DO
-            END DO
-         END DO
-         CPASSERT(position == recv_offsets(irank) + recv_counts(irank))
-      END DO
-
-      CALL timestop(handle)
-
-   END SUBROUTINE distribute_dlp_rows
 
 ! **************************************************************************************************
 !> \brief Bound the combined complex send/receive storage by free memory on every rank.
@@ -8854,2815 +7566,6 @@ CONTAINS
    END SUBROUTINE unpack_transfer_matrix
 
 ! **************************************************************************************************
-!> \brief Construct d_lP(T) by shared uniform quadrature with analytic auxiliary potentials.
-!> (1) f_l(r)=sum_mu,R ϕ_mu,R(r_l) ϕ_mu,R(r), using the explicit AO cell set.
-!> (2) d_lP(T)=integral f_l(r)^2 v_P,T(r) dr is approximated by |det S| sum_g f_l(r_g)^2 v_P,T(r_g).
-!> (3) r_g=r_0+S n covers the bounding box of r_l enlarged by padding. The spacing follows
-!> h=C/[sqrt(alpha_max log(1/epsilon))], calibrated to h=0.4 bohr for the validated Si basis
-!> at epsilon=1e-8. The padding is 1.1 sqrt[log(1/epsilon)/alpha_min].
-!> Periodic cells use r_0 at atom 1 and S=H diag(1/N_i), with integer N_i and ||S||_2<=h.
-!> Translation and cell wrapping then only shift the quadrature lattice or relabel its points.
-!> Nonperiodic systems retain r_0=0 and S=h I. Finite-box and screening errors still converge.
-!> (4) Spatial blocks of r_l are screened separately for every P-atom/T pair immediately before
-!> contraction. A triangle-inequality product bound controls discarded discrete terms, not
-!> quadrature error. For a truncated kernel, it decays outside the Coulomb cutoff.
-!> The usual l/P/T cutoff removes individual l rows before contraction.
-!> Unlike the analytic screened reference,
-!> Eq. (1) does not omit individual AO pairs; cell-domain and screening differences must converge.
-!> Quadrature tiles are MPI distributed and each AO field is evaluated once. Bounded batches
-!> share these fields within memory groups whose ranks divide T; independent groups divide g.
-!> Group sums assemble disjoint cyclic T cells. A final all-to-all
-!> redistributes the completed d(T) from T ownership to the caller's l ownership.
-!> Each memory group holds one full partial d(T), subject to the memory budget.
-!> No global AO-pair matrix is formed.
-!> EPS_FILTER/10 controls the grid, finite box and screening threshold together.
-!> \param bs_env Periodic band-structure environment.
-!> \param grid_points RI-RS points r_l, indexed (3,l).
-!> \param target_cells Retained integer lattice vectors T, indexed (3,T).
-!> \param target_R Real right-hand side indexed (local l,P,T).
-!> \param first_l Global index of the first locally owned l row.
-!> \param qpoints ...
-!> \param charge_lq ...
-! **************************************************************************************************
-   SUBROUTINE build_uniform_dlp(bs_env, grid_points, target_cells, target_R, first_l, &
-                                qpoints, charge_lq)
-      TYPE(post_scf_bandstructure_type), POINTER         :: bs_env
-      REAL(dp), INTENT(IN)                               :: grid_points(:, :)
-      INTEGER, INTENT(IN)                                :: target_cells(:, :)
-      REAL(dp), INTENT(OUT)                              :: target_R(:, :, :)
-      INTEGER, INTENT(IN)                                :: first_l
-      REAL(dp), INTENT(IN), OPTIONAL                     :: qpoints(:, :)
-      COMPLEX(dp), INTENT(OUT), OPTIONAL                 :: charge_lq(:, :)
-
-      TYPE(uniform_settings_type)                        :: settings
-
-      CALL read_uniform_settings(bs_env, grid_points, settings)
-      CALL integrate_uniform_tiles(bs_env, grid_points, target_cells, settings, target_R, first_l, &
-                                   qpoints, charge_lq)
-   END SUBROUTINE build_uniform_dlp
-
-! **************************************************************************************************
-!> \brief Accumulate Q_lq += w SUM_g f_l(r_g)^2 exp(i q.r_g) with real BLAS products.
-!> The real field is the existing f_l(r_g)^2 on one quadrature tile. Cosine and sine
-!> columns share a DGEMM; OpenMP partitions disjoint l rows without a reduction.
-!> The grid, phase convention, weights, and retained quadrature points are unchanged.
-!> \param points ...
-!> \param field ...
-!> \param q_cart ...
-!> \param weight ...
-!> \param charge_lq ...
-! **************************************************************************************************
-   SUBROUTINE accumulate_fourier_charge(points, field, q_cart, weight, charge_lq)
-      REAL(dp), INTENT(IN)                               :: points(:, :)
-      REAL(dp), CONTIGUOUS, INTENT(IN)                   :: field(:, :)
-      REAL(dp), INTENT(IN)                               :: q_cart(:, :), weight
-      COMPLEX(dp), INTENT(INOUT)                         :: charge_lq(:, :)
-
-      INTEGER, PARAMETER                                 :: row_block = 64
-
-      COMPLEX(dp)                                        :: phase
-      INTEGER                                            :: first_l, ig, il, iq, nblock, ng, nl, nq
-      REAL(dp), ALLOCATABLE                              :: charge_parts(:, :), phase_parts(:, :)
-
-      ng = SIZE(points, 2)
-      nl = SIZE(field, 2)
-      nq = SIZE(q_cart, 2)
-      CPASSERT(SIZE(points, 1) == 3 .AND. SIZE(q_cart, 1) == 3)
-      CPASSERT(SIZE(field, 1) >= ng)
-      CPASSERT(SIZE(charge_lq, 1) == nl .AND. SIZE(charge_lq, 2) == nq)
-      IF (ng == 0 .OR. nl == 0 .OR. nq == 0) RETURN
-      ALLOCATE (phase_parts(ng, 2*nq))
-      DO iq = 1, nq
-         DO ig = 1, ng
-            phase = EXP(CMPLX(0.0_dp, SUM(q_cart(:, iq)*points(:, ig)), dp))
-            phase_parts(ig, iq) = REAL(phase, dp)
-            phase_parts(ig, nq + iq) = AIMAG(phase)
-         END DO
-      END DO
-      !$OMP PARALLEL DEFAULT(NONE) IF(nl > row_block) &
-      !$OMP SHARED(field, phase_parts, charge_lq, ng, nl, nq, weight) &
-      !$OMP PRIVATE(charge_parts, first_l, il, iq, nblock)
-      ALLOCATE (charge_parts(row_block, 2*nq))
-      !$OMP DO SCHEDULE(STATIC)
-      DO first_l = 1, nl, row_block
-         nblock = MIN(row_block, nl - first_l + 1)
-         CALL dgemm('T', 'N', nblock, 2*nq, ng, weight, &
-                    field(:, first_l:first_l + nblock - 1), SIZE(field, 1), &
-                    phase_parts, ng, 0.0_dp, charge_parts, row_block)
-         DO iq = 1, nq
-            DO il = 1, nblock
-               charge_lq(first_l + il - 1, iq) = charge_lq(first_l + il - 1, iq) + &
-                                                 CMPLX(charge_parts(il, iq), charge_parts(il, nq + iq), dp)
-            END DO
-         END DO
-      END DO
-      !$OMP END DO
-      DEALLOCATE (charge_parts)
-      !$OMP END PARALLEL
-      DEALLOCATE (phase_parts)
-   END SUBROUTINE accumulate_fourier_charge
-
-! **************************************************************************************************
-!> \brief Validate the operator and define the integration box and mesh in Eq. (3).
-!> \param bs_env ...
-!> \param grid_points ...
-!> \param settings ...
-!> \param report ...
-! **************************************************************************************************
-   SUBROUTINE read_uniform_settings(bs_env, grid_points, settings, report)
-      TYPE(post_scf_bandstructure_type), POINTER         :: bs_env
-      REAL(dp), INTENT(IN)                               :: grid_points(:, :)
-      TYPE(uniform_settings_type), INTENT(OUT)           :: settings
-      LOGICAL, INTENT(IN), OPTIONAL                      :: report
-
-      INTEGER(int_8)                                     :: npoints
-      LOGICAL                                            :: report_settings
-      REAL(dp)                                           :: exponent_max, exponent_min, &
-                                                            padding_safety, spacing_prefactor
-
-      settings%accuracy = dlp_accuracy(bs_env)
-      IF (bs_env%ri_metric%potential_type /= do_potential_coulomb .AND. &
-          bs_env%ri_metric%potential_type /= do_potential_truncated .AND. &
-          bs_env%ri_metric%potential_type /= do_potential_short) THEN
-         CPABORT('Uniform DLP requires a Coulomb, truncated or short-range RI metric')
-      END IF
-      CALL ao_exponent_range(bs_env, exponent_min, exponent_max)
-      ! The AO exponent calibration includes the matched reference RI basis.
-      spacing_prefactor = 0.4_dp*SQRT(2.693604_dp*LOG(1.0E8_dp))
-      padding_safety = 1.1_dp
-      settings%l_block_edge = 1.0_dp/angstrom
-      settings%spacing = spacing_prefactor/ &
-                         SQRT(exponent_max*LOG(1.0_dp/settings%accuracy))
-      settings%padding = padding_safety*SQRT(LOG(1.0_dp/settings%accuracy)/exponent_min)
-      CALL build_uniform_mesh(bs_env, grid_points, settings)
-      npoints = PRODUCT(INT(settings%counts, int_8))
-      report_settings = .TRUE.
-      IF (PRESENT(report)) report_settings = report
-      IF (bs_env%unit_nr > 0 .AND. report_settings) THEN
-         WRITE (bs_env%unit_nr, '(T2,A,T72,ES9.1E2)') 'd_lP uniform quadrature points', REAL(npoints, dp)
-         WRITE (bs_env%unit_nr, '(T2,A,T72,ES9.1)') 'd_lP integration threshold', settings%accuracy
-         WRITE (bs_env%unit_nr, '(T2,A,T69,F12.3)') 'd_lP largest AO exponent [bohr^-2]', exponent_max
-         WRITE (bs_env%unit_nr, '(T2,A,T69,F12.3)') 'd_lP uniform spacing [bohr]', settings%spacing
-      END IF
-   END SUBROUTINE read_uniform_settings
-
-! **************************************************************************************************
-!> \brief Build Eq. (3) on a cell-commensurate lattice without coarsening its largest spacing.
-!> The integration parallelepiped contains the original padded Cartesian box.
-!> \param bs_env Band-structure environment with RI-RS cell and atoms.
-!> \param grid_points ...
-!> \param settings ...
-! **************************************************************************************************
-   SUBROUTINE build_uniform_mesh(bs_env, grid_points, settings)
-      TYPE(post_scf_bandstructure_type), POINTER         :: bs_env
-      REAL(dp), INTENT(IN)                               :: grid_points(:, :)
-      TYPE(uniform_settings_type), INTENT(INOUT)         :: settings
-
-      INTEGER                                            :: idir, subdivisions(3)
-      REAL(dp)                                           :: box_center(3), box_extent(3), &
-                                                            eigenvalues(3), inverse_step(3, 3), &
-                                                            metric(3, 3), scale, upper(3)
-      TYPE(cell_type), POINTER                           :: cell
-      TYPE(particle_type), POINTER                       :: particles(:)
-
-      CPASSERT(SIZE(grid_points, 1) == 3 .AND. SIZE(grid_points, 2) > 0)
-      CPASSERT(settings%spacing > 0.0_dp)
-      cell => bs_env%ri_rs%cell
-      particles => bs_env%ri_rs%particle_set
-      settings%origin = 0.0_dp
-      settings%step = 0.0_dp
-      inverse_step = 0.0_dp
-      settings%weight = settings%spacing**3
-      DO idir = 1, 3
-         settings%step(idir, idir) = settings%spacing
-         inverse_step(idir, idir) = 1.0_dp/settings%spacing
-      END DO
-      IF (ANY(cell%perd /= 0)) THEN
-         CPASSERT(ASSOCIATED(particles))
-         CPASSERT(SIZE(particles) > 0 .AND. ABS(cell%deth) > TINY(1.0_dp))
-         settings%origin = pbc(particles(1)%r, cell)
-         DO idir = 1, 3
-            subdivisions(idir) = MAX(1, CEILING(NORM2(cell%hmat(:, idir))/settings%spacing))
-            settings%step(:, idir) = cell%hmat(:, idir)/REAL(subdivisions(idir), dp)
-         END DO
-         metric = MATMUL(TRANSPOSE(settings%step), settings%step)
-         CALL diamat_all(metric, eigenvalues, dac=.TRUE.)
-         scale = MAX(1.0_dp, SQRT(MAXVAL(eigenvalues))/settings%spacing)
-         subdivisions = CEILING(scale*REAL(subdivisions, dp))
-         DO idir = 1, 3
-            settings%step(:, idir) = cell%hmat(:, idir)/REAL(subdivisions(idir), dp)
-            inverse_step(idir, :) = REAL(subdivisions(idir), dp)*cell%h_inv(idir, :)
-         END DO
-         settings%weight = ABS(cell%deth)/PRODUCT(REAL(subdivisions, dp))
-      ELSE
-         settings%lower = REAL(CEILING((MINVAL(grid_points, DIM=2) - settings%padding)/ &
-                                       settings%spacing), dp)
-         upper = REAL(FLOOR((MAXVAL(grid_points, DIM=2) + settings%padding)/settings%spacing), dp)
-         settings%counts = INT(upper - settings%lower) + 1
-         CPASSERT(ALL(settings%counts > 0))
-         RETURN
-      END IF
-      box_center = 0.5_dp*(MINVAL(grid_points, DIM=2) + MAXVAL(grid_points, DIM=2)) - settings%origin
-      box_extent = 0.5_dp*(MAXVAL(grid_points, DIM=2) - MINVAL(grid_points, DIM=2)) + settings%padding
-      settings%lower = REAL(CEILING(MATMUL(inverse_step, box_center) - &
-                                    MATMUL(ABS(inverse_step), box_extent)), dp)
-      upper = REAL(FLOOR(MATMUL(inverse_step, box_center) + &
-                         MATMUL(ABS(inverse_step), box_extent)), dp)
-      settings%counts = INT(upper - settings%lower) + 1
-      CPASSERT(ALL(settings%counts > 0))
-   END SUBROUTINE build_uniform_mesh
-
-! **************************************************************************************************
-!> \brief Partition the RI-RS points r_l into Cartesian cubes used by Eq. (4).
-!> \param grid_points ...
-!> \param edge ...
-!> \param blocks ...
-! **************************************************************************************************
-   SUBROUTINE build_l_blocks(grid_points, edge, blocks)
-      REAL(dp), INTENT(IN)                               :: grid_points(:, :), edge
-      TYPE(l_block_partition_type), INTENT(OUT)          :: blocks
-
-      INTEGER                                            :: cube(3), iblock, idir, il, insert
-      INTEGER, ALLOCATABLE                               :: block_of_l(:), counts(:), cubes(:, :), &
-                                                            next(:)
-      REAL(dp)                                           :: origin(3)
-
-      CPASSERT(edge > 0.0_dp)
-      origin = MINVAL(grid_points, DIM=2)
-      ALLOCATE (block_of_l(SIZE(grid_points, 2)), cubes(3, SIZE(grid_points, 2)))
-      blocks%nblocks = 0
-      DO il = 1, SIZE(grid_points, 2)
-         cube = FLOOR((grid_points(:, il) - origin)/edge)
-         iblock = 0
-         DO insert = 1, blocks%nblocks
-            IF (ALL(cubes(:, insert) == cube)) THEN
-               iblock = insert
-               EXIT
-            END IF
-         END DO
-         IF (iblock == 0) THEN
-            blocks%nblocks = blocks%nblocks + 1
-            iblock = blocks%nblocks
-            cubes(:, iblock) = cube
-         END IF
-         block_of_l(il) = iblock
-      END DO
-      ALLOCATE (counts(blocks%nblocks), next(blocks%nblocks), &
-                blocks%first(blocks%nblocks + 1), blocks%indices(SIZE(grid_points, 2)), &
-                blocks%lower(3, blocks%nblocks), blocks%upper(3, blocks%nblocks))
-      counts = 0
-      DO il = 1, SIZE(grid_points, 2)
-         counts(block_of_l(il)) = counts(block_of_l(il)) + 1
-      END DO
-      blocks%first(1) = 1
-      DO iblock = 1, blocks%nblocks
-         blocks%first(iblock + 1) = blocks%first(iblock) + counts(iblock)
-      END DO
-      next(:) = blocks%first(1:blocks%nblocks)
-      blocks%lower = HUGE(1.0_dp)
-      blocks%upper = -HUGE(1.0_dp)
-      DO il = 1, SIZE(grid_points, 2)
-         iblock = block_of_l(il)
-         blocks%indices(next(iblock)) = il
-         next(iblock) = next(iblock) + 1
-         DO idir = 1, 3
-            blocks%lower(idir, iblock) = MIN(blocks%lower(idir, iblock), grid_points(idir, il))
-            blocks%upper(idir, iblock) = MAX(blocks%upper(idir, iblock), grid_points(idir, il))
-         END DO
-      END DO
-   END SUBROUTINE build_l_blocks
-
-! **************************************************************************************************
-!> \brief Return the smallest and largest positive AO primitive exponents for the grid heuristic.
-!> \param bs_env ...
-!> \param exponent_min ...
-!> \param exponent_max ...
-! **************************************************************************************************
-   SUBROUTINE ao_exponent_range(bs_env, exponent_min, exponent_max)
-      TYPE(post_scf_bandstructure_type), POINTER         :: bs_env
-      REAL(dp), INTENT(OUT)                              :: exponent_min, exponent_max
-
-      INTEGER                                            :: ikind, ipgf, iset
-      REAL(dp)                                           :: exponent
-      TYPE(gto_basis_set_type), POINTER                  :: basis
-
-      exponent_min = HUGE(1.0_dp)
-      exponent_max = 0.0_dp
-      DO ikind = 1, SIZE(bs_env%basis_set_AO)
-         basis => bs_env%basis_set_AO(ikind)%gto_basis_set
-         IF (.NOT. ASSOCIATED(basis)) CYCLE
-         DO iset = 1, basis%nset
-            DO ipgf = 1, basis%npgf(iset)
-               exponent = basis%zet(ipgf, iset)
-               IF (exponent <= 0.0_dp) CYCLE
-               exponent_min = MIN(exponent_min, exponent)
-               exponent_max = MAX(exponent_max, exponent)
-            END DO
-         END DO
-      END DO
-      IF (exponent_max <= 0.0_dp .OR. exponent_min == HUGE(1.0_dp)) THEN
-         CPABORT('Uniform DLP found no positive AO primitive exponent')
-      END IF
-   END SUBROUTINE ao_exponent_range
-
-! **************************************************************************************************
-!> \brief Automatic l/P cutoff from the overlap of the diffuse AO-field square and RI potential.
-!>
-!> Outside a truncated Coulomb sphere, conservative Gaussian envelopes are
-!> f_l(r)^2 ~ exp[-alpha_AO |r-r_l|^2] and
-!> v_PT(r) ~ exp[-alpha_RI (|r-R_PT|-r_c)^2/2]. Maximizing their product over r gives
-!> exp[-gamma (|r_l-R_PT|-r_c)^2], with 1/gamma=1/alpha_AO+2/alpha_RI.
-!> Both methods use the same EPS_FILTER-dependent lattice domain.
-!> \param bs_env ...
-!> \param cutoffs ...
-! **************************************************************************************************
-   SUBROUTINE get_dlp_target_cutoffs(bs_env, cutoffs)
-      TYPE(post_scf_bandstructure_type), POINTER         :: bs_env
-      REAL(dp), ALLOCATABLE, INTENT(OUT)                 :: cutoffs(:)
-
-      INTEGER                                            :: iatom, ikind
-      REAL(dp)                                           :: accuracy, ao_max, ao_min, ri_max, ri_min
-      TYPE(gto_basis_set_type), POINTER                  :: basis
-      TYPE(particle_type), POINTER                       :: particles(:)
-
-      particles => bs_env%ri_rs%particle_set
-      accuracy = dlp_accuracy(bs_env)
-      ALLOCATE (cutoffs(bs_env%n_atom))
-      DO iatom = 1, bs_env%n_atom
-         IF (bs_env%ri_metric%potential_type == do_potential_coulomb) THEN
-            cutoffs(iatom) = 2.0_dp*MAXVAL(bs_env%ri_rs%radius_ao_per_atom) + &
-                             bs_env%ri_rs%radius_ri_per_atom(iatom)
-            CYCLE
-         END IF
-         ikind = particles(iatom)%atomic_kind%kind_number
-         basis => bs_env%basis_set_AO(ikind)%gto_basis_set
-         CALL basis_exponent_range(basis, ao_min, ao_max)
-         basis => bs_env%basis_set_RI(ikind)%gto_basis_set
-         CALL basis_exponent_range(basis, ri_min, ri_max)
-         cutoffs(iatom) = MAX(0.0_dp, bs_env%ri_metric%cutoff_radius) + &
-                          SQRT(LOG(1.0_dp/accuracy)*(1.0_dp/ao_min + 2.0_dp/ri_min))
-      END DO
-   END SUBROUTINE get_dlp_target_cutoffs
-
-! **************************************************************************************************
-!> \brief Set the DLP threshold below the sparse-filter threshold.
-!> \param bs_env ...
-!> \return ...
-! **************************************************************************************************
-   FUNCTION dlp_accuracy(bs_env) RESULT(accuracy)
-      TYPE(post_scf_bandstructure_type), POINTER         :: bs_env
-      REAL(dp)                                           :: accuracy
-
-      IF (.NOT. ieee_is_finite(bs_env%eps_filter) .OR. &
-          bs_env%eps_filter <= 0.0_dp .OR. bs_env%eps_filter >= 1.0_dp) THEN
-         CPABORT('EPS_FILTER must be between zero and one for periodic RI-RS DLP')
-      END IF
-      accuracy = bs_env%eps_filter/10.0_dp
-      IF (accuracy <= 0.0_dp) CPABORT('EPS_FILTER is too small for DLP quadrature')
-   END FUNCTION dlp_accuracy
-
-! **************************************************************************************************
-!> \brief Return the smallest and largest positive primitive exponent of one Gaussian basis.
-!> \param basis ...
-!> \param exponent_min ...
-!> \param exponent_max ...
-! **************************************************************************************************
-   SUBROUTINE basis_exponent_range(basis, exponent_min, exponent_max)
-      TYPE(gto_basis_set_type), POINTER                  :: basis
-      REAL(dp), INTENT(OUT)                              :: exponent_min, exponent_max
-
-      INTEGER                                            :: ipgf, iset
-      REAL(dp)                                           :: exponent
-
-      CPASSERT(ASSOCIATED(basis))
-      exponent_min = HUGE(1.0_dp)
-      exponent_max = 0.0_dp
-      DO iset = 1, basis%nset
-         DO ipgf = 1, basis%npgf(iset)
-            exponent = basis%zet(ipgf, iset)
-            IF (exponent <= 0.0_dp) CYCLE
-            exponent_min = MIN(exponent_min, exponent)
-            exponent_max = MAX(exponent_max, exponent)
-         END DO
-      END DO
-      IF (exponent_max <= 0.0_dp .OR. exponent_min == HUGE(1.0_dp)) THEN
-         CPABORT('Automatic DLP cutoff found no positive primitive exponent')
-      END IF
-   END SUBROUTINE basis_exponent_range
-
-! **************************************************************************************************
-!> \brief Distribute integration tiles in Eq. (2), reusing fields and potentials within each tile.
-!> \param bs_env ...
-!> \param grid_points ...
-!> \param target_cells ...
-!> \param settings ...
-!> \param target_R ...
-!> \param first_l ...
-!> \param qpoints ...
-!> \param charge_lq ...
-! **************************************************************************************************
-   SUBROUTINE integrate_uniform_tiles(bs_env, grid_points, target_cells, settings, target_R, first_l, &
-                                      qpoints, charge_lq)
-      TYPE(post_scf_bandstructure_type), POINTER         :: bs_env
-      REAL(dp), INTENT(IN)                               :: grid_points(:, :)
-      INTEGER, INTENT(IN)                                :: target_cells(:, :)
-      TYPE(uniform_settings_type), INTENT(IN)            :: settings
-      REAL(dp), INTENT(OUT)                              :: target_R(:, :, :)
-      INTEGER, INTENT(IN)                                :: first_l
-      REAL(dp), INTENT(IN), OPTIONAL                     :: qpoints(:, :)
-      COMPLEX(dp), INTENT(OUT), OPTIONAL                 :: charge_lq(:, :)
-
-      INTEGER, PARAMETER                                 :: tile_edge = 8, tile_size = tile_edge**3
-
-      INTEGER :: counts(3), handle, iatom, ibatch, iblock, idir, ig, igroup, il, &
-         indices(tile_size), integration_rank, irank, it, last_rank, next_progress, ngroups, &
-         nkeep, nl, np, npoints, nranks, nreceived, position, rank, ranks_per_batch, &
-         tile_counts(3), tile_first(3), tile_points(3)
-      INTEGER(int_8) :: block_contractions, coalesced_contractions, contraction_products, &
-         index_grid, iround, itile, n_completed_tiles, n_local_tiles, nrounds, ntiles, ntotal, &
-         potential_points, screened_blocks
-      INTEGER, ALLOCATABLE                               :: kept_per_rank(:), local_cells(:, :), &
-                                                            recv_counts(:), recv_offsets(:)
-      LOGICAL, ALLOCATABLE                               :: target_blocks(:, :, :), &
-                                                            target_selection(:, :, :)
-      REAL(dp) :: bound, discarded, elapsed, field_bound(tile_size), lower(3), mesh_index(3), &
-         omitted, points(3, tile_size), prep_start, target_center(3), threshold, weight
-      REAL(dp), ALLOCATABLE :: cyclic_targets(:, :, :), envelopes(:, :), local_targets(:, :, :), &
-         q_cart(:, :), receive_fields(:), send_fields(:), target_cutoffs(:)
-      REAL(dp) :: field(tile_size, SIZE(grid_points, 2))
-      TYPE(ao_image_type), ALLOCATABLE                   :: images(:)
-      TYPE(cell_type), POINTER                           :: cell
-      TYPE(l_block_partition_type)                       :: blocks
-      TYPE(mp_comm_type)                                 :: field_comm, integration_comm
-      TYPE(particle_type), POINTER                       :: particles(:)
-      TYPE(radial_interpolation_type), ALLOCATABLE       :: aux_potentials(:)
-
-      IF (bs_env%unit_nr > 0) THEN
-         WRITE (bs_env%unit_nr, '(T2,A)') 'dLP timing guide (details in final timing table):'
-         WRITE (bs_env%unit_nr, '(T2,A)') 'd_lP_allocate_thread_buffers: Allocate thread work arrays'
-         WRITE (bs_env%unit_nr, '(T2,A)') 'd_lP_screen_atom_image: Screen atom images and grid points'
-         WRITE (bs_env%unit_nr, '(T2,A)') 'd_lP_wait_for_threads: Wait for other OpenMP threads'
-         WRITE (bs_env%unit_nr, '(T2,A)') 'd_lP_release_thread_buffers: Release thread work arrays'
-         WRITE (bs_env%unit_nr, '(T2,A)') 'd_lP_uniform_exchange: Exchange grid fields between MPI ranks'
-         WRITE (bs_env%unit_nr, '(T2,A)') 'd_lP_prepare_field_bounds: Bound fields for screening'
-         WRITE (bs_env%unit_nr, '(T2,A)') 'd_lP_sum_g_f2_v: Contract potential with squared AO fields'
-      END IF
-      nl = SIZE(grid_points, 2)
-      IF (PRESENT(qpoints) .NEQV. PRESENT(charge_lq)) THEN
-         CPABORT('Request DLP q points and Fourier charges together')
-      END IF
-      IF (PRESENT(qpoints)) THEN
-         CPASSERT(SIZE(qpoints, 1) == 3)
-         CPASSERT(SIZE(charge_lq, 1) == nl)
-         CPASSERT(SIZE(charge_lq, 2) == SIZE(qpoints, 2))
-         cell => bs_env%ri_rs%cell
-         ALLOCATE (q_cart(3, SIZE(qpoints, 2)))
-         q_cart(:, :) = MATMUL(twopi*TRANSPOSE(cell%h_inv), qpoints)
-         charge_lq = CMPLX(0.0_dp, 0.0_dp, dp)
-      END IF
-      elapsed = m_walltime()
-      prep_start = elapsed
-      IF (bs_env%unit_nr > 0) THEN
-         WRITE (bs_env%unit_nr, '(T2,A)') 'd_lP quadrature: evaluating AO image values'
-         FLUSH (bs_env%unit_nr)
-      END IF
-      CALL prepare_ao_images(bs_env, grid_points, images)
-      IF (bs_env%unit_nr > 0) THEN
-         WRITE (bs_env%unit_nr, '(T2,A,T67,F12.1,A)') &
-            'd_lP AO image values, rank 0 time:', m_walltime() - prep_start, ' s'
-         FLUSH (bs_env%unit_nr)
-      END IF
-      CALL prepare_auto_ri_potentials(bs_env, settings, aux_potentials)
-      CALL auxiliary_potential_bound(bs_env, aux_potentials, envelopes)
-      CALL build_l_blocks(grid_points, settings%l_block_edge, blocks)
-      bound = MAXVAL(envelopes(1, :))
-      target_R = 0.0_dp
-      CALL prepare_dlp_groups(bs_env%para_env, nl, bs_env, SIZE(target_cells, 2), SIZE(target_R, KIND=int_8), &
-                              integration_comm, field_comm, ngroups)
-      igroup = field_comm%mepos
-      integration_rank = integration_comm%mepos
-      nranks = field_comm%num_pe
-      rank = field_comm%mepos
-      np = bs_env%n_RI
-      IF (bs_env%auto_ri%enabled) np = SUM(bs_env%auto_ri%sizes_opt_RI)
-      ALLOCATE (local_cells(3, SIZE(target_cells(:, igroup + 1::ngroups), 2)))
-      local_cells(:, :) = target_cells(:, igroup + 1::ngroups)
-
-      CALL timeset('d_lP_prepare_target_geometry', handle)
-
-      cell => bs_env%ri_rs%cell
-      particles => bs_env%ri_rs%particle_set
-      CALL get_dlp_target_cutoffs(bs_env, target_cutoffs)
-      ALLOCATE (target_selection(nl, bs_env%n_atom, SIZE(local_cells, 2)))
-      ALLOCATE (target_blocks(blocks%nblocks, bs_env%n_atom, SIZE(local_cells, 2)), source=.FALSE.)
-      DO it = 1, SIZE(local_cells, 2)
-         DO iatom = 1, bs_env%n_atom
-            target_center = pbc(particles(iatom)%r, cell) + MATMUL(bs_env%hmat, REAL(local_cells(:, it), dp))
-            DO il = 1, nl
-               target_selection(il, iatom, it) = SUM((grid_points(:, il) - target_center)**2) <= target_cutoffs(iatom)**2
-            END DO
-            DO iblock = 1, blocks%nblocks
-               IF (distance_to_box_squared(target_center, blocks%lower(:, iblock), &
-                                           blocks%upper(:, iblock)) > target_cutoffs(iatom)**2) CYCLE
-               target_blocks(iblock, iatom, it) = &
-                  ANY(target_selection(blocks%indices(blocks%first(iblock):blocks%first(iblock + 1) - 1), iatom, it))
-            END DO
-         END DO
-      END DO
-      DEALLOCATE (target_cutoffs)
-      IF (bs_env%unit_nr > 0) THEN
-         FLUSH (bs_env%unit_nr)
-      END IF
-
-      CALL timestop(handle)
-
-      ALLOCATE (local_targets(nl, np, SIZE(local_cells, 2)), source=0.0_dp)
-      ALLOCATE (kept_per_rank(nranks), recv_counts(nranks), recv_offsets(nranks))
-      ! At most 32 MiB of shared fields per rank, independent of the MPI size.
-      ranks_per_batch = MAX(1, INT(32.0_dp*1024.0_dp**2/ &
-                                   (8.0_dp*REAL(nl + 3, dp)*REAL(tile_size, dp))))
-      ranks_per_batch = MIN(nranks, ranks_per_batch)
-      ALLOCATE (send_fields((nl + 3)*tile_size), &
-                receive_fields((nl + 3)*tile_size*ranks_per_batch))
-      omitted = 0.0_dp
-      block_contractions = 0_int_8
-      coalesced_contractions = 0_int_8
-      contraction_products = 0_int_8
-      potential_points = 0_int_8
-      screened_blocks = 0_int_8
-      weight = settings%weight
-      lower = settings%lower
-      counts = settings%counts
-      ntotal = PRODUCT(INT(counts, int_8))
-      tile_counts = (counts + tile_edge - 1)/tile_edge
-      ntiles = PRODUCT(INT(tile_counts, int_8))
-      nrounds = (ntiles + INT(bs_env%para_env%num_pe, int_8) - 1_int_8)/ &
-                INT(bs_env%para_env%num_pe, int_8)
-      next_progress = 1
-      n_local_tiles = nrounds
-      threshold = 0.5_dp*settings%accuracy/(REAL(ntotal, dp)*weight)
-      CALL screen_ao_images(images, settings%accuracy/ &
-                            (8.0_dp*weight*REAL(ntotal, dp)*MAX(1.0_dp, bound)))
-      DO iround = 0_int_8, nrounds - 1_int_8
-         itile = iround*INT(bs_env%para_env%num_pe, int_8) + &
-                 INT(bs_env%para_env%mepos, int_8)
-         nkeep = 0
-         IF (itile < ntiles) THEN
-            ! Compact tiles preserve the quadrature while tightening all spatial bounds.
-            index_grid = itile
-            DO idir = 1, 3
-               tile_first(idir) = tile_edge*INT(MODULO(index_grid, INT(tile_counts(idir), int_8)))
-               tile_points(idir) = MIN(tile_edge, counts(idir) - tile_first(idir))
-               index_grid = index_grid/INT(tile_counts(idir), int_8)
-            END DO
-            npoints = PRODUCT(tile_points)
-            DO ig = 1, npoints
-               index_grid = INT(ig - 1, int_8)
-               DO idir = 1, 3
-                  mesh_index(idir) = lower(idir) + &
-                                     REAL(tile_first(idir) + INT(MODULO(index_grid, INT(tile_points(idir), int_8))), dp)
-                  index_grid = index_grid/INT(tile_points(idir), int_8)
-               END DO
-               points(:, ig) = settings%origin + MATMUL(settings%step, mesh_index)
-            END DO
-            CALL timeset('d_lP_f_l_squared', handle)
-            CALL evaluate_field_squared(images, points(:, 1:npoints), field(1:npoints, :), &
-                                        settings%accuracy/(8.0_dp*weight*REAL(ntotal, dp)*MAX(1.0_dp, bound)))
-            CALL timestop(handle)
-            IF (PRESENT(charge_lq)) THEN
-               CALL timeset('d_lP_charge_fourier', handle)
-               CALL accumulate_fourier_charge(points(:, 1:npoints), field, q_cart, weight, charge_lq)
-               CALL timestop(handle)
-            END IF
-            CALL timeset('d_lP_screen_pack_fields', handle)
-            nkeep = 0
-            field_bound(1:npoints) = 0.0_dp
-            DO il = 1, nl
-               !$OMP SIMD
-               DO ig = 1, npoints
-                  field_bound(ig) = MAX(field_bound(ig), ABS(field(ig, il)))
-               END DO
-            END DO
-            DO ig = 1, npoints
-               discarded = field_bound(ig)
-               IF (discarded*bound > threshold) THEN
-                  nkeep = nkeep + 1
-                  indices(nkeep) = ig
-               ELSE
-                  omitted = omitted + weight*bound*discarded
-               END IF
-            END DO
-            DO ig = 1, nkeep
-               send_fields(3*ig - 2:3*ig) = points(:, indices(ig))
-            END DO
-            DO il = 1, nl
-               DO ig = 1, nkeep
-                  send_fields(3*nkeep + (il - 1)*nkeep + ig) = field(indices(ig), il)
-               END DO
-            END DO
-            CALL timestop(handle)
-         END IF
-         CALL field_comm%allgather(nkeep, kept_per_rank)
-         DO ibatch = 1, nranks, ranks_per_batch
-            last_rank = MIN(nranks, ibatch + ranks_per_batch - 1)
-            recv_counts = 0
-            recv_counts(ibatch:last_rank) = (nl + 3)*kept_per_rank(ibatch:last_rank)
-            nreceived = 0
-            DO irank = 1, nranks
-               recv_offsets(irank) = nreceived
-               nreceived = nreceived + recv_counts(irank)
-            END DO
-            IF (nreceived == 0) CYCLE
-            CPASSERT(nreceived <= SIZE(receive_fields))
-            CALL timeset('d_lP_uniform_exchange', handle)
-            CALL field_comm%allgatherv(send_fields(1:recv_counts(rank + 1)), &
-                                       receive_fields(1:nreceived), recv_counts, recv_offsets)
-            CALL timestop(handle)
-            DO irank = ibatch, last_rank
-               nkeep = kept_per_rank(irank)
-               IF (nkeep == 0 .OR. SIZE(local_cells, 2) == 0) CYCLE
-               CALL timeset('d_lP_unpack_fields', handle)
-               position = recv_offsets(irank)
-               DO ig = 1, nkeep
-                  points(:, ig) = receive_fields(position + 3*ig - 2:position + 3*ig)
-               END DO
-               DO il = 1, nl
-                  DO ig = 1, nkeep
-                     field(ig, il) = receive_fields(position + 3*nkeep + (il - 1)*nkeep + ig)
-                  END DO
-               END DO
-               CALL timestop(handle)
-               CALL timeset('d_lP_integrate_tiles', handle)
-               CALL integrate_potentials(bs_env, grid_points, local_cells, target_selection, target_blocks, &
-                                         points(:, 1:nkeep), field(1:nkeep, :), &
-                                         weight, envelopes, blocks, threshold, omitted, potential_points, &
-                                         block_contractions, screened_blocks, coalesced_contractions, &
-                                         contraction_products, local_targets, aux_potentials)
-               CALL timestop(handle)
-            END DO
-         END DO
-         n_completed_tiles = iround + 1_int_8
-         CALL write_ri_rs_phase_progress(bs_env%unit_nr, 'd_lP Integration batch done', &
-                                         n_completed_tiles, n_local_tiles, next_progress, elapsed)
-      END DO
-
-      CALL timeset('d_lP_uniform_reduce', handle)
-
-      DEALLOCATE (send_fields, receive_fields, kept_per_rank, recv_counts, recv_offsets)
-      CALL apply_target_cutoff(bs_env, grid_points, local_cells, local_targets)
-      CALL sum_dlp_cyclic_cells(integration_comm, local_targets, cyclic_targets)
-      DEALLOCATE (local_targets, local_cells)
-      CALL distribute_dlp_rows(bs_env%para_env, cyclic_targets, first_l, target_R)
-      DEALLOCATE (cyclic_targets)
-      CALL integration_comm%free()
-      CALL field_comm%free()
-      IF (PRESENT(charge_lq)) CALL bs_env%para_env%sum(charge_lq)
-      CALL bs_env%para_env%sum(omitted)
-      CALL bs_env%para_env%sum(potential_points)
-      CALL bs_env%para_env%sum(block_contractions)
-      CALL bs_env%para_env%sum(screened_blocks)
-      CALL bs_env%para_env%sum(coalesced_contractions)
-      CALL bs_env%para_env%sum(contraction_products)
-
-      CALL timestop(handle)
-
-      IF (bs_env%unit_nr > 0) THEN
-         WRITE (bs_env%unit_nr, '(T2,A,T72,ES9.1E2)') &
-            'Potential evaluations V_P^R(r_g) (point, atom image):', REAL(potential_points, dp)
-         WRITE (bs_env%unit_nr, '(T2,A,T72,ES9.1E2)') &
-            'd_lP products f_l(r_g)^2 V_P^R(r_g):', REAL(contraction_products, dp)
-         WRITE (bs_env%unit_nr, '(T2,A)') &
-            'f_l(r) = SUM_(μ,R) ϕ_μ^R(r_l) ϕ_μ^R(r)'
-         WRITE (bs_env%unit_nr, '(T2,A)') &
-            'd_lP^R = SUM_g w_g f_l(r_g)^2 V_P^R(r_g)'
-      END IF
-      elapsed = m_walltime() - elapsed
-      CALL bs_env%para_env%max(elapsed)
-      IF (bs_env%unit_nr > 0) WRITE (bs_env%unit_nr, '(T2,A,T69,F10.1,A)') &
-         'd_lP completed numerical integration, Exec. time:', elapsed, ' s'
-      IF (bs_env%unit_nr > 0) FLUSH (bs_env%unit_nr)
-   END SUBROUTINE integrate_uniform_tiles
-
-! **************************************************************************************************
-!> \brief Form each atom-local auxiliary potential's spherical coefficients just once.
-!> \param bs_env ...
-!> \param settings ...
-!> \param aux_potentials ...
-! **************************************************************************************************
-   SUBROUTINE prepare_auto_ri_potentials(bs_env, settings, aux_potentials)
-      TYPE(post_scf_bandstructure_type), POINTER         :: bs_env
-      TYPE(uniform_settings_type), INTENT(IN)            :: settings
-      TYPE(radial_interpolation_type), ALLOCATABLE, &
-         INTENT(OUT)                                     :: aux_potentials(:)
-
-      CHARACTER(LEN=12)                                  :: spacing_text
-      INTEGER                                            :: first_U, iatom, ikind, nmesh, np, nref
-      REAL(dp)                                           :: cutoff, mesh_bytes, &
-                                                            mesh_displacement(3), mesh_spacing
-      REAL(dp), ALLOCATABLE                              :: U_Pp(:, :)
-      TYPE(cell_type), POINTER                           :: cell
-      TYPE(gto_basis_set_type), POINTER                  :: basis
-      TYPE(particle_type), POINTER                       :: particles(:)
-
-      IF (.NOT. bs_env%auto_ri%enabled) RETURN
-      particles => bs_env%ri_rs%particle_set
-      cell => bs_env%ri_rs%cell
-      cutoff = 0.0_dp
-      IF (bs_env%ri_metric%potential_type == do_potential_truncated) cutoff = bs_env%ri_metric%cutoff_radius
-      ALLOCATE (aux_potentials(bs_env%n_atom))
-      nmesh = 0
-      mesh_bytes = 0.0_dp
-      mesh_spacing = 0.0_dp
-      DO iatom = 1, bs_env%n_atom
-         ikind = particles(iatom)%atomic_kind%kind_number
-         basis => bs_env%basis_set_RI(ikind)%gto_basis_set
-         nref = bs_env%auto_ri%sizes_ref_RI(iatom)
-         np = bs_env%auto_ri%sizes_opt_RI(iatom)
-         first_U = bs_env%auto_ri%U_Pp_atom_offset(iatom)
-         ALLOCATE (U_Pp(nref, np))
-         U_Pp(:, :) = RESHAPE(bs_env%auto_ri%U_Pp_atom(first_U:first_U + nref*np - 1), [nref, np])
-         mesh_displacement = settings%origin - pbc(particles(iatom)%r, cell)
-         CALL prepare_contracted_potential(basis, U_Pp, aux_potentials(iatom), cutoff, &
-                                           MAX(0.0_dp, bs_env%ri_metric%omega), &
-                                           radial_table_bytes=256.0_dp*1024.0_dp**2/REAL(MAX(1, bs_env%n_atom), dp), &
-                                           mesh_step=settings%step, &
-                                           mesh_displacement=mesh_displacement)
-         IF (ALLOCATED(aux_potentials(iatom)%mesh_moments)) THEN
-            nmesh = nmesh + 1
-            mesh_bytes = mesh_bytes + 8.0_dp*REAL(SIZE(aux_potentials(iatom)%mesh_moments, KIND=int_8), dp)
-            mesh_spacing = aux_potentials(iatom)%mesh_spacing
-         END IF
-         DEALLOCATE (U_Pp)
-      END DO
-      IF (bs_env%unit_nr > 0) THEN
-         IF (nmesh > 0) THEN
-            WRITE (bs_env%unit_nr, '(T2,A,T69,F12.1)') 'd_lP radial mesh storage [MiB/rank]', mesh_bytes/1024.0_dp**2
-            WRITE (spacing_text, '(ES12.1E1)') mesh_spacing
-            IF (INDEX(spacing_text, '*') > 0) WRITE (spacing_text, '(ES12.1E2)') mesh_spacing
-            IF (INDEX(spacing_text, '*') > 0) WRITE (spacing_text, '(ES12.1E3)') mesh_spacing
-            WRITE (bs_env%unit_nr, '(T2,A,T69,A12)') 'd_lP radial mesh squared spacing [bohr^2]', spacing_text
-         END IF
-      END IF
-   END SUBROUTINE prepare_auto_ri_potentials
-
-! **************************************************************************************************
-!> \brief Store nonzero atom-image coefficients ϕ_mu,R(r_l) in Eq. (1) once.
-!> \param bs_env ...
-!> \param grid_points ...
-!> \param images ...
-! **************************************************************************************************
-   SUBROUTINE prepare_ao_images(bs_env, grid_points, images)
-      TYPE(post_scf_bandstructure_type), POINTER         :: bs_env
-      REAL(dp), INTENT(IN)                               :: grid_points(:, :)
-      TYPE(ao_image_type), ALLOCATABLE, INTENT(OUT)      :: images(:)
-
-      INTEGER                                            :: iatom, icell, iimage, ikind, maxao, nao
-      REAL(dp)                                           :: center(3), cutoff2
-      REAL(dp), ALLOCATABLE                              :: primary(:, :)
-      TYPE(cell_type), POINTER                           :: cell
-      TYPE(gto_basis_set_type), POINTER                  :: basis
-      TYPE(particle_type), POINTER                       :: particles(:)
-
-      cell => bs_env%ri_rs%cell
-      particles => bs_env%ri_rs%particle_set
-      maxao = MAXVAL(bs_env%i_ao_end_from_atom - bs_env%i_ao_start_from_atom + 1)
-      ALLOCATE (primary(SIZE(grid_points, 2), maxao))
-      ALLOCATE (images(bs_env%n_atom*SIZE(bs_env%index_to_cell_3c, 2)))
-      iimage = 0
-      DO icell = 1, SIZE(bs_env%index_to_cell_3c, 2)
-         DO iatom = 1, bs_env%n_atom
-            ikind = particles(iatom)%atomic_kind%kind_number
-            basis => bs_env%basis_set_AO(ikind)%gto_basis_set
-            nao = bs_env%i_ao_end_from_atom(iatom) - bs_env%i_ao_start_from_atom(iatom) + 1
-            center = pbc(particles(iatom)%r, cell) + MATMUL(bs_env%hmat, REAL(bs_env%index_to_cell_3c(:, icell), dp))
-            cutoff2 = bs_env%ri_rs%radius_ao_per_atom(iatom)**2
-            IF (bs_env%ri_rs%cutoff_radius_ri_ao > 0.0_dp) cutoff2 = bs_env%ri_rs%cutoff_radius_ri_ao**2
-            primary = 0.0_dp
-            CALL evaluate_ao_basis_on_points(primary(:, 1:nao), grid_points, basis, center, cell, &
-                                             cutoff_squared=cutoff2, minimum_image=.FALSE.)
-            IF (.NOT. ANY(primary(:, 1:nao) /= 0.0_dp)) CYCLE
-            iimage = iimage + 1
-            images(iimage)%basis => basis
-            images(iimage)%center = center
-            ALLOCATE (images(iimage)%primary(SIZE(grid_points, 2), nao))
-            images(iimage)%primary(:, :) = primary(:, 1:nao)
-            CALL pack_nonzero_ao_rows(images(iimage))
-            CALL bound_ao_image(images(iimage))
-         END DO
-      END DO
-   END SUBROUTINE prepare_ao_images
-
-! **************************************************************************************************
-!> \brief Store only exactly nonzero l rows of Eq. (1) when at least half the rows are zero.
-!> primary_l maps packed rows back to the original r_l; no finite AO coefficient is discarded.
-!> \param image ...
-! **************************************************************************************************
-   SUBROUTINE pack_nonzero_ao_rows(image)
-      TYPE(ao_image_type), INTENT(INOUT)                 :: image
-
-      INTEGER                                            :: il, ipacked, nkeep, nl
-      LOGICAL, ALLOCATABLE                               :: nonzero(:)
-      REAL(dp), ALLOCATABLE                              :: primary(:, :)
-
-      CPASSERT(ALLOCATED(image%primary))
-      CPASSERT(.NOT. ALLOCATED(image%primary_l))
-      nl = SIZE(image%primary, 1)
-      ALLOCATE (nonzero(nl))
-      DO il = 1, nl
-         nonzero(il) = ANY(ABS(image%primary(il, :)) > 0.0_dp)
-      END DO
-      nkeep = COUNT(nonzero)
-      IF (nkeep == 0 .OR. nkeep > nl/2) RETURN
-      ALLOCATE (primary(nkeep, SIZE(image%primary, 2)), image%primary_l(nkeep))
-      ipacked = 0
-      DO il = 1, nl
-         IF (.NOT. nonzero(il)) CYCLE
-         ipacked = ipacked + 1
-         primary(ipacked, :) = image%primary(il, :)
-         image%primary_l(ipacked) = il
-      END DO
-      CALL MOVE_ALLOC(primary, image%primary)
-   END SUBROUTINE pack_nonzero_ao_rows
-
-! **************************************************************************************************
-!> \brief Bound each image contribution to f_l(r) in Eq. (1) by B exp(-a_min r^2/2).
-!> |x^n exp(-a x^2/2)| <= (n/(a e))^(n/2) bounds the remaining polynomial and Gaussian.
-!> \param image ...
-! **************************************************************************************************
-   SUBROUTINE bound_ao_image(image)
-      TYPE(ao_image_type), INTENT(INOUT)                 :: image
-
-      INTEGER                                            :: ico, idir, il, ipgf, irow, iset, isgf, &
-                                                            ncart, power
-      REAL(dp)                                           :: amplitude, exponent, factor
-      REAL(dp), ALLOCATABLE                              :: ao_bound(:)
-      TYPE(gto_basis_set_type), POINTER                  :: basis
-
-      basis => image%basis
-      image%decay = HUGE(0.0_dp)
-      ALLOCATE (ao_bound(SIZE(image%primary, 2)), source=0.0_dp)
-      DO iset = 1, basis%nset
-         ncart = ncoset(basis%lmax(iset))
-         DO ipgf = 1, basis%npgf(iset)
-            exponent = basis%zet(ipgf, iset)
-            CPASSERT(exponent > 0.0_dp)
-            image%decay = MIN(image%decay, 0.5_dp*exponent)
-            DO ico = 1, ncart
-               factor = 1.0_dp
-               DO idir = 1, 3
-                  power = indco(idir, ico)
-                  IF (power > 0) factor = factor*(REAL(power, dp)/(exponent*EXP(1.0_dp)))** &
-                                          (0.5_dp*REAL(power, dp))
-               END DO
-               irow = (ipgf - 1)*ncart + ico
-               DO isgf = basis%first_sgf(1, iset), basis%last_sgf(basis%nshell(iset), iset)
-                  ao_bound(isgf) = ao_bound(isgf) + ABS(basis%sphi(irow, isgf))*factor
-               END DO
-            END DO
-         END DO
-      END DO
-      image%bound = 0.0_dp
-      DO il = 1, SIZE(image%primary, 1)
-         amplitude = 0.0_dp
-         DO isgf = 1, SIZE(ao_bound)
-            amplitude = amplitude + ABS(image%primary(il, isgf))*ao_bound(isgf)
-         END DO
-         image%bound = MAX(image%bound, amplitude)
-      END DO
-      CALL prepare_ao_radial_envelope(image)
-   END SUBROUTINE bound_ao_image
-
-! **************************************************************************************************
-!> \brief Bound each Cartesian primitive in Eq. (1) by its exact angular maximum at fixed radius.
-!> For degree n, |x^i y^j z^k| <= r^n product_d (n_d/n)^(n_d/2).
-!> Positive coefficient sums bound every l row without changing the field error budget.
-!> \param image ...
-! **************************************************************************************************
-   SUBROUTINE prepare_ao_radial_envelope(image)
-      TYPE(ao_image_type), INTENT(INOUT)                 :: image
-
-      INTEGER                                            :: ico, idegree, idir, iexponent, il, ipgf, &
-                                                            irow, iset, isgf, ncart, power
-      REAL(dp)                                           :: amplitude, angular_factor
-      REAL(dp), ALLOCATABLE                              :: ao_weight(:)
-      TYPE(gto_basis_set_type), POINTER                  :: basis
-
-      CPASSERT(ASSOCIATED(image%basis))
-      CPASSERT(ALLOCATED(image%primary))
-      basis => image%basis
-      IF (ALLOCATED(image%envelope_exponents)) DEALLOCATE (image%envelope_exponents, image%radial_envelope)
-      ALLOCATE (image%envelope_exponents(SUM(basis%npgf(:basis%nset))), &
-                image%radial_envelope(0:MAXVAL(basis%lmax(:basis%nset)), SUM(basis%npgf(:basis%nset))), &
-                ao_weight(SIZE(image%primary, 2)))
-      ao_weight = 0.0_dp
-      DO isgf = 1, SIZE(ao_weight)
-         DO il = 1, SIZE(image%primary, 1)
-            ao_weight(isgf) = MAX(ao_weight(isgf), ABS(image%primary(il, isgf)))
-         END DO
-      END DO
-      image%radial_envelope = 0.0_dp
-      iexponent = 0
-      DO iset = 1, basis%nset
-         ncart = ncoset(basis%lmax(iset))
-         DO ipgf = 1, basis%npgf(iset)
-            iexponent = iexponent + 1
-            image%envelope_exponents(iexponent) = basis%zet(ipgf, iset)
-            DO ico = 1, ncart
-               idegree = SUM(indco(:, ico))
-               angular_factor = 1.0_dp
-               DO idir = 1, 3
-                  power = indco(idir, ico)
-                  IF (power > 0) angular_factor = angular_factor* &
-                                                  (REAL(power, dp)/REAL(idegree, dp))**(0.5_dp*REAL(power, dp))
-               END DO
-               irow = (ipgf - 1)*ncart + ico
-               amplitude = 0.0_dp
-               DO isgf = basis%first_sgf(1, iset), basis%last_sgf(basis%nshell(iset), iset)
-                  amplitude = amplitude + ao_weight(isgf)*ABS(basis%sphi(irow, isgf))
-               END DO
-               image%radial_envelope(idegree, iexponent) = &
-                  image%radial_envelope(idegree, iexponent) + angular_factor*amplitude
-            END DO
-         END DO
-      END DO
-      image%radial_envelope(:, :) = image%radial_envelope* &
-                                    (1.0_dp + EPSILON(1.0_dp)*(64.0_dp + &
-                                                            4.0_dp*REAL(SIZE(image%radial_envelope), dp)*REAL(SIZE(ao_weight), dp)))
-   END SUBROUTINE prepare_ao_radial_envelope
-
-! **************************************************************************************************
-!> \brief Bound Eq. (1) outside a sphere using max_{r>=r_min} r^n exp(-alpha*r²).
-!> The maximum is at r²=max(r_min²,n/(2*alpha)); far-field polynomials share one exponential.
-!> \param image ...
-!> \param distance_squared ...
-!> \return ...
-! **************************************************************************************************
-   PURE FUNCTION bound_ao_image_distance(image, distance_squared) RESULT(bound)
-      TYPE(ao_image_type), INTENT(IN)                    :: image
-      REAL(dp), INTENT(IN)                               :: distance_squared
-      REAL(dp)                                           :: bound
-
-      INTEGER                                            :: idegree, iexponent, lmax
-      REAL(dp)                                           :: exponent, polynomial, radius, &
-                                                            radius_squared
-
-      IF (.NOT. ALLOCATED(image%radial_envelope)) THEN
-         bound = image%bound*EXP(-image%decay*distance_squared)
-         RETURN
-      END IF
-      bound = 0.0_dp
-      lmax = UBOUND(image%radial_envelope, 1)
-      radius = SQRT(distance_squared)
-      DO iexponent = 1, SIZE(image%envelope_exponents)
-         exponent = image%envelope_exponents(iexponent)
-         IF (exponent*distance_squared >= 0.5_dp*REAL(lmax, dp)) THEN
-            polynomial = image%radial_envelope(lmax, iexponent)
-            DO idegree = lmax - 1, 0, -1
-               polynomial = image%radial_envelope(idegree, iexponent) + radius*polynomial
-            END DO
-            bound = bound + polynomial*EXP(-exponent*distance_squared)
-         ELSE
-            DO idegree = 0, lmax
-               radius_squared = MAX(distance_squared, 0.5_dp*REAL(idegree, dp)/exponent)
-               bound = bound + image%radial_envelope(idegree, iexponent)* &
-                       radius_squared**(0.5_dp*REAL(idegree, dp))*EXP(-exponent*radius_squared)
-            END DO
-         END IF
-      END DO
-   END FUNCTION bound_ao_image_distance
-
-! **************************************************************************************************
-!> \brief Bound the omitted squared field in Eq. (2) by tolerance at every point.
-!> With A=sum_i B_i and delta<=min(1,tolerance/(2A+1)), 2A delta+delta^2<=tolerance.
-!> Each omitted image contributes at most delta/N; box distances bound every point in a tile.
-!> \param images ...
-!> \param tolerance ...
-! **************************************************************************************************
-   SUBROUTINE screen_ao_images(images, tolerance)
-      TYPE(ao_image_type), INTENT(INOUT)                 :: images(:)
-      REAL(dp), INTENT(IN)                               :: tolerance
-
-      INTEGER                                            :: iimage, nimages
-      REAL(dp)                                           :: amplitude, delta
-
-      nimages = 0
-      amplitude = 0.0_dp
-      DO iimage = 1, SIZE(images)
-         IF (.NOT. ALLOCATED(images(iimage)%primary)) EXIT
-         nimages = nimages + 1
-         amplitude = amplitude + images(iimage)%bound
-      END DO
-      IF (nimages == 0) RETURN
-      delta = MIN(1.0_dp, tolerance/(2.0_dp*amplitude + 1.0_dp))/REAL(nimages, dp)
-      IF (delta <= TINY(0.0_dp)) RETURN
-      DO iimage = 1, nimages
-         IF (images(iimage)%bound <= delta) THEN
-            images(iimage)%radius2 = -1.0_dp
-         ELSE
-            images(iimage)%radius2 = (LOG(images(iimage)%bound) - LOG(delta))/images(iimage)%decay
-         END IF
-      END DO
-   END SUBROUTINE screen_ao_images
-
-! **************************************************************************************************
-!> \brief Evaluate the complete squared AO field in Eq. (2) on one Cartesian tile.
-!> \param images ...
-!> \param points ...
-!> \param field_squared ...
-!> \param field_accuracy ...
-! **************************************************************************************************
-   SUBROUTINE evaluate_field_squared(images, points, field_squared, field_accuracy)
-      TYPE(ao_image_type), INTENT(IN)                    :: images(:)
-      REAL(dp), INTENT(IN)                               :: points(:, :)
-      REAL(dp), INTENT(OUT)                              :: field_squared(:, :)
-      REAL(dp), INTENT(IN), OPTIONAL                     :: field_accuracy
-
-      INTEGER                                            :: first, last, nblock, ng, nthreads
-      REAL(dp)                                           :: tolerance
-
-      tolerance = 0.0_dp
-      IF (PRESENT(field_accuracy)) tolerance = field_accuracy
-      ng = SIZE(points, 2)
-      nthreads = 1
-!$    nthreads = omp_get_max_threads()
-      nblock = MAX(1, (ng + nthreads - 1)/nthreads)
-      !$OMP PARALLEL DO DEFAULT(NONE) SCHEDULE(STATIC) &
-      !$OMP SHARED(images, points, field_squared, ng, nblock, tolerance) PRIVATE(first, last)
-      DO first = 1, ng, nblock
-         last = MIN(ng, first + nblock - 1)
-         CALL evaluate_field_squared_block(images, points(:, first:last), field_squared(first:last, :), tolerance)
-      END DO
-      !$OMP END PARALLEL DO
-   END SUBROUTINE evaluate_field_squared
-
-! **************************************************************************************************
-!> \brief Evaluate Eq. (1), then square, with a tile-local bound on the squared-field error.
-!> For image bounds b_i and A=sum_i b_i, omit at most delta=sqrt(A²+epsilon)-A in amplitude;
-!> then 2A*delta+delta²<=epsilon. Whole tiles with A²<=epsilon need no AO evaluation.
-!> The legacy radius bound applies when no positive squared-field accuracy is supplied.
-!> \param images ...
-!> \param points ...
-!> \param field_squared ...
-!> \param field_accuracy ...
-! **************************************************************************************************
-   SUBROUTINE evaluate_field_squared_block(images, points, field_squared, field_accuracy)
-      TYPE(ao_image_type), INTENT(IN)                    :: images(:)
-      REAL(dp), INTENT(IN)                               :: points(:, :)
-      REAL(dp), INTENT(OUT)                              :: field_squared(:, :)
-      REAL(dp), INTENT(IN), OPTIONAL                     :: field_accuracy
-
-      INTEGER                                            :: handle, iimage, il, nao, ng, nimages, &
-                                                            nl, nprimary
-      REAL(dp)                                           :: amplitude, delta, lower(3), &
-                                                            root_tolerance, tolerance, upper(3)
-      REAL(dp), ALLOCATABLE                              :: field(:, :), image_field(:, :), &
-                                                            values(:, :)
-      REAL(dp)                                           :: image_bounds(SIZE(images))
-
-      tolerance = 0.0_dp
-      IF (PRESENT(field_accuracy)) tolerance = field_accuracy
-      ng = SIZE(points, 2)
-      nl = SIZE(field_squared, 2)
-      ALLOCATE (field(ng, nl))
-      field = 0.0_dp
-      lower = MINVAL(points, DIM=2)
-      upper = MAXVAL(points, DIM=2)
-      delta = 0.0_dp
-      IF (tolerance > 0.0_dp) THEN
-         amplitude = 0.0_dp
-         nimages = 0
-         DO iimage = 1, SIZE(images)
-            IF (.NOT. ALLOCATED(images(iimage)%primary)) EXIT
-            image_bounds(iimage) = images(iimage)%bound* &
-                                   EXP(-images(iimage)%decay*distance_to_box_squared(images(iimage)%center, lower, upper))
-            amplitude = amplitude + image_bounds(iimage)
-            nimages = nimages + 1
-         END DO
-         amplitude = amplitude*(1.0_dp + REAL(nimages, dp)*EPSILON(1.0_dp))
-         root_tolerance = SQRT(tolerance)
-         IF (amplitude <= root_tolerance) THEN
-            field_squared = 0.0_dp
-            RETURN
-         END IF
-         delta = (tolerance/amplitude)/(SQRT(1.0_dp + (root_tolerance/amplitude)**2) + 1.0_dp)
-         delta = delta/REAL(MAX(1, nimages), dp)
-      END IF
-      DO iimage = 1, SIZE(images)
-         IF (.NOT. ALLOCATED(images(iimage)%primary)) EXIT
-         IF (tolerance > 0.0_dp) THEN
-            IF (image_bounds(iimage) <= delta) CYCLE
-            IF (bound_ao_image_distance(images(iimage), &
-                                        distance_to_box_squared(images(iimage)%center, lower, upper)) <= delta) CYCLE
-         ELSE
-            IF (distance_to_box_squared(images(iimage)%center, lower, upper) > images(iimage)%radius2) CYCLE
-         END IF
-         nao = SIZE(images(iimage)%primary, 2)
-         ALLOCATE (values(ng, nao), SOURCE=0.0_dp)
-         CALL timeset('d_lP_AO_values', handle)
-         CALL evaluate_uniform_ao_values(values, points, images(iimage)%basis, images(iimage)%center)
-         CALL timestop(handle)
-         CALL timeset('d_lP_f_l_sum_AO', handle)
-         nprimary = SIZE(images(iimage)%primary, 1)
-         IF (ALLOCATED(images(iimage)%primary_l)) THEN
-            IF (.NOT. ALLOCATED(image_field)) ALLOCATE (image_field(ng, nl))
-            CALL dgemm('N', 'T', ng, nprimary, nao, 1.0_dp, values, ng, &
-                       images(iimage)%primary, nprimary, 0.0_dp, image_field, ng)
-            DO il = 1, nprimary
-               field(:, images(iimage)%primary_l(il)) = &
-                  field(:, images(iimage)%primary_l(il)) + image_field(:, il)
-            END DO
-         ELSE
-            CALL dgemm('N', 'T', ng, nl, nao, 1.0_dp, values, ng, &
-                       images(iimage)%primary, nl, 1.0_dp, field, ng)
-         END IF
-         CALL timestop(handle)
-         DEALLOCATE (values)
-      END DO
-      field_squared = field**2
-   END SUBROUTINE evaluate_field_squared_block
-
-! **************************************************************************************************
-!> \brief Evaluate the AO values in Eq. (1), sharing primitive factors before contraction.
-!> Columns of primitive are Cartesian Gaussian primitives, grouped by basis set and exponent.
-!> The original spherical contraction coefficients define exactly the same unscreened AO values.
-!> \param values ...
-!> \param points ...
-!> \param basis ...
-!> \param center ...
-! **************************************************************************************************
-   SUBROUTINE evaluate_uniform_ao_values(values, points, basis, center)
-      REAL(dp), INTENT(OUT)                              :: values(:, :)
-      REAL(dp), INTENT(IN)                               :: points(:, :)
-      TYPE(gto_basis_set_type), POINTER                  :: basis
-      REAL(dp), INTENT(IN)                               :: center(3)
-
-      INTEGER                                            :: first_sgf, ico, ig, ipgf, ipower, iset, &
-                                                            last_sgf, ncart, ng, nprimitive
-      INTEGER, ALLOCATABLE                               :: offsets(:)
-      LOGICAL                                            :: parallel_points
-      REAL(dp)                                           :: relative(3)
-      REAL(dp), ALLOCATABLE                              :: coordinate_power(:, :), exponential(:), &
-                                                            monomial(:, :), primitive(:, :), &
-                                                            radius2(:)
-
-      CPASSERT(ASSOCIATED(basis))
-      ng = SIZE(points, 2)
-      CPASSERT(SIZE(values, 1) == ng)
-      IF (ng == 0) RETURN
-      CPASSERT(basis%nset > 0)
-      ALLOCATE (offsets(basis%nset), monomial(ng, ncoset(MAXVAL(basis%lmax))), &
-                coordinate_power(3, 0:MAXVAL(basis%lmax)), radius2(ng), exponential(ng))
-      nprimitive = 0
-      DO iset = 1, basis%nset
-         offsets(iset) = nprimitive
-         nprimitive = nprimitive + basis%npgf(iset)*ncoset(basis%lmax(iset))
-      END DO
-      ALLOCATE (primitive(ng, nprimitive))
-      parallel_points = .TRUE.
-!$    parallel_points = .NOT. omp_in_parallel()
-      !$OMP PARALLEL DEFAULT(NONE) IF(parallel_points) &
-      !$OMP SHARED(ng, points, center, basis, primitive, offsets, ncoset, indco, radius2, monomial) &
-      !$OMP PRIVATE(ig, relative, ico, coordinate_power, ipower, iset, ipgf, ncart, exponential)
-      !$OMP DO SCHEDULE(STATIC)
-      DO ig = 1, ng
-         relative = points(:, ig) - center
-         radius2(ig) = DOT_PRODUCT(relative, relative)
-         coordinate_power(:, 0) = 1.0_dp
-         DO ipower = 1, UBOUND(coordinate_power, 2)
-            coordinate_power(:, ipower) = coordinate_power(:, ipower - 1)*relative
-         END DO
-         DO ico = 1, SIZE(monomial, 2)
-            monomial(ig, ico) = coordinate_power(1, indco(1, ico))* &
-                                coordinate_power(2, indco(2, ico))*coordinate_power(3, indco(3, ico))
-         END DO
-      END DO
-      !$OMP END DO
-      ! Fill primitive columns contiguously in g, reusing each Cartesian monomial.
-      DO iset = 1, basis%nset
-         ncart = ncoset(basis%lmax(iset))
-         !$OMP DO SCHEDULE(STATIC)
-         DO ipgf = 1, basis%npgf(iset)
-            !$OMP SIMD
-            DO ig = 1, ng
-               exponential(ig) = EXP(-basis%zet(ipgf, iset)*radius2(ig))
-            END DO
-            DO ico = 1, ncart
-               !$OMP SIMD
-               DO ig = 1, ng
-                  primitive(ig, offsets(iset) + (ipgf - 1)*ncart + ico) = monomial(ig, ico)*exponential(ig)
-               END DO
-            END DO
-         END DO
-         !$OMP END DO
-      END DO
-      !$OMP END PARALLEL
-      values = 0.0_dp
-      DO iset = 1, basis%nset
-         nprimitive = basis%npgf(iset)*ncoset(basis%lmax(iset))
-         first_sgf = basis%first_sgf(1, iset)
-         last_sgf = basis%last_sgf(basis%nshell(iset), iset)
-         CALL dgemm('N', 'N', ng, last_sgf - first_sgf + 1, nprimitive, &
-                    1.0_dp, primitive(:, offsets(iset) + 1:), ng, &
-                    basis%sphi(:, first_sgf:last_sgf), SIZE(basis%sphi, 1), &
-                    1.0_dp, values(:, first_sgf:last_sgf), ng)
-      END DO
-   END SUBROUTINE evaluate_uniform_ao_values
-
-! **************************************************************************************************
-!> \brief Bound every auxiliary potential in Eq. (2), including contracted angular functions.
-!> |x^n exp(-a x²/2)| <= (n/(a e))^(n/2); the remaining Gaussian potential is <=4 pi/a.
-!> The triangle inequality uses the transformed primitive coefficients for AUTO_RI functions.
-!> Truncating the positive kernel preserves the bound; envelopes are indexed (bound/exponents,atom).
-!> \param bs_env ...
-!> \param aux_potentials ...
-!> \param envelopes ...
-! **************************************************************************************************
-   SUBROUTINE auxiliary_potential_bound(bs_env, aux_potentials, envelopes)
-      TYPE(post_scf_bandstructure_type), POINTER         :: bs_env
-      TYPE(radial_interpolation_type), ALLOCATABLE, &
-         INTENT(IN)                                      :: aux_potentials(:)
-      REAL(dp), ALLOCATABLE, INTENT(OUT)                 :: envelopes(:, :)
-
-      INTEGER                                            :: iatom, ico, idir, ikind, ipgf, irow, &
-                                                            irow_packed, iset, isgf, ishell, l, &
-                                                            ncart, power
-      LOGICAL, ALLOCATABLE                               :: angular_used(:)
-      REAL(dp)                                           :: exponent, factor
-      REAL(dp), ALLOCATABLE                              :: bounds(:)
-      TYPE(gto_basis_set_type), POINTER                  :: basis
-      TYPE(particle_type), POINTER                       :: particles(:)
-
-      particles => bs_env%ri_rs%particle_set
-      ALLOCATE (envelopes(3, bs_env%n_atom))
-      envelopes = 0.0_dp
-      DO iatom = 1, bs_env%n_atom
-         ikind = particles(iatom)%atomic_kind%kind_number
-         basis => bs_env%basis_set_RI(ikind)%gto_basis_set
-         CPASSERT(ASSOCIATED(basis))
-         IF (bs_env%auto_ri%enabled) THEN
-            CPASSERT(ALLOCATED(aux_potentials))
-            ALLOCATE (bounds(SIZE(aux_potentials(iatom)%coefficients, 2)))
-         ELSE
-            ALLOCATE (bounds(SIZE(basis%sphi, 2)))
-         END IF
-         ALLOCATE (angular_used(0:MAXVAL(basis%lmax)))
-         bounds = 0.0_dp
-         irow_packed = 0
-         envelopes(2, iatom) = HUGE(1.0_dp)
-         DO iset = 1, basis%nset
-            ncart = ncoset(basis%lmax(iset))
-            angular_used = .FALSE.
-            DO ishell = 1, basis%nshell(iset)
-               angular_used(basis%l(ishell, iset)) = .TRUE.
-            END DO
-            DO ipgf = 1, basis%npgf(iset)
-               exponent = basis%zet(ipgf, iset)
-               envelopes(2, iatom) = MIN(envelopes(2, iatom), exponent)
-               envelopes(3, iatom) = MAX(envelopes(3, iatom), exponent)
-               DO l = 0, basis%lmax(iset)
-                  IF (.NOT. angular_used(l)) CYCLE
-                  DO ico = ncoset(l - 1) + 1, ncoset(l)
-                     irow = (ipgf - 1)*ncart + ico
-                     irow_packed = irow_packed + 1
-                     factor = 4.0_dp*pi/exponent
-                     DO idir = 1, 3
-                        power = indco(idir, ico)
-                        IF (power > 0) factor = factor*(REAL(power, dp)/(exponent*EXP(1.0_dp)))** &
-                                                (0.5_dp*REAL(power, dp))
-                     END DO
-                     IF (bs_env%auto_ri%enabled) THEN
-                        bounds(:) = bounds(:) + ABS(aux_potentials(iatom)%coefficients(irow_packed, :))*factor
-                     ELSE
-                        DO ishell = 1, basis%nshell(iset)
-                           IF (basis%l(ishell, iset) /= l) CYCLE
-                           DO isgf = basis%first_sgf(ishell, iset), basis%last_sgf(ishell, iset)
-                              bounds(isgf) = bounds(isgf) + ABS(basis%sphi(irow, isgf))*factor
-                           END DO
-                        END DO
-                     END IF
-                  END DO
-               END DO
-            END DO
-         END DO
-         IF (bs_env%auto_ri%enabled) THEN
-            IF (.NOT. (irow_packed == SIZE(aux_potentials(iatom)%coefficients, 1))) THEN
-               CPABORT('Inconsistent packed auxiliary rows')
-            END IF
-         END IF
-         envelopes(1, iatom) = MAXVAL(bounds)
-         DEALLOCATE (bounds, angular_used)
-      END DO
-   END SUBROUTINE auxiliary_potential_bound
-
-! **************************************************************************************************
-!> \brief Contract Eqs. (2),(4), screening every spatial l/P-atom/T block separately.
-!> For d=max(0,|r-center|-rc), |v_P(r)|<=B min(1,a_max rc² exp(-a_min d²/2)/2).
-!> B bounds every selected potential on this atom; a_min/max bound its primitive exponents.
-!> For erfc(ωr)/r, |v_P(r)|<=B exp[-a_min ω² |r-center|²/(a_min+2ω²)].
-!> This follows from erfc(x)<=exp(-x²), completing the square, and the Gaussian Coulomb bound.
-!> Half the absolute budget screens common points. The other half is applied independently to
-!> every d_lP(T): a point is contracted for one l block only when its local product bound exceeds
-!> the per-point threshold. The exact l/P/T distance criterion is applied before each GEMM.
-!> \param bs_env ...
-!> \param grid_points ...
-!> \param target_cells ...
-!> \param target_selection ...
-!> \param target_blocks ...
-!> \param points ...
-!> \param field_squared ...
-!> \param weight ...
-!> \param envelopes ...
-!> \param blocks ...
-!> \param threshold ...
-!> \param omitted ...
-!> \param potential_points ...
-!> \param block_contractions ...
-!> \param screened_blocks ...
-!> \param coalesced_contractions ...
-!> \param contraction_products ...
-!> \param target_R ...
-!> \param aux_potentials ...
-! **************************************************************************************************
-   SUBROUTINE integrate_potentials(bs_env, grid_points, target_cells, target_selection, target_blocks, &
-                                   points, field_squared, weight, &
-                                   envelopes, blocks, threshold, omitted, potential_points, block_contractions, &
-                                   screened_blocks, coalesced_contractions, contraction_products, target_R, &
-                                   aux_potentials)
-      TYPE(post_scf_bandstructure_type), POINTER         :: bs_env
-      REAL(dp), INTENT(IN)                               :: grid_points(:, :)
-      INTEGER, INTENT(IN)                                :: target_cells(:, :)
-      LOGICAL, INTENT(IN)                                :: target_selection(:, :, :), &
-                                                            target_blocks(:, :, :)
-      REAL(dp), INTENT(IN)                               :: points(:, :), field_squared(:, :), &
-                                                            weight, envelopes(:, :)
-      TYPE(l_block_partition_type), INTENT(IN)           :: blocks
-      REAL(dp), INTENT(IN)                               :: threshold
-      REAL(dp), INTENT(INOUT)                            :: omitted
-      INTEGER(int_8), INTENT(INOUT)                      :: potential_points, block_contractions, &
-                                                            screened_blocks, &
-                                                            coalesced_contractions, &
-                                                            contraction_products
-      REAL(dp), INTENT(INOUT)                            :: target_R(:, :, :)
-      TYPE(radial_interpolation_type), ALLOCATABLE, &
-         INTENT(IN)                                      :: aux_potentials(:)
-
-      INTEGER                                            :: firstp, handle, iatom, iblock, ig, &
-                                                            ikind, ilocal, it, lastp, maxnp, &
-                                                            nactive, nkeep, np, nthreads, nunion, &
-                                                            row
-      REAL(dp)                                           :: center(3), cutoff, decay, distance, &
-                                                            estimate
-      REAL(dp), ALLOCATABLE                              :: block_field_bound(:, :), &
-                                                            block_target(:, :), field_work(:, :), &
-                                                            point_bound(:), potential(:, :)
-      LOGICAL                                            :: point_needed(SIZE(points, 2))
-      INTEGER                                            :: union_indices(SIZE(points, 2)), &
-                                                            active_l(SIZE(grid_points, 2))
-      TYPE(cell_type), POINTER                           :: cell
-      TYPE(gto_basis_set_type), POINTER                  :: basis
-      LOGICAL                                            :: block_needed(blocks%nblocks)
-      INTEGER :: block_active_last(blocks%nblocks), block_active_first(blocks%nblocks)
-      TYPE(particle_type), POINTER                       :: particles(:)
-
-      cell => bs_env%ri_rs%cell
-      particles => bs_env%ri_rs%particle_set
-      cutoff = 0.0_dp
-      IF (bs_env%ri_metric%potential_type == do_potential_truncated) cutoff = bs_env%ri_metric%cutoff_radius
-      maxnp = MAXVAL(bs_env%i_RI_end_from_atom - bs_env%i_RI_start_from_atom + 1)
-      IF (bs_env%auto_ri%enabled) maxnp = MAXVAL(bs_env%auto_ri%sizes_opt_RI)
-
-      CALL timeset('d_lP_allocate_field_bounds', handle)
-
-      ALLOCATE (block_field_bound(SIZE(points, 2), blocks%nblocks))
-
-      CALL timestop(handle)
-
-      CALL timeset('d_lP_prepare_field_bounds', handle)
-
-      DO iblock = 1, blocks%nblocks
-         block_field_bound(:, iblock) = 0.0_dp
-         DO ilocal = blocks%first(iblock), blocks%first(iblock + 1) - 1
-            DO ig = 1, SIZE(points, 2)
-               block_field_bound(ig, iblock) = MAX(block_field_bound(ig, iblock), &
-                                                   ABS(field_squared(ig, blocks%indices(ilocal))))
-            END DO
-         END DO
-      END DO
-
-      CALL timestop(handle)
-
-      ! Bound the additional thread workspaces to 128 MiB per MPI rank.
-      ! A single thread retains the original memory bound for large global l grids.
-      nthreads = 1
-!$    nthreads = omp_get_max_threads()
-      nthreads = MIN(nthreads, MAX(1, INT(128.0_dp*1024.0_dp**2/ &
-                                          (8.0_dp*(REAL(SIZE(grid_points, 2), dp)*(maxnp + SIZE(points, 2)) + &
-                                                   REAL(SIZE(points, 2), dp)*maxnp)))))
-      ! Each atom/image owns disjoint P/T columns of Eq. (2).
-
-      !$OMP PARALLEL DEFAULT(NONE) NUM_THREADS(nthreads) &
-      !$OMP SHARED(bs_env, grid_points, target_cells, points, field_squared, weight, envelopes, &
-      !$OMP blocks, threshold, target_R, aux_potentials, cell, particles, cutoff, &
-      !$OMP maxnp, block_field_bound, target_selection, target_blocks) &
-      !$OMP PRIVATE(firstp, handle, iatom, iblock, ig, ikind, ilocal, it, lastp, nactive, nkeep, &
-      !$OMP np, nunion, row, center, decay, distance, estimate, basis, &
-      !$OMP block_target, field_work, point_bound, potential, point_needed, union_indices, &
-      !$OMP active_l, block_needed, block_active_last, block_active_first) &
-      !$OMP REDUCTION(+:omitted, potential_points, block_contractions, screened_blocks, &
-      !$OMP coalesced_contractions, contraction_products)
-
-      CALL timeset('d_lP_allocate_thread_buffers', handle)
-
-      ALLOCATE (block_target(SIZE(grid_points, 2), maxnp), &
-                field_work(SIZE(points, 2), SIZE(grid_points, 2)), point_bound(SIZE(points, 2)), &
-                potential(SIZE(points, 2), maxnp))
-
-      CALL timestop(handle)
-
-      !$OMP DO COLLAPSE(2) SCHEDULE(DYNAMIC)
-      DO it = 1, SIZE(target_cells, 2)
-         DO iatom = 1, bs_env%n_atom
-            ikind = particles(iatom)%atomic_kind%kind_number
-            basis => bs_env%basis_set_RI(ikind)%gto_basis_set
-            firstp = bs_env%i_RI_start_from_atom(iatom)
-            lastp = bs_env%i_RI_end_from_atom(iatom)
-            IF (bs_env%auto_ri%enabled) THEN
-               firstp = 1 + SUM(bs_env%auto_ri%sizes_opt_RI(:iatom - 1))
-               lastp = firstp + bs_env%auto_ri%sizes_opt_RI(iatom) - 1
-            END IF
-            np = lastp - firstp + 1
-            center = pbc(particles(iatom)%r, cell) + MATMUL(bs_env%hmat, REAL(target_cells(:, it), dp))
-            IF (.NOT. ANY(target_blocks(:, iatom, it))) CYCLE
-            CALL timeset('d_lP_screen_atom_image', handle)
-            decay = 0.0_dp
-            IF (bs_env%ri_metric%potential_type == do_potential_short) THEN
-               decay = envelopes(2, iatom)*bs_env%ri_metric%omega**2/ &
-                       (envelopes(2, iatom) + 2.0_dp*bs_env%ri_metric%omega**2)
-            END IF
-            DO ig = 1, SIZE(points, 2)
-               point_bound(ig) = envelopes(1, iatom)
-               IF (decay > 0.0_dp) point_bound(ig) = point_bound(ig)* &
-                                                     EXP(-decay*SUM((points(:, ig) - center)**2))
-               IF (cutoff > 0.0_dp) THEN
-                  distance = MAX(0.0_dp, NORM2(points(:, ig) - center) - cutoff)
-                  point_bound(ig) = point_bound(ig)* &
-                                    MIN(1.0_dp, 0.5_dp*envelopes(3, iatom)*cutoff**2* &
-                                        EXP(-0.5_dp*envelopes(2, iatom)*distance**2))
-               END IF
-            END DO
-            block_needed = .FALSE.
-            point_needed = .FALSE.
-            DO iblock = 1, blocks%nblocks
-               IF (.NOT. target_blocks(iblock, iatom, it)) CYCLE
-               DO ig = 1, SIZE(points, 2)
-                  estimate = block_field_bound(ig, iblock)*point_bound(ig)
-                  IF (estimate > threshold) THEN
-                     block_needed(iblock) = .TRUE.
-                     point_needed(ig) = .TRUE.
-                  ELSE
-                     omitted = omitted + weight*estimate
-                  END IF
-               END DO
-               IF (.NOT. block_needed(iblock)) screened_blocks = screened_blocks + 1_int_8
-            END DO
-            nunion = 0
-            DO ig = 1, SIZE(points, 2)
-               IF (point_needed(ig)) THEN
-                  nunion = nunion + 1
-                  union_indices(nunion) = ig
-               END IF
-            END DO
-            CALL timestop(handle)
-            IF (nunion == 0) CYCLE
-            potential_points = potential_points + INT(nunion, int_8)
-            CALL timeset('d_lP_potential_eval', handle)
-            IF (bs_env%auto_ri%enabled) THEN
-               CALL evaluate_uniform_potential(potential(:, 1:np), &
-                                               points(:, union_indices(1:nunion)), &
-                                               basis, center, cutoff, aux_potentials(iatom), &
-                                               attenuation=MAX(0.0_dp, bs_env%ri_metric%omega))
-            ELSE
-               CALL evaluate_uniform_potential(potential(1:nunion, 1:np), &
-                                               points(:, union_indices(1:nunion)), &
-                                               basis, center, cutoff, &
-                                               attenuation=MAX(0.0_dp, bs_env%ri_metric%omega))
-            END IF
-            CALL timestop(handle)
-            CALL timeset('d_lP_prepare_quadrature', handle)
-            nactive = 0
-            block_active_first = 0
-            block_active_last = -1
-            DO iblock = 1, blocks%nblocks
-               IF (.NOT. block_needed(iblock)) CYCLE
-               block_active_first(iblock) = nactive + 1
-               DO ilocal = blocks%first(iblock), blocks%first(iblock + 1) - 1
-                  IF (target_selection(blocks%indices(ilocal), iatom, it)) THEN
-                     nactive = nactive + 1
-                     active_l(nactive) = blocks%indices(ilocal)
-                  END IF
-               END DO
-               block_active_last(iblock) = nactive
-               IF (.NOT. (block_active_last(iblock) >= block_active_first(iblock))) THEN
-                  CPABORT('Empty active integration block')
-               END IF
-            END DO
-            DO iblock = 1, blocks%nblocks
-               IF (.NOT. block_needed(iblock)) CYCLE
-               DO row = 1, nunion
-                  ig = union_indices(row)
-                  point_needed(row) = block_field_bound(ig, iblock)*point_bound(ig) > threshold
-               END DO
-               nkeep = COUNT(point_needed(1:nunion))
-               DO ilocal = block_active_first(iblock), block_active_last(iblock)
-                  DO row = 1, nunion
-                     field_work(row, ilocal) = MERGE( &
-                                               field_squared(union_indices(row), active_l(ilocal)), 0.0_dp, point_needed(row))
-                  END DO
-               END DO
-               CPASSERT(nkeep > 0)
-               block_contractions = block_contractions + 1_int_8
-            END DO
-            CALL timestop(handle)
-            CALL timeset('d_lP_sum_g_f2_v', handle)
-            CALL dgemm('T', 'N', nactive, np, nunion, weight, field_work, SIZE(field_work, 1), &
-                       potential, SIZE(potential, 1), 0.0_dp, block_target, SIZE(block_target, 1))
-            DO ilocal = 1, nactive
-               target_R(active_l(ilocal), firstp:lastp, it) = &
-                  target_R(active_l(ilocal), firstp:lastp, it) + block_target(ilocal, 1:np)
-            END DO
-            CALL timestop(handle)
-            coalesced_contractions = coalesced_contractions + 1_int_8
-            contraction_products = contraction_products + &
-                                   INT(nactive, int_8)*INT(np, int_8)*INT(nunion, int_8)
-         END DO
-      END DO
-      !$OMP END DO NOWAIT
-
-      CALL timeset('d_lP_wait_for_threads', handle)
-
-      !$OMP BARRIER
-
-      CALL timestop(handle)
-
-      CALL timeset('d_lP_release_thread_buffers', handle)
-
-      DEALLOCATE (block_target, field_work, point_bound, potential)
-
-      CALL timestop(handle)
-
-      !$OMP END PARALLEL
-   END SUBROUTINE integrate_potentials
-
-! **************************************************************************************************
-!> \brief Squared distance from a point to an axis-aligned spatial l block.
-!> \param point ...
-!> \param lower ...
-!> \param upper ...
-!> \return ...
-! **************************************************************************************************
-   PURE FUNCTION distance_to_box_squared(point, lower, upper) RESULT(distance_squared)
-      REAL(dp), INTENT(IN)                               :: point(3), lower(3), upper(3)
-      REAL(dp)                                           :: distance_squared
-
-      INTEGER                                            :: idir
-      REAL(dp)                                           :: delta
-
-      distance_squared = 0.0_dp
-      DO idir = 1, 3
-         delta = MAX(lower(idir) - point(idir), point(idir) - upper(idir), 0.0_dp)
-         distance_squared = distance_squared + delta**2
-      END DO
-   END FUNCTION distance_to_box_squared
-
-! **************************************************************************************************
-!> \brief Apply the established l/P/T distance criterion after Eq. (2).
-!> \param bs_env ...
-!> \param grid_points ...
-!> \param target_cells ...
-!> \param target_R ...
-! **************************************************************************************************
-   SUBROUTINE apply_target_cutoff(bs_env, grid_points, target_cells, target_R)
-      TYPE(post_scf_bandstructure_type), POINTER         :: bs_env
-      REAL(dp), INTENT(IN)                               :: grid_points(:, :)
-      INTEGER, INTENT(IN)                                :: target_cells(:, :)
-      REAL(dp), INTENT(INOUT)                            :: target_R(:, :, :)
-
-      INTEGER                                            :: firstp, iatom, il, it, lastp
-      REAL(dp)                                           :: center(3), cutoff
-      REAL(dp), ALLOCATABLE                              :: target_cutoffs(:)
-      TYPE(cell_type), POINTER                           :: cell
-      TYPE(particle_type), POINTER                       :: particles(:)
-
-      cell => bs_env%ri_rs%cell
-      particles => bs_env%ri_rs%particle_set
-      CALL get_dlp_target_cutoffs(bs_env, target_cutoffs)
-      DO it = 1, SIZE(target_cells, 2)
-         DO iatom = 1, bs_env%n_atom
-            center = pbc(particles(iatom)%r, cell) + MATMUL(bs_env%hmat, REAL(target_cells(:, it), dp))
-            firstp = bs_env%i_RI_start_from_atom(iatom)
-            lastp = bs_env%i_RI_end_from_atom(iatom)
-            IF (bs_env%auto_ri%enabled) THEN
-               firstp = 1 + SUM(bs_env%auto_ri%sizes_opt_RI(:iatom - 1))
-               lastp = firstp + bs_env%auto_ri%sizes_opt_RI(iatom) - 1
-            END IF
-            cutoff = target_cutoffs(iatom)
-            DO il = 1, SIZE(grid_points, 2)
-               IF (NORM2(grid_points(:, il) - center) > cutoff) target_R(il, firstp:lastp, it) = 0.0_dp
-            END DO
-         END DO
-      END DO
-      DEALLOCATE (target_cutoffs)
-   END SUBROUTINE apply_target_cutoff
-
-! **************************************************************************************************
-!> \brief Evaluate v_P(r) for a contracted spherical auxiliary basis, without Gaussian smearing.
-!> For a primitive H_l(r) exp(-a r²), H_l is a homogeneous harmonic polynomial.
-!> (1) Its potential is H_l(r) (-1/a)^l d^l F(s)/ds^l, s=r².
-!> (2) F is the s-Gaussian convolution with theta(rc-|r-r'|)/|r-r'|:
-!> F(r²)=pi^(3/2)[2 erf(sqrt(a)r)-erf(sqrt(a)(r-rc))-erf(sqrt(a)(r+rc))]/(2 a^(3/2) r).
-!> The existing sphi coefficients supply all contraction and angular normalization factors.
-!> A nonpositive rc selects the untruncated Coulomb kernel. No spatial cutoff is applied here.
-!> The origin uses a convergent power series; elsewhere Taylor arithmetic differentiates (2).
-!> \param values Potentials indexed by integration point and contracted auxiliary function.
-!> \param points Cartesian integration points in bohr, indexed (3,point).
-!> \param basis Contracted spherical auxiliary basis.
-!> \param center Auxiliary atomic center in bohr.
-!> \param cutoff Coulomb cutoff in bohr, or nonpositive for the full kernel.
-!> \param contracted ...
-!> \param attenuation Positive omega (inverse bohr) selects erfc(omega*r)/r.
-! **************************************************************************************************
-   SUBROUTINE evaluate_uniform_potential(values, points, basis, center, cutoff, contracted, attenuation)
-      REAL(dp), CONTIGUOUS, INTENT(OUT)                  :: values(:, :)
-      REAL(dp), INTENT(IN)                               :: points(:, :)
-      TYPE(gto_basis_set_type), POINTER                  :: basis
-      REAL(dp), INTENT(IN)                               :: center(3), cutoff
-      TYPE(radial_interpolation_type), INTENT(IN), &
-         OPTIONAL                                        :: contracted
-      REAL(dp), INTENT(IN), OPTIONAL                     :: attenuation
-
-      CPASSERT(ASSOCIATED(basis))
-      CPASSERT(SIZE(points, 1) == 3)
-      IF (PRESENT(contracted)) THEN
-         CPASSERT(SIZE(values, 1) >= SIZE(points, 2))
-      ELSE
-         CPASSERT(SIZE(values, 1) == SIZE(points, 2))
-      END IF
-      CALL contract_potentials(values, points, basis, center, cutoff, contracted, attenuation)
-   END SUBROUTINE evaluate_uniform_potential
-
-! **************************************************************************************************
-!> \brief Transform spherical coefficients once; bound optional radial tables by radial_table_bytes.
-!> \param basis ...
-!> \param U_Pp ...
-!> \param contracted ...
-!> \param cutoff ...
-!> \param attenuation ...
-!> \param radial_table_bytes ...
-!> \param mesh_step ...
-!> \param mesh_displacement ...
-! **************************************************************************************************
-   SUBROUTINE prepare_contracted_potential(basis, U_Pp, contracted, cutoff, attenuation, radial_table_bytes, &
-                                           mesh_step, mesh_displacement)
-      TYPE(gto_basis_set_type), POINTER                  :: basis
-      REAL(dp), INTENT(IN), OPTIONAL                     :: U_Pp(:, :)
-      TYPE(radial_interpolation_type), INTENT(OUT)       :: contracted
-      REAL(dp), INTENT(IN), OPTIONAL                     :: cutoff, attenuation, radial_table_bytes, &
-                                                            mesh_step(3, 3), mesh_displacement(3)
-
-      INTEGER                                            :: ico, iopt, ipgf, irow, irow_packed, &
-                                                            iset, isgf, ishell, l, ncart, &
-                                                            ninterval, np, nrows
-      LOGICAL, ALLOCATABLE                               :: angular_used(:)
-      REAL(dp)                                           :: bytes_per_node, table_bytes
-      REAL(dp), ALLOCATABLE                              :: full_abscissae(:), moments(:, :)
-
-      CPASSERT(ASSOCIATED(basis))
-      ALLOCATE (angular_used(0:MAXVAL(basis%lmax)))
-      np = basis%nsgf
-      IF (PRESENT(U_Pp)) THEN
-         CPASSERT(SIZE(U_Pp, 1) == basis%nsgf)
-         np = SIZE(U_Pp, 2)
-      END IF
-      nrows = 0
-      DO iset = 1, basis%nset
-         angular_used = .FALSE.
-         DO ishell = 1, basis%nshell(iset)
-            angular_used(basis%l(ishell, iset)) = .TRUE.
-         END DO
-         DO l = 0, basis%lmax(iset)
-            IF (angular_used(l)) nrows = nrows + basis%npgf(iset)*(ncoset(l) - ncoset(l - 1))
-         END DO
-      END DO
-      ! W_g,ia is independent of the contracted shell: sum its coefficients before evaluating W.
-      ! Rows enumerate (set, primitive, distinct angular momentum, Cartesian monomial).
-      ALLOCATE (contracted%coefficients(nrows, np), source=0.0_dp)
-      irow_packed = 0
-      DO iset = 1, basis%nset
-         ncart = ncoset(basis%lmax(iset))
-         angular_used = .FALSE.
-         DO ishell = 1, basis%nshell(iset)
-            angular_used(basis%l(ishell, iset)) = .TRUE.
-         END DO
-         DO ipgf = 1, basis%npgf(iset)
-            DO l = 0, basis%lmax(iset)
-               IF (.NOT. angular_used(l)) CYCLE
-               DO ico = ncoset(l - 1) + 1, ncoset(l)
-                  irow = (ipgf - 1)*ncart + ico
-                  irow_packed = irow_packed + 1
-                  DO ishell = 1, basis%nshell(iset)
-                     IF (basis%l(ishell, iset) /= l) CYCLE
-                     DO isgf = basis%first_sgf(ishell, iset), basis%last_sgf(ishell, iset)
-                        IF (PRESENT(U_Pp)) THEN
-                           DO iopt = 1, np
-                              contracted%coefficients(irow_packed, iopt) = &
-                                 contracted%coefficients(irow_packed, iopt) + basis%sphi(irow, isgf)*U_Pp(isgf, iopt)
-                           END DO
-                        ELSE
-                           contracted%coefficients(irow_packed, isgf) = &
-                              contracted%coefficients(irow_packed, isgf) + basis%sphi(irow, isgf)
-                        END IF
-                     END DO
-                  END DO
-               END DO
-            END DO
-         END DO
-      END DO
-      CPASSERT(irow_packed == nrows)
-      DEALLOCATE (angular_used)
-      IF (PRESENT(U_Pp) .AND. basis%nsgf < nrows) THEN
-         CALL prepare_spherical_potential_factorization(basis, U_Pp, contracted)
-      END IF
-      IF (PRESENT(cutoff) .OR. PRESENT(attenuation)) THEN
-         IF (PRESENT(cutoff)) contracted%cutoff = cutoff
-         IF (PRESENT(attenuation)) contracted%attenuation = MAX(0.0_dp, attenuation)
-         CALL prepare_radial_series(basis, contracted%cutoff, contracted%attenuation, &
-                                    contracted%series, contracted%short_series)
-         IF (contracted%attenuation > 0.0_dp) THEN
-            table_bytes = 16.0_dp*1024.0_dp**2
-            IF (PRESENT(radial_table_bytes)) table_bytes = MAX(0.0_dp, radial_table_bytes)
-            ! Budget the actual logarithmic nodes, including one primitive preparation buffer.
-            bytes_per_node = 8.0_dp*REAL(MAXVAL(basis%lmax) + 7, dp)* &
-                             REAL(MAXVAL(basis%npgf)*basis%nset + 1, dp)
-            CALL prepare_short_radial_grid(512.0_dp, contracted%short_abscissae)
-            table_bytes = MAX(0.0_dp, table_bytes - 8.0_dp*REAL(SIZE(contracted%short_abscissae), dp))
-            ninterval = INT(MIN(REAL(SIZE(contracted%short_abscissae), dp), &
-                                table_bytes/bytes_per_node)) - 1
-            IF (ninterval < 1) THEN
-               DEALLOCATE (contracted%short_abscissae)
-               RETURN
-            END IF
-            IF (ninterval < UBOUND(contracted%short_abscissae, 1)) THEN
-               CALL MOVE_ALLOC(contracted%short_abscissae, full_abscissae)
-               ALLOCATE (contracted%short_abscissae(0:ninterval))
-               contracted%short_abscissae(:) = full_abscissae(0:ninterval)
-               DEALLOCATE (full_abscissae)
-            END IF
-            ALLOCATE (contracted%short_moments(0:MAXVAL(basis%lmax) + 6, &
-                                               0:ninterval, MAXVAL(basis%npgf), basis%nset))
-            DO iset = 1, basis%nset
-               DO ipgf = 1, basis%npgf(iset)
-                  CALL prepare_short_radial_table(basis%zet(ipgf, iset), contracted%attenuation, &
-                                                  MAXVAL(basis%lmax), moments, ninterval, abscissae=contracted%short_abscissae)
-                  contracted%short_moments(:, :, ipgf, iset) = moments
-                  DEALLOCATE (moments)
-               END DO
-            END DO
-            ! Keep the generic radial lookup at all radii before using remaining storage for mesh nodes.
-            table_bytes = MAX(0.0_dp, table_bytes - 8.0_dp*REAL(SIZE(contracted%short_moments, KIND=int_8), dp))
-            IF (PRESENT(mesh_step) .AND. PRESENT(mesh_displacement)) THEN
-               CALL prepare_mesh_radial_moments(basis, contracted, mesh_step, mesh_displacement, table_bytes)
-            END IF
-         END IF
-      END IF
-   END SUBROUTINE prepare_contracted_potential
-
-! **************************************************************************************************
-!> \brief Factor sphi into a common angular map and shell/primitive radial scales when exact.
-!> This is checked against every spherical coefficient; arbitrary contracted or modified bases
-!> retain the original Cartesian path if the factorization does not hold.
-!> \param basis ...
-!> \param U_Pp ...
-!> \param contracted ...
-! **************************************************************************************************
-   SUBROUTINE prepare_spherical_potential_factorization(basis, U_Pp, contracted)
-      TYPE(gto_basis_set_type), POINTER                  :: basis
-      REAL(dp), INTENT(IN)                               :: U_Pp(:, :)
-      TYPE(radial_interpolation_type), INTENT(INOUT)     :: contracted
-
-      INTEGER                                            :: c, first, ico, ipgf, iset, ishell, l, &
-                                                            lmax, m, ncart, ref_c, ref_m, ref_p, &
-                                                            ref_shell, row
-      LOGICAL, ALLOCATABLE                               :: used(:)
-      REAL(dp)                                           :: actual, expected, ref_abs, ref_value, &
-                                                            scale
-      REAL(dp), ALLOCATABLE                              :: angular_coeff(:, :, :, :), &
-                                                            primitive_scale(:, :, :)
-
-      IF (SIZE(U_Pp, 1) /= basis%nsgf) RETURN
-      ALLOCATE (used(basis%nsgf), source=.FALSE.)
-      ALLOCATE (angular_coeff(MAXVAL(ncoset(0:MAXVAL(basis%lmax)) - &
-                                     ncoset(-1:MAXVAL(basis%lmax) - 1)), &
-                              MAXVAL(nso(0:MAXVAL(basis%lmax))), &
-                              0:MAXVAL(basis%lmax), basis%nset), source=0.0_dp)
-      ALLOCATE (primitive_scale(MAXVAL(basis%npgf), MAXVAL(basis%nshell), basis%nset), &
-                source=0.0_dp)
-      DO iset = 1, basis%nset
-         DO ishell = 1, basis%nshell(iset)
-            l = basis%l(ishell, iset)
-            first = basis%first_sgf(ishell, iset)
-            IF (first < 1 .OR. basis%last_sgf(ishell, iset) /= first + nso(l) - 1) RETURN
-            IF (basis%last_sgf(ishell, iset) > basis%nsgf) RETURN
-            IF (ANY(used(first:first + nso(l) - 1))) RETURN
-            used(first:first + nso(l) - 1) = .TRUE.
-         END DO
-      END DO
-      IF (.NOT. ALL(used)) RETURN
-      DO iset = 1, basis%nset
-         lmax = basis%lmax(iset)
-         DO l = 0, lmax
-            ref_abs = 0.0_dp
-            ref_shell = 0
-            ncart = ncoset(l) - ncoset(l - 1)
-            DO ishell = 1, basis%nshell(iset)
-               IF (basis%l(ishell, iset) /= l) CYCLE
-               first = basis%first_sgf(ishell, iset)
-               DO ipgf = 1, basis%npgf(iset)
-                  DO m = 1, nso(l)
-                     DO c = 1, ncart
-                        ico = ncoset(l - 1) + c
-                        row = (ipgf - 1)*ncoset(lmax) + ico
-                        actual = basis%sphi(row, first + m - 1)
-                        IF (ABS(actual) > ref_abs) THEN
-                           ref_abs = ABS(actual)
-                           ref_value = actual
-                           ref_shell = ishell
-                           ref_p = ipgf
-                           ref_c = c
-                           ref_m = m
-                        END IF
-                     END DO
-                  END DO
-               END DO
-            END DO
-            IF (ref_shell == 0) CYCLE
-            first = basis%first_sgf(ref_shell, iset)
-            DO m = 1, nso(l)
-               DO c = 1, ncart
-                  ico = ncoset(l - 1) + c
-                  row = (ref_p - 1)*ncoset(lmax) + ico
-                  angular_coeff(c, m, l, iset) = basis%sphi(row, first + m - 1)
-               END DO
-            END DO
-            DO ishell = 1, basis%nshell(iset)
-               IF (basis%l(ishell, iset) /= l) CYCLE
-               first = basis%first_sgf(ishell, iset)
-               DO ipgf = 1, basis%npgf(iset)
-                  row = (ipgf - 1)*ncoset(lmax) + ncoset(l - 1) + ref_c
-                  scale = basis%sphi(row, first + ref_m - 1)/ref_value
-                  primitive_scale(ipgf, ishell, iset) = scale
-                  DO m = 1, nso(l)
-                     DO c = 1, ncart
-                        ico = ncoset(l - 1) + c
-                        row = (ipgf - 1)*ncoset(lmax) + ico
-                        actual = basis%sphi(row, first + m - 1)
-                        expected = scale*angular_coeff(c, m, l, iset)
-                        IF (ABS(actual - expected) > 64.0_dp*EPSILON(1.0_dp)* &
-                            MAX(ref_abs, ABS(actual), ABS(expected))) RETURN
-                     END DO
-                  END DO
-               END DO
-            END DO
-         END DO
-      END DO
-      CALL MOVE_ALLOC(angular_coeff, contracted%spherical_angular)
-      CALL MOVE_ALLOC(primitive_scale, contracted%spherical_primitive)
-      ALLOCATE (contracted%spherical_selection(SIZE(U_Pp, 1), SIZE(U_Pp, 2)))
-      contracted%spherical_selection(:, :) = U_Pp
-      contracted%spherical_factorized = .TRUE.
-   END SUBROUTINE prepare_spherical_potential_factorization
-
-! **************************************************************************************************
-!> \brief Prepare the origin series in Eq. (2) once for a fixed basis and interaction kernel.
-!> The coefficients depend on neither the integration point nor the translated atomic center.
-!> \param basis ...
-!> \param cutoff ...
-!> \param omega ...
-!> \param series ...
-!> \param short_series ...
-! **************************************************************************************************
-   SUBROUTINE prepare_radial_series(basis, cutoff, omega, series, short_series)
-      TYPE(gto_basis_set_type), POINTER                  :: basis
-      REAL(dp), INTENT(IN)                               :: cutoff, omega
-      REAL(dp), ALLOCATABLE, INTENT(OUT)                 :: series(:, :, :), short_series(:, :, :)
-
-      INTEGER                                            :: in, ipgf, iset, lmax
-      REAL(dp)                                           :: beta_ratio, exponent
-
-      lmax = MAXVAL(basis%lmax)
-      ALLOCATE (series(0:lmax + 24, MAXVAL(basis%npgf), basis%nset), &
-                short_series(0:lmax + 24, MAXVAL(basis%npgf), basis%nset))
-      DO iset = 1, basis%nset
-         DO ipgf = 1, basis%npgf(iset)
-            exponent = basis%zet(ipgf, iset)
-            IF (omega > 0.0_dp) THEN
-               CALL origin_series(exponent, 0.0_dp, series(:, ipgf, iset))
-               beta_ratio = omega**2/(exponent + omega**2)
-               DO in = 0, UBOUND(series, 1)
-                  short_series(in, ipgf, iset) = series(in, ipgf, iset)* &
-                                                 (1.0_dp - beta_ratio**(REAL(in, dp) + 0.5_dp))
-               END DO
-            ELSE
-               CALL origin_series(exponent, cutoff, series(:, ipgf, iset))
-               short_series(:, ipgf, iset) = 0.0_dp
-            END IF
-         END DO
-      END DO
-   END SUBROUTINE prepare_radial_series
-
-! **************************************************************************************************
-!> \brief Contract primitive potentials from Eq. (1) using the CP2K spherical coefficients.
-!> \param values ...
-!> \param points ...
-!> \param basis ...
-!> \param center ...
-!> \param cutoff ...
-!> \param contracted ...
-!> \param attenuation ...
-! **************************************************************************************************
-   SUBROUTINE contract_potentials(values, points, basis, center, cutoff, contracted, attenuation)
-      REAL(dp), CONTIGUOUS, INTENT(OUT)                  :: values(:, :)
-      REAL(dp), INTENT(IN)                               :: points(:, :)
-      TYPE(gto_basis_set_type), POINTER                  :: basis
-      REAL(dp), INTENT(IN)                               :: center(3), cutoff
-      TYPE(radial_interpolation_type), INTENT(IN), &
-         OPTIONAL                                        :: contracted
-      REAL(dp), INTENT(IN), OPTIONAL                     :: attenuation
-
-      INTEGER                                            :: ico, in, ipgf, ipoint, irow, iset, isgf, &
-                                                            ishell, l, lmax, ncart
-      LOGICAL                                            :: parallel_points, short
-      REAL(dp)                                           :: beta_ratio, exponent, minimum_radius2, &
-                                                            omega, polynomial, radius, &
-                                                            relative(3), weight
-      REAL(dp), ALLOCATABLE                              :: long_radial(:), radial(:), &
-                                                            series(:, :, :), short_series(:, :, :)
-      TYPE(radial_work_type)                             :: radial_work
-
-      lmax = MAXVAL(basis%lmax)
-      omega = 0.0_dp
-      IF (PRESENT(attenuation)) omega = attenuation
-      short = omega > 0.0_dp
-      IF (PRESENT(contracted)) THEN
-         CPASSERT(ALLOCATED(contracted%coefficients))
-         CPASSERT(SIZE(contracted%coefficients, 2) == SIZE(values, 2))
-         CALL contract_selected_potentials(values, points, basis, center, cutoff, contracted, attenuation)
-         RETURN
-      END IF
-      ALLOCATE (series(0:lmax + 24, MAXVAL(basis%npgf), basis%nset), &
-                short_series(0:lmax + 24, MAXVAL(basis%npgf), basis%nset))
-      minimum_radius2 = MINVAL(SUM((points - SPREAD(center, 2, SIZE(points, 2)))**2, DIM=1))
-      DO iset = 1, basis%nset
-         DO ipgf = 1, basis%npgf(iset)
-            exponent = basis%zet(ipgf, iset)
-            IF (short) THEN
-               CALL origin_series(exponent, 0.0_dp, series(:, ipgf, iset))
-               beta_ratio = omega**2/(exponent + omega**2)
-               DO in = 0, UBOUND(series, 1)
-                  short_series(in, ipgf, iset) = series(in, ipgf, iset)* &
-                                                 (1.0_dp - beta_ratio**(REAL(in, dp) + 0.5_dp))
-               END DO
-            ELSE IF (exponent*minimum_radius2 < 0.5_dp) THEN
-               CALL origin_series(exponent, cutoff, series(:, ipgf, iset))
-            ELSE
-               series(:, ipgf, iset) = 0.0_dp
-            END IF
-         END DO
-      END DO
-      values = 0.0_dp
-      parallel_points = .TRUE.
-!$    parallel_points = .NOT. omp_in_parallel()
-      !$OMP PARALLEL DEFAULT(NONE) IF(parallel_points) &
-      !$OMP SHARED(values, points, basis, center, cutoff, lmax, series, short_series, &
-      !$OMP short, omega, ncoset, indco) &
-      !$OMP PRIVATE(ipoint, relative, radius, iset, ipgf, exponent, radial, ishell, &
-      !$OMP l, isgf, ico, irow, ncart, polynomial, weight, radial_work, long_radial)
-      ALLOCATE (radial(0:lmax), long_radial(0:lmax), radial_work%jet(0:lmax), &
-                radial_work%gaussian(0:lmax), radial_work%derivative(0:lmax), radial_work%bracket(0:lmax))
-      !$OMP DO SCHEDULE(STATIC)
-      DO ipoint = 1, SIZE(points, 2)
-         relative = points(:, ipoint) - center
-         radius = NORM2(relative)
-         DO iset = 1, basis%nset
-            ncart = ncoset(basis%lmax(iset))
-            DO ipgf = 1, basis%npgf(iset)
-               exponent = basis%zet(ipgf, iset)
-               IF (short) THEN
-                  CALL radial_potential_short(radius, exponent, omega, series(:, ipgf, iset), &
-                                              short_series(:, ipgf, iset), radial, radial_work, long_radial)
-               ELSE
-                  CALL radial_potential(radius, exponent, cutoff, series(:, ipgf, iset), radial, radial_work)
-               END IF
-               DO ishell = 1, basis%nshell(iset)
-                  l = basis%l(ishell, iset)
-                  DO isgf = basis%first_sgf(ishell, iset), basis%last_sgf(ishell, iset)
-                     polynomial = 0.0_dp
-                     DO ico = ncoset(l - 1) + 1, ncoset(l)
-                        irow = (ipgf - 1)*ncart + ico
-                        weight = basis%sphi(irow, isgf)
-                        polynomial = polynomial + weight*relative(1)**indco(1, ico)* &
-                                     relative(2)**indco(2, ico)*relative(3)**indco(3, ico)
-                     END DO
-                     values(ipoint, isgf) = values(ipoint, isgf) + polynomial*radial(l)
-                  END DO
-               END DO
-            END DO
-         END DO
-      END DO
-      !$OMP END DO
-      DEALLOCATE (radial, long_radial, radial_work%jet, radial_work%gaussian, &
-                  radial_work%derivative, radial_work%bracket)
-      !$OMP END PARALLEL
-   END SUBROUTINE contract_potentials
-
-! **************************************************************************************************
-!> \brief Contract selected auxiliary potentials with BLAS after shared radial work.
-!> The potential columns are selected AUTO_RI functions throughout this routine.
-!> Each thread reuses radial work arrays over all points and Gaussian primitives.
-!> \param values ...
-!> \param points ...
-!> \param basis ...
-!> \param center ...
-!> \param cutoff ...
-!> \param contracted ...
-!> \param attenuation ...
-! **************************************************************************************************
-   SUBROUTINE contract_selected_potentials(values, points, basis, center, cutoff, contracted, attenuation)
-      REAL(dp), CONTIGUOUS, INTENT(OUT)                  :: values(:, :)
-      REAL(dp), INTENT(IN)                               :: points(:, :)
-      TYPE(gto_basis_set_type), POINTER                  :: basis
-      REAL(dp), INTENT(IN)                               :: center(3), cutoff
-      TYPE(radial_interpolation_type), INTENT(IN), &
-         TARGET                                          :: contracted
-      REAL(dp), INTENT(IN), OPTIONAL                     :: attenuation
-
-      INTEGER                                            :: handle, iangular, ico, ig, imesh, in, &
-                                                            ipgf, irow, iset, isgf, ishell, l, &
-                                                            lmax, m, nchannels, ng, np, nrows, &
-                                                            nwork
-      INTEGER, ALLOCATABLE                               :: angular_count(:, :, :), &
-                                                            angular_index(:), &
-                                                            angular_term(:, :, :, :), &
-                                                            mesh_channel(:), minimum_l(:)
-      LOGICAL                                            :: factorized, in_table, parallel_points, &
-                                                            prepared, short, tabulated, use_mesh
-      LOGICAL, ALLOCATABLE                               :: angular_used(:, :)
-      REAL(dp) :: beta_ratio, exponent, mesh_delta, mesh_position, minimum_radius2, omega, &
-         radial_sum, radius, radius2, relative(3), spherical_value, x
-      REAL(dp), ALLOCATABLE :: angular_values(:, :, :), coordinate_power(:, :), long_radial(:), &
-         monomial(:), radial(:), radial_channels(:, :, :), radial_mesh(:), work(:, :)
-      REAL(dp), CONTIGUOUS, POINTER                      :: coefficient_matrix(:, :)
-      REAL(dp), POINTER                                  :: series(:, :, :), short_series(:, :, :)
-      TYPE(radial_work_type)                             :: radial_work
-
-      CALL timeset('d_lP_potential_prepare', handle)
-
-      ng = SIZE(points, 2)
-      np = SIZE(values, 2)
-      lmax = MAXVAL(basis%lmax)
-      nrows = SIZE(contracted%coefficients, 1)
-      factorized = contracted%spherical_factorized
-      nwork = nrows
-      IF (factorized) nwork = basis%nsgf
-      ALLOCATE (angular_used(0:lmax, basis%nset), source=.FALSE.)
-      ALLOCATE (minimum_l(basis%nset))
-      DO iset = 1, basis%nset
-         minimum_l(iset) = MINVAL(basis%l(1:basis%nshell(iset), iset))
-         DO ishell = 1, basis%nshell(iset)
-            angular_used(basis%l(ishell, iset), iset) = .TRUE.
-         END DO
-      END DO
-      omega = 0.0_dp
-      IF (PRESENT(attenuation)) omega = attenuation
-      short = omega > 0.0_dp
-      ALLOCATE (work(nwork, ng))
-      prepared = ALLOCATED(contracted%series) .AND. ALLOCATED(contracted%short_series)
-      prepared = prepared .AND. ABS(contracted%cutoff - cutoff) <= 0.0_dp .AND. &
-                 ABS(contracted%attenuation - omega) <= 0.0_dp
-      IF (prepared) THEN
-         series => contracted%series
-         short_series => contracted%short_series
-      ELSE
-         ALLOCATE (series(0:lmax + 24, MAXVAL(basis%npgf), basis%nset), &
-                   short_series(0:lmax + 24, MAXVAL(basis%npgf), basis%nset))
-         minimum_radius2 = MINVAL(SUM((points - SPREAD(center, 2, ng))**2, DIM=1))
-         DO iset = 1, basis%nset
-            DO ipgf = 1, basis%npgf(iset)
-               exponent = basis%zet(ipgf, iset)
-               IF (short) THEN
-                  CALL origin_series(exponent, 0.0_dp, series(:, ipgf, iset))
-                  beta_ratio = omega**2/(exponent + omega**2)
-                  DO in = 0, UBOUND(series, 1)
-                     short_series(in, ipgf, iset) = series(in, ipgf, iset)* &
-                                                    (1.0_dp - beta_ratio**(REAL(in, dp) + 0.5_dp))
-                  END DO
-               ELSE IF (exponent*minimum_radius2 < 0.5_dp) THEN
-                  CALL origin_series(exponent, cutoff, series(:, ipgf, iset))
-               ELSE
-                  series(:, ipgf, iset) = 0.0_dp
-               END IF
-            END DO
-         END DO
-      END IF
-      ! Primitive/angular row labels are invariant over the integration points.
-      ! Evaluate each tabulated radial channel once, then apply its Cartesian monomial.
-      nchannels = 0
-      ALLOCATE (mesh_channel(nrows), angular_index(nrows))
-      IF (prepared) THEN
-         IF (ALLOCATED(contracted%mesh_moments)) THEN
-            nchannels = SIZE(contracted%mesh_moments, 2)
-            irow = 0
-            DO iset = 1, basis%nset
-               DO ipgf = 1, basis%npgf(iset)
-                  DO l = 0, basis%lmax(iset)
-                     IF (.NOT. angular_used(l, iset)) CYCLE
-                     DO ico = ncoset(l - 1) + 1, ncoset(l)
-                        irow = irow + 1
-                        mesh_channel(irow) = contracted%mesh_first(ipgf, iset) + l - minimum_l(iset)
-                        angular_index(irow) = ico
-                     END DO
-                  END DO
-               END DO
-            END DO
-            CPASSERT(irow == nrows)
-         END IF
-      END IF
-      ! Preserve the order of the nonzero polynomial terms; omit only exact zeros.
-      IF (factorized) THEN
-         ALLOCATE (angular_count(MAXVAL(nso(0:lmax)), 0:lmax, basis%nset), source=0)
-         ALLOCATE (angular_term(SIZE(contracted%spherical_angular, 1), MAXVAL(nso(0:lmax)), 0:lmax, basis%nset))
-         DO iset = 1, basis%nset
-            DO l = 0, basis%lmax(iset)
-               IF (.NOT. angular_used(l, iset)) CYCLE
-               DO m = 1, nso(l)
-                  DO ico = ncoset(l - 1) + 1, ncoset(l)
-                     IF (ABS(contracted%spherical_angular(ico - ncoset(l - 1), m, l, iset)) <= 0.0_dp) CYCLE
-                     angular_count(m, l, iset) = angular_count(m, l, iset) + 1
-                     angular_term(angular_count(m, l, iset), m, l, iset) = ico
-                  END DO
-               END DO
-            END DO
-         END DO
-      END IF
-      tabulated = prepared .AND. ALLOCATED(contracted%short_moments)
-
-      CALL timestop(handle)
-
-      CALL timeset('d_lP_potential_radial', handle)
-
-      parallel_points = .TRUE.
-!$    parallel_points = .NOT. omp_in_parallel()
-      !$OMP PARALLEL DEFAULT(NONE) IF(parallel_points) &
-      !$OMP SHARED(ng, points, center, basis, cutoff, series, short_series, short, omega, &
-      !$OMP work, indco, ncoset, lmax, angular_used, minimum_l, contracted, tabulated, prepared, &
-      !$OMP nchannels, nrows, nwork, factorized, mesh_channel, angular_index, nso, angular_count, angular_term) &
-      !$OMP PRIVATE(ig, ico, relative, radius, radius2, iset, ipgf, radial, monomial, l, irow, radial_work, long_radial, &
-      !$OMP x, in_table, coordinate_power, imesh, mesh_delta, mesh_position, use_mesh, radial_mesh, &
-      !$OMP radial_channels, angular_values, isgf, m, radial_sum, spherical_value, iangular)
-      ALLOCATE (radial(0:lmax), long_radial(0:lmax), radial_work%jet(0:lmax), &
-                radial_work%gaussian(0:lmax), radial_work%derivative(0:lmax), radial_work%bracket(0:lmax))
-      ALLOCATE (monomial(ncoset(lmax)), coordinate_power(3, 0:lmax), radial_mesh(nchannels))
-      IF (factorized) ALLOCATE (radial_channels(0:lmax, MAXVAL(basis%npgf), basis%nset), &
-                                angular_values(MAXVAL(nso(0:lmax)), 0:lmax, basis%nset))
-      !$OMP DO SCHEDULE(STATIC)
-      DO ig = 1, ng
-         relative = points(:, ig) - center
-         radius2 = SUM(relative**2)
-         coordinate_power(:, 0) = 1.0_dp
-         DO l = 1, lmax
-            coordinate_power(:, l) = coordinate_power(:, l - 1)*relative
-         END DO
-         DO ico = 1, SIZE(monomial)
-            monomial(ico) = coordinate_power(1, indco(1, ico))* &
-                            coordinate_power(2, indco(2, ico))*coordinate_power(3, indco(3, ico))
-         END DO
-         use_mesh = .FALSE.
-         mesh_delta = 0.0_dp
-         imesh = 0
-         IF (prepared) THEN
-            IF (ALLOCATED(contracted%mesh_moments)) THEN
-               mesh_position = radius2/contracted%mesh_spacing - contracted%mesh_offset
-               IF (mesh_position >= -0.5_dp .AND. mesh_position <= REAL(UBOUND(contracted%mesh_moments, 3), dp) + 0.5_dp) THEN
-                  imesh = NINT(mesh_position)
-                  IF (imesh >= 0 .AND. imesh <= UBOUND(contracted%mesh_moments, 3)) THEN
-                     mesh_delta = radius2 - contracted%mesh_spacing*(REAL(imesh, dp) + contracted%mesh_offset)
-                     use_mesh = ABS(mesh_delta) <= 64.0_dp*EPSILON(1.0_dp)*MAX(1.0_dp, radius2)
-                     use_mesh = use_mesh .AND. contracted%mesh_exponent*ABS(mesh_delta) <= 1.0E-8_dp
-                  END IF
-               END IF
-            END IF
-         END IF
-         IF (use_mesh) THEN
-            IF (factorized .AND. ALLOCATED(contracted%spherical_mesh_first)) THEN
-               ! The radial shell contraction was formed once for each squared-radius node.
-            ELSE
-               radial_mesh(:) = contracted%mesh_moments(1, :, imesh) + &
-                                mesh_delta*contracted%mesh_moments(2, :, imesh)
-            END IF
-            IF (factorized .AND. .NOT. ALLOCATED(contracted%spherical_mesh_first)) THEN
-               DO iset = 1, basis%nset
-                  DO ipgf = 1, basis%npgf(iset)
-                     DO l = 0, basis%lmax(iset)
-                        IF (.NOT. angular_used(l, iset)) CYCLE
-                        radial_channels(l, ipgf, iset) = &
-                           radial_mesh(contracted%mesh_first(ipgf, iset) + l - minimum_l(iset))
-                     END DO
-                  END DO
-               END DO
-            ELSE IF (.NOT. factorized) THEN
-               DO irow = 1, nrows
-                  work(irow, ig) = monomial(angular_index(irow))*radial_mesh(mesh_channel(irow))
-               END DO
-               CYCLE
-            END IF
-         ELSE
-            radius = SQRT(radius2)
-            irow = 0
-            DO iset = 1, basis%nset
-               DO ipgf = 1, basis%npgf(iset)
-                  x = basis%zet(ipgf, iset)*radius2
-                  in_table = .FALSE.
-                  IF (tabulated) in_table = x <= contracted%short_abscissae(UBOUND(contracted%short_abscissae, 1))
-                  IF (in_table) THEN
-        CALL evaluate_short_radial_table(x, contracted%short_abscissae, contracted%short_moments(minimum_l(iset):, :, ipgf, iset), &
-                                                      radial(minimum_l(iset):basis%lmax(iset)))
-                  ELSE IF (short) THEN
-                     CALL radial_potential_short(radius, basis%zet(ipgf, iset), omega, &
-                                                 series(:, ipgf, iset), short_series(:, ipgf, iset), &
-                                                 radial(0:basis%lmax(iset)), radial_work, long_radial)
-                  ELSE
-                     CALL radial_potential(radius, basis%zet(ipgf, iset), cutoff, &
-                                           series(:, ipgf, iset), radial(0:basis%lmax(iset)), radial_work)
-                  END IF
-                  IF (factorized) THEN
-                     DO l = 0, basis%lmax(iset)
-                        IF (angular_used(l, iset)) radial_channels(l, ipgf, iset) = radial(l)
-                     END DO
-                  ELSE
-                     DO l = 0, basis%lmax(iset)
-                        IF (.NOT. angular_used(l, iset)) CYCLE
-                        DO ico = ncoset(l - 1) + 1, ncoset(l)
-                           irow = irow + 1
-                           work(irow, ig) = monomial(ico)*radial(l)
-                        END DO
-                     END DO
-                  END IF
-               END DO
-            END DO
-         END IF
-         IF (factorized) THEN
-            work(:, ig) = 0.0_dp
-            DO iset = 1, basis%nset
-               DO l = 0, basis%lmax(iset)
-                  IF (.NOT. angular_used(l, iset)) CYCLE
-                  DO m = 1, nso(l)
-                     spherical_value = 0.0_dp
-                     DO iangular = 1, angular_count(m, l, iset)
-                        ico = angular_term(iangular, m, l, iset)
-                        spherical_value = spherical_value + monomial(ico)* &
-                                          contracted%spherical_angular(ico - ncoset(l - 1), m, l, iset)
-                     END DO
-                     angular_values(m, l, iset) = spherical_value
-                  END DO
-               END DO
-               DO ishell = 1, basis%nshell(iset)
-                  l = basis%l(ishell, iset)
-                  IF (use_mesh .AND. ALLOCATED(contracted%spherical_mesh_first)) THEN
-                     irow = contracted%spherical_mesh_first(ishell, iset)
-                     radial_sum = contracted%mesh_moments(1, irow, imesh) + &
-                                  mesh_delta*contracted%mesh_moments(2, irow, imesh)
-                  ELSE
-                     radial_sum = SUM(radial_channels(l, 1:basis%npgf(iset), iset)* &
-                                      contracted%spherical_primitive(1:basis%npgf(iset), ishell, iset))
-                  END IF
-                  DO m = 1, nso(l)
-                     isgf = basis%first_sgf(ishell, iset) + m - 1
-                     work(isgf, ig) = radial_sum*angular_values(m, l, iset)
-                  END DO
-               END DO
-            END DO
-         END IF
-      END DO
-      !$OMP END DO
-      DEALLOCATE (radial, long_radial, radial_work%jet, radial_work%gaussian, &
-                  radial_work%derivative, radial_work%bracket)
-      DEALLOCATE (monomial, coordinate_power, radial_mesh)
-      IF (factorized) DEALLOCATE (radial_channels, angular_values)
-      !$OMP END PARALLEL
-
-      CALL timestop(handle)
-
-      CALL timeset('d_lP_potential_RI_transform', handle)
-
-      ! The caller supplies the full leading dimension; write only the active point rows.
-      IF (factorized) THEN
-         coefficient_matrix => contracted%spherical_selection
-      ELSE
-         coefficient_matrix => contracted%coefficients
-      END IF
-      CALL dgemm('T', 'N', ng, np, nwork, 1.0_dp, work, nwork, &
-                 coefficient_matrix, nwork, 0.0_dp, values, SIZE(values, 1))
-      IF (factorized) DEALLOCATE (angular_count, angular_term)
-      DEALLOCATE (angular_used, minimum_l, mesh_channel, angular_index)
-      IF (.NOT. prepared) DEALLOCATE (series, short_series)
-
-      CALL timestop(handle)
-
-   END SUBROUTINE contract_selected_potentials
-
-! **************************************************************************************************
-!> \brief Gaussian potential for erfc(omega*r)/r via two full-Coulomb potentials.
-!> With beta=a*omega²/(a+omega²), the long-range part equals the beta potential
-!> multiplied in angular channel l by (beta/a)^(l+3/2). The origin coefficients
-!> combine both terms before evaluation to avoid subtraction at r=0.
-!> \param radius ...
-!> \param exponent ...
-!> \param omega ...
-!> \param coefficients ...
-!> \param short_coefficients ...
-!> \param radial ...
-!> \param radial_work ...
-!> \param long_radial ...
-! **************************************************************************************************
-   SUBROUTINE radial_potential_short(radius, exponent, omega, coefficients, short_coefficients, radial, radial_work, long_radial)
-      REAL(dp), INTENT(IN)                               :: radius, exponent, omega, &
-                                                            coefficients(0:), &
-                                                            short_coefficients(0:)
-      REAL(dp), INTENT(OUT)                              :: radial(0:)
-      TYPE(radial_work_type), INTENT(INOUT)              :: radial_work
-      REAL(dp), INTENT(INOUT)                            :: long_radial(0:)
-
-      INTEGER                                            :: il
-      REAL(dp)                                           :: beta, beta_ratio, factor, lower_exp, &
-                                                            ratio_power, root_x, upper_exp, x
-
-      IF (exponent*radius**2 < 0.5_dp) THEN
-         CALL radial_potential(radius, exponent, 0.0_dp, short_coefficients, radial, radial_work)
-         RETURN
-      END IF
-      beta_ratio = omega**2/(exponent + omega**2)
-      beta = exponent*beta_ratio
-      x = exponent*radius**2
-      IF (x >= REAL(2*UBOUND(radial, 1) + 8, dp)) THEN
-         ! H_l(x,b)=integral_{sqrt(b)}^1 t^(2l) exp(-x t^2) dt; radial_l=(2 pi/a) H_l.
-         ! Its upward recurrence is stable here and avoids subtracting two Coulomb derivatives.
-         root_x = SQRT(x)
-         factor = 2.0_dp*pi/exponent
-         radial(0) = factor*SQRT(pi)/(2.0_dp*root_x)* &
-                     (ERFC(SQRT(beta_ratio)*root_x) - ERFC(root_x))
-         upper_exp = EXP(-x)
-         lower_exp = EXP(-beta_ratio*x)
-         ratio_power = SQRT(beta_ratio)
-         DO il = 1, UBOUND(radial, 1)
-            radial(il) = (REAL(2*il - 1, dp)*radial(il - 1) + &
-                          factor*(ratio_power*lower_exp - upper_exp))/(2.0_dp*x)
-            ratio_power = ratio_power*beta_ratio
-         END DO
-         RETURN
-      END IF
-      CALL radial_potential(radius, exponent, 0.0_dp, coefficients, radial, radial_work)
-      CALL radial_potential(radius, beta, 0.0_dp, coefficients, long_radial(0:UBOUND(radial, 1)), radial_work)
-      DO il = 0, UBOUND(radial, 1)
-         radial(il) = radial(il) - beta_ratio**(REAL(il, dp) + 1.5_dp)*long_radial(il)
-      END DO
-   END SUBROUTINE radial_potential_short
-
-! **************************************************************************************************
-!> \brief Expand Eq. (2) in x=a r²: F=(2 pi/a) sum_n c_n x^n near the origin.
-!> \param exponent ...
-!> \param cutoff ...
-!> \param coefficients ...
-! **************************************************************************************************
-   SUBROUTINE origin_series(exponent, cutoff, coefficients)
-      REAL(dp), INTENT(IN)                               :: exponent, cutoff
-      REAL(dp), INTENT(OUT)                              :: coefficients(0:)
-
-      INTEGER                                            :: ij, ik, in
-      REAL(dp) :: factorial, gamma_p, integral, term, weight, y, terms(0:UBOUND(coefficients, 1))
-
-      y = exponent*cutoff**2
-      weight = 1.0_dp
-      DO ik = 0, UBOUND(terms, 1)
-         gamma_p = 1.0_dp
-         IF (cutoff > 0.0_dp .AND. y < 200.0_dp) THEN
-            ! P(k+1,y) is a positive Poisson tail, avoiding subtraction near zero.
-            term = EXP(-y)
-            DO ij = 1, ik + 1
-               term = term*y/REAL(ij, dp)
-            END DO
-            integral = term
-            DO ij = ik + 2, ik + 1000
-               term = term*y/REAL(ij, dp)
-               integral = integral + term
-               IF (term < EPSILON(1.0_dp)*integral) EXIT
-            END DO
-            gamma_p = integral
-         END IF
-         terms(ik) = weight*gamma_p
-         weight = weight*2.0_dp/REAL(2*ik + 3, dp)
-      END DO
-      DO in = 0, UBOUND(coefficients, 1)
-         coefficients(in) = 0.0_dp
-         factorial = 1.0_dp
-         DO ik = in, 0, -1
-            coefficients(in) = coefficients(in) + factorial*terms(ik)
-            factorial = -factorial/REAL(in - ik + 1, dp)
-         END DO
-      END DO
-   END SUBROUTINE origin_series
-
-! **************************************************************************************************
-!> \brief Evaluate the radial derivatives in Eq. (1) by series or Taylor differentiation of (2).
-!> \param radius ...
-!> \param exponent ...
-!> \param cutoff ...
-!> \param coefficients ...
-!> \param radial ...
-!> \param radial_work ...
-! **************************************************************************************************
-   SUBROUTINE radial_potential(radius, exponent, cutoff, coefficients, radial, radial_work)
-      REAL(dp), INTENT(IN)                               :: radius, exponent, cutoff, &
-                                                            coefficients(0:)
-      REAL(dp), INTENT(OUT)                              :: radial(0:)
-      TYPE(radial_work_type), INTENT(INOUT)              :: radial_work
-
-      INTEGER                                            :: ij, il, in, lmax
-      REAL(dp)                                           :: displacement, factor, power, prefactor, &
-                                                            value, x
-
-      lmax = UBOUND(radial, 1)
-      x = exponent*radius**2
-      IF (x < 0.5_dp) THEN
-         DO il = 0, lmax
-            value = 0.0_dp
-            power = 1.0_dp
-            DO in = il, UBOUND(coefficients, 1)
-               factor = 1.0_dp
-               DO ij = in - il + 1, in
-                  factor = factor*REAL(ij, dp)
-               END DO
-               value = value + coefficients(in)*factor*power
-               power = power*x
-            END DO
-            radial(il) = 2.0_dp*pi/exponent*(-1.0_dp)**il*value
-         END DO
-         RETURN
-      END IF
-      radial_work%bracket(0:lmax) = 0.0_dp
-      DO ij = 1, 3
-         displacement = radius
-         factor = 2.0_dp
-         IF (ij > 1) THEN
-            IF (cutoff <= 0.0_dp) EXIT
-            displacement = radius + REAL(2*ij - 5, dp)*cutoff
-            factor = -1.0_dp
-         END IF
-         radial_work%gaussian(0) = EXP(-exponent*displacement**2)
-         IF (lmax > 0) radial_work%gaussian(1) = -2.0_dp*exponent*displacement*radial_work%gaussian(0)
-         DO in = 2, lmax
-            radial_work%gaussian(in) = -2.0_dp*exponent* &
-                                       (displacement*radial_work%gaussian(in - 1) + radial_work%gaussian(in - 2))/REAL(in, dp)
-         END DO
-         DO in = 1, lmax
-            radial_work%bracket(in) = radial_work%bracket(in) + &
-                                      factor*2.0_dp*SQRT(exponent/pi)*radial_work%gaussian(in - 1)/REAL(in, dp)
-         END DO
-      END DO
-      IF (cutoff <= 0.0_dp) THEN
-         radial_work%bracket(0) = 2.0_dp*ERF(SQRT(exponent)*radius)
-      ELSE IF (radius > cutoff) THEN
-         radial_work%bracket(0) = ERFC(SQRT(exponent)*(radius - cutoff)) + &
-                                  ERFC(SQRT(exponent)*(radius + cutoff)) - 2.0_dp*ERFC(SQRT(exponent)*radius)
-      ELSE
-         radial_work%bracket(0) = 2.0_dp*ERF(SQRT(exponent)*radius) - &
-                                  ERF(SQRT(exponent)*(radius - cutoff)) - ERF(SQRT(exponent)*(radius + cutoff))
-      END IF
-      prefactor = pi**1.5_dp/(2.0_dp*exponent**1.5_dp)
-      radial_work%jet(0) = radial_work%bracket(0)/radius
-      DO in = 1, lmax
-         radial_work%jet(in) = (radial_work%bracket(in) - radial_work%jet(in - 1))/radius
-      END DO
-      radial(0) = prefactor*radial_work%jet(0)
-      DO il = 1, lmax
-         radial_work%derivative(0:lmax) = 0.0_dp
-         radial_work%derivative(0) = radial_work%jet(1)/(2.0_dp*radius)
-         DO in = 1, lmax - il
-            radial_work%derivative(in) = (REAL(in + 1, dp)*radial_work%jet(in + 1)/2.0_dp - radial_work%derivative(in - 1))/radius
-         END DO
-         radial_work%jet(0:lmax) = radial_work%derivative(0:lmax)
-         radial(il) = prefactor*(-1.0_dp/exponent)**il*radial_work%jet(0)
-      END DO
-   END SUBROUTINE radial_potential
-
-! **************************************************************************************************
-!> \brief Place radial nodes at x=0.02*i up to x=2, then at x=2*1.01**(i-100).
-!> The final node retains the original table extent. For a nearest-node displacement δ,
-!> the sixth-order Taylor remainder of H_j is bounded by
-!> |δ|**7/7! * integral_0^1 t**(2*j+14)*exp(-(x-|δ|)*t**2) dt.
-!> On the geometric part |δ| <= 0.005*x, so this bound is below 1.1e-17 for j>=0.
-!> This is an absolute bound before the Gaussian prefactor 2*pi/a; roundoff is separate.
-!> \param xmax ...
-!> \param abscissae ...
-! **************************************************************************************************
-   SUBROUTINE prepare_short_radial_grid(xmax, abscissae)
-      REAL(dp), INTENT(IN)                               :: xmax
-      REAL(dp), ALLOCATABLE, INTENT(OUT)                 :: abscissae(:)
-
-      INTEGER                                            :: ix, last
-
-      CPASSERT(xmax > 0.0_dp)
-      IF (xmax <= 2.0_dp) THEN
-         last = CEILING(xmax/0.02_dp)
-      ELSE
-         last = 100 + CEILING(LOG(xmax/2.0_dp)/LOG(1.01_dp))
-      END IF
-      ALLOCATE (abscissae(0:last))
-      DO ix = 0, last - 1
-         IF (ix <= 100) THEN
-            abscissae(ix) = 0.02_dp*REAL(ix, dp)
-         ELSE
-            abscissae(ix) = 2.0_dp*EXP(REAL(ix - 100, dp)*LOG(1.01_dp))
-         END IF
-      END DO
-      abscissae(last) = xmax
-   END SUBROUTINE prepare_short_radial_grid
-
-! **************************************************************************************************
-!> \brief Tabulate H_j(x,b)=integral_sqrt(b)^1 t^(2j)*exp(-x*t²)dt for erfc potentials.
-!> A 64-point positive quadrature supplies near-field moments; a stable upward recurrence
-!> supplies far-field moments for b<0.9. Narrow intervals retain quadrature to avoid cancellation.
-!> Uniform mesh tables select spacing and offset; nonuniform lookup tables supply their abscissae.
-!> The caller bounds storage, including one primitive preparation buffer.
-!> \param a ...
-!> \param omega ...
-!> \param lmax ...
-!> \param table ...
-!> \param ninterval ...
-!> \param point_spacing ...
-!> \param point_offset ...
-!> \param last_moment ...
-!> \param abscissae ...
-! **************************************************************************************************
-   SUBROUTINE prepare_short_radial_table(a, omega, lmax, table, ninterval, point_spacing, point_offset, &
-                                         last_moment, abscissae)
-      REAL(dp), INTENT(IN)                               :: a, omega
-      INTEGER, INTENT(IN)                                :: lmax
-      REAL(dp), ALLOCATABLE, INTENT(OUT)                 :: table(:, :)
-      INTEGER, INTENT(IN), OPTIONAL                      :: ninterval
-      REAL(dp), INTENT(IN), OPTIONAL                     :: point_spacing, point_offset
-      INTEGER, INTENT(IN), OPTIONAL                      :: last_moment
-      REAL(dp), INTENT(IN), OPTIONAL                     :: abscissae(0:)
-
-      INTEGER                                            :: ig, ij, il, iter, ix, last, order, &
-                                                            quadrature_last
-      REAL(dp)                                           :: b, derivative, dz, factor, lower, &
-                                                            lower_exp, offset, p0, p1, p2, &
-                                                            ratio_power, root_x, spacing, t, t2, &
-                                                            term, upper_exp, w, width, x, z
-
-      CPASSERT(a > 0.0_dp .AND. omega > 0.0_dp .AND. lmax >= 0)
-      last = 25600
-      IF (PRESENT(ninterval)) last = ninterval
-      CPASSERT(last > 0)
-      spacing = 0.02_dp
-      offset = 0.0_dp
-      order = lmax + 6
-      IF (PRESENT(point_spacing)) spacing = point_spacing
-      IF (PRESENT(point_offset)) offset = point_offset
-      IF (PRESENT(last_moment)) order = last_moment
-      CPASSERT(spacing > 0.0_dp .AND. offset >= 0.0_dp .AND. order >= 0)
-      IF (PRESENT(abscissae)) THEN
-         CPASSERT(SIZE(abscissae) == last + 1)
-         CPASSERT(abscissae(0) >= 0.0_dp)
-         CPASSERT(ALL(abscissae(1:) > abscissae(:last - 1)))
-      END IF
-      ALLOCATE (table(0:order, 0:last), source=0.0_dp)
-      b = omega**2/(a + omega**2)
-      lower = SQRT(b)
-      width = (a/(a + omega**2))/(1.0_dp + lower)
-      quadrature_last = last
-      IF (b < 0.9_dp) THEN
-         IF (PRESENT(abscissae)) THEN
-            quadrature_last = COUNT(abscissae <= REAL(2*order + 8, dp)) - 1
-         ELSE
-            quadrature_last = INT(MIN(REAL(last, dp), MAX(0.0_dp, REAL(2*order + 8, dp)/spacing - offset)))
-         END IF
-      END IF
-      DO ig = 1, 64
-         z = COS(pi*(REAL(ig, dp) - 0.25_dp)/64.5_dp)
-         DO iter = 1, 30
-            p0 = 1.0_dp
-            p1 = z
-            DO ij = 2, 64
-               p2 = (REAL(2*ij - 1, dp)*z*p1 - REAL(ij - 1, dp)*p0)/REAL(ij, dp)
-               p0 = p1
-               p1 = p2
-            END DO
-            derivative = 64.0_dp*(z*p1 - p0)/(z*z - 1.0_dp)
-            dz = p1/derivative
-            z = z - dz
-            IF (ABS(dz) < 2.0E-16_dp) EXIT
-         END DO
-         IF (iter > 30) CPABORT('DLP radial quadrature failed')
-         w = 2.0_dp/((1.0_dp - z*z)*derivative**2)
-         t = lower + 0.5_dp*width*(1.0_dp + z)
-         t2 = t*t
-         DO ix = 0, quadrature_last
-            x = spacing*(REAL(ix, dp) + offset)
-            IF (PRESENT(abscissae)) x = abscissae(ix)
-            term = 0.5_dp*width*w*EXP(-x*t2)*2.0_dp*pi/a
-            DO il = 0, UBOUND(table, 1)
-               table(il, ix) = table(il, ix) + term
-               term = term*t2
-            END DO
-         END DO
-      END DO
-      factor = 2.0_dp*pi/a
-      DO ix = quadrature_last + 1, last
-         x = spacing*(REAL(ix, dp) + offset)
-         IF (PRESENT(abscissae)) x = abscissae(ix)
-         root_x = SQRT(x)
-         table(0, ix) = factor*SQRT(pi)/(2.0_dp*root_x)*(ERFC(lower*root_x) - ERFC(root_x))
-         lower_exp = EXP(-b*x)
-         upper_exp = EXP(-x)
-         ratio_power = lower
-         DO il = 1, UBOUND(table, 1)
-            table(il, ix) = (REAL(2*il - 1, dp)*table(il - 1, ix) + &
-                             factor*(ratio_power*lower_exp - upper_exp))/(2.0_dp*x)
-            ratio_power = ratio_power*b
-         END DO
-      END DO
-   END SUBROUTINE prepare_short_radial_table
-
-! **************************************************************************************************
-!> \brief Evaluate H_l at the nearest table point with its first six derivatives.
-!> Since d^k H_l/dx^k=(-1)^k H_(l+k), the stored higher moments provide the derivatives.
-!> The nonuniform-node error bound is given in prepare_short_radial_grid.
-!> \param x ...
-!> \param abscissae ...
-!> \param table ...
-!> \param radial ...
-! **************************************************************************************************
-   SUBROUTINE evaluate_short_radial_table(x, abscissae, table, radial)
-      REAL(dp), INTENT(IN)                               :: x, abscissae(0:), table(0:, 0:)
-      REAL(dp), INTENT(OUT)                              :: radial(0:)
-
-      INTEGER::ix, il, ik, ileft, iright, imiddle
-      REAL(dp)::delta, value
-      REAL(dp), PARAMETER :: inverse(6) = [1.0_dp, 0.5_dp, 1.0_dp/3.0_dp, 0.25_dp, 0.2_dp, 1.0_dp/6.0_dp]
-      ileft = 0
-      iright = UBOUND(abscissae, 1)
-      DO WHILE (iright - ileft > 1)
-         imiddle = (ileft + iright)/2
-         IF (x < abscissae(imiddle)) THEN
-            iright = imiddle
-         ELSE
-            ileft = imiddle
-         END IF
-      END DO
-      ix = ileft
-      IF (abscissae(iright) - x < x - abscissae(ileft)) ix = iright
-      delta = abscissae(ix) - x
-      DO il = 0, UBOUND(radial, 1)
-         value = table(il + 6, ix)
-         DO ik = 5, 0, -1
-            value = table(il + ik, ix) + delta*value*inverse(ik + 1)
-         END DO
-         radial(il) = value
-      END DO
-   END SUBROUTINE evaluate_short_radial_table
-
-! **************************************************************************************************
-!> \brief Tabulate H_l(r²) only when squared mesh distances share a one-dimensional lattice.
-!> With M=SᵀS and d=r_origin-r_atom, r²=nᵀMn+2nᵀSᵀd+d². Integer coefficients
-!> in units q imply r²=q(i+offset). Whole-cell translations preserve this mesh.
-!> H_l(s+δ)=H_l(s)-a δ H_(l+1)(s)+O((a δ)²); each lookup checks the residual.
-!> Tables cover up to 40 bohr within the storage budget; other points use the generic lookup.
-!> Account for all stored channels, their index map and the largest temporary moment table.
-!> \param basis ...
-!> \param contracted ...
-!> \param step ...
-!> \param displacement ...
-!> \param table_bytes ...
-! **************************************************************************************************
-   SUBROUTINE prepare_mesh_radial_moments(basis, contracted, step, displacement, table_bytes)
-      TYPE(gto_basis_set_type), POINTER                  :: basis
-      TYPE(radial_interpolation_type), INTENT(INOUT)     :: contracted
-      REAL(dp), INTENT(IN)                               :: step(3, 3), displacement(3)
-      REAL(dp), INTENT(INOUT)                            :: table_bytes
-
-      INTEGER :: idir, ifirst, il, ipgf, iset, ishell, jdir, last, max_l, max_primitive, &
-         minimum_l, nchannels, nshell_total, nstored, shell_index
-      LOGICAL                                            :: direct_shells
-      REAL(dp)                                           :: bytes_per_node, index_bytes, linear(3), &
-                                                            metric(3, 3), offset, ratio, &
-                                                            required_bytes, spacing
-      REAL(dp), ALLOCATABLE                              :: moments(:, :)
-
-      IF (basis%nset < 1) RETURN
-      IF (ANY(basis%nshell(1:basis%nset) < 1)) RETURN
-      IF (ANY(basis%npgf(1:basis%nset) < 1)) RETURN
-      IF (contracted%attenuation <= 0.0_dp .OR. table_bytes <= 0.0_dp) RETURN
-      metric = MATMUL(TRANSPOSE(step), step)
-      spacing = MIN(metric(1, 1), metric(2, 2), metric(3, 3))
-      IF (spacing <= TINY(1.0_dp)) RETURN
-      DO idir = 1, 3
-         DO jdir = idir, 3
-            ratio = metric(idir, jdir)/spacing
-            IF (idir /= jdir) ratio = 2.0_dp*ratio
-            IF (ABS(ratio - ANINT(ratio)) > 1.0E-10_dp) RETURN
-         END DO
-      END DO
-      linear = 2.0_dp*MATMUL(TRANSPOSE(step), displacement)/spacing
-      IF (ANY(ABS(linear - ANINT(linear)) > 1.0E-10_dp)) RETURN
-      offset = MODULO(SUM(displacement**2)/spacing, 1.0_dp)
-      IF (1600.0_dp/spacing > REAL(HUGE(last) - 1, dp)) RETURN
-      last = CEILING(1600.0_dp/spacing)
-      IF (last < 1) RETURN
-      nchannels = 0
-      DO iset = 1, basis%nset
-         minimum_l = MINVAL(basis%l(1:basis%nshell(iset), iset))
-         nchannels = nchannels + basis%npgf(iset)*(basis%lmax(iset) - minimum_l + 1)
-      END DO
-      nshell_total = SUM(basis%nshell(1:basis%nset))
-      max_l = MAXVAL(basis%lmax(1:basis%nset))
-      max_primitive = MAXVAL(basis%npgf(1:basis%nset))
-      direct_shells = contracted%spherical_factorized .AND. nshell_total <= nchannels
-      nstored = nchannels
-      IF (direct_shells) nstored = nshell_total
-      bytes_per_node = 8.0_dp*(2.0_dp*REAL(nstored, dp) + REAL(max_l + 2, dp))
-      index_bytes = REAL(STORAGE_SIZE(0)/8, dp)*REAL(max_primitive, dp)*REAL(basis%nset, dp)
-      IF (direct_shells) THEN
-         index_bytes = index_bytes + &
-                       REAL(STORAGE_SIZE(0)/8, dp)*REAL(MAXVAL(basis%nshell)*basis%nset, dp)
-      END IF
-      ! A smaller table still accelerates nearby points; its upper bound selects the generic fallback.
-      last = MIN(last, INT(MIN(REAL(HUGE(last), dp), &
-                               MAX(0.0_dp, (table_bytes - index_bytes)/bytes_per_node))) - 1)
-      IF (last < 1) RETURN
-      required_bytes = bytes_per_node*REAL(last + 1, dp) + index_bytes
-      IF (required_bytes > table_bytes) RETURN
-      ALLOCATE (contracted%mesh_moments(2, nstored, 0:last))
-      ALLOCATE (contracted%mesh_first(max_primitive, basis%nset), source=0)
-      contracted%mesh_spacing = spacing
-      contracted%mesh_offset = offset
-      IF (direct_shells) THEN
-         ALLOCATE (contracted%spherical_mesh_first(MAXVAL(basis%nshell), basis%nset), source=0)
-         shell_index = 0
-         DO iset = 1, basis%nset
-            DO ishell = 1, basis%nshell(iset)
-               shell_index = shell_index + 1
-               contracted%spherical_mesh_first(ishell, iset) = shell_index
-            END DO
-         END DO
-         contracted%mesh_moments = 0.0_dp
-      END IF
-      ifirst = 1
-      DO iset = 1, basis%nset
-         minimum_l = MINVAL(basis%l(1:basis%nshell(iset), iset))
-         DO ipgf = 1, basis%npgf(iset)
-            contracted%mesh_exponent = MAX(contracted%mesh_exponent, basis%zet(ipgf, iset))
-            contracted%mesh_first(ipgf, iset) = ifirst
-            CALL prepare_short_radial_table(basis%zet(ipgf, iset), contracted%attenuation, &
-                                            basis%lmax(iset), moments, last, &
-                                            basis%zet(ipgf, iset)*spacing, offset, basis%lmax(iset) + 1)
-            IF (direct_shells) THEN
-               ! Accumulate primitive contributions in their original order for each shell.
-               ! The larger primitive-channel table is never materialized.
-               DO ishell = 1, basis%nshell(iset)
-                  il = basis%l(ishell, iset)
-                  shell_index = contracted%spherical_mesh_first(ishell, iset)
-                  contracted%mesh_moments(1, shell_index, :) = &
-                     contracted%mesh_moments(1, shell_index, :) + &
-                     contracted%spherical_primitive(ipgf, ishell, iset)*moments(il, :)
-                  contracted%mesh_moments(2, shell_index, :) = &
-                     contracted%mesh_moments(2, shell_index, :) + &
-                     contracted%spherical_primitive(ipgf, ishell, iset)*(-basis%zet(ipgf, iset)*moments(il + 1, :))
-               END DO
-               ifirst = ifirst + basis%lmax(iset) - minimum_l + 1
-            ELSE
-               DO il = minimum_l, basis%lmax(iset)
-                  contracted%mesh_moments(1, ifirst, :) = moments(il, :)
-                  contracted%mesh_moments(2, ifirst, :) = -basis%zet(ipgf, iset)*moments(il + 1, :)
-                  ifirst = ifirst + 1
-               END DO
-            END IF
-            DEALLOCATE (moments)
-         END DO
-      END DO
-      table_bytes = table_bytes - required_bytes
-   END SUBROUTINE prepare_mesh_radial_moments
-
-! **************************************************************************************************
 !> \brief Keep balanced q groups contiguous in physical-node rank order.
 !> Every MPI rank participates. Group sizes differ by at most one; at most
 !> n_node-1 groups cross node boundaries, independent of the launch rank order.
@@ -11761,31 +7664,31 @@ CONTAINS
 !> \param world ...
 !> \param n ...
 !> \param source_rank ...
-!> \param target_rank ...
+!> \param destination_rank ...
 !> \param source ...
-!> \param TARGET ...
+!> \param destination ...
 !> Transfer a matrix between world owners without a full-size communication buffer.
 ! **************************************************************************************************
-   SUBROUTINE grouped_w_copy_matrix(world, n, source_rank, target_rank, source, TARGET)
+   SUBROUTINE grouped_w_copy_matrix(world, n, source_rank, destination_rank, source, destination)
       TYPE(mp_para_env_type), INTENT(INOUT)              :: world
-      INTEGER, INTENT(IN)                                :: n, source_rank, target_rank
+      INTEGER, INTENT(IN)                                :: n, source_rank, destination_rank
       COMPLEX(KIND=dp), INTENT(IN)                       :: source(:, :)
-      COMPLEX(KIND=dp), INTENT(INOUT)                    :: target(:, :)
+      COMPLEX(KIND=dp), INTENT(INOUT)                    :: destination(:, :)
 
       INTEGER                                            :: first, last, sender, tag
 
-      IF (source_rank == target_rank) THEN
-         IF (world%mepos == source_rank) TARGET = source
+      IF (source_rank == destination_rank) THEN
+         IF (world%mepos == source_rank) destination = source
          RETURN
       END IF
-      DO first = 1, n, tile_cols
-         last = MIN(first + tile_cols - 1, n)
+      DO first = 1, n, column_block_cols
+         last = MIN(first + column_block_cols - 1, n)
          IF (world%mepos == source_rank) THEN
-            CALL world%send(source(:, first:last), target_rank, 0)
-         ELSE IF (world%mepos == target_rank) THEN
+            CALL world%send(source(:, first:last), destination_rank, 0)
+         ELSE IF (world%mepos == destination_rank) THEN
             sender = source_rank
             tag = 0
-            CALL world%recv(TARGET(:, first:last), sender, tag)
+            CALL world%recv(destination(:, first:last), sender, tag)
          END IF
       END DO
    END SUBROUTINE grouped_w_copy_matrix

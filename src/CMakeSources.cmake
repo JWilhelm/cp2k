@@ -246,6 +246,8 @@ list(
   ri_rs_setup.F
   ri_rs_types.F
   ri_rs_utils.F
+  ri_rs_kp_fitting.F
+  ri_rs_kp_integrals.F
   ri_rs_fitting.F
   ri_rs_matrices.F
   post_scf_bandstructure_types.F
