@@ -337,7 +337,10 @@ CONTAINS
          CALL get_atomic_kind_set(atomic_kind_set, kind_of=kind_of, atom_of_kind=atom_of_kind)
 
          ! Supporting stuff for GPW
-         CALL prepare_gpw(qs_env, dft_control, e_cutoff_old, cutoff_old, relative_cutoff_old, para_env_sub, pw_env_sub, &
+         CALL get_qs_env(qs_env, dft_control=dft_control)
+         CALL prepare_gpw(qs_env, &
+                          [qs_env%mp2_env%mp2_gpw%cutoff, qs_env%mp2_env%mp2_gpw%relative_cutoff]*0.5_dp, &
+                          e_cutoff_old, cutoff_old, relative_cutoff_old, para_env_sub, pw_env_sub, &
                           auxbas_pw_pool, poisson_env, task_list_sub, rho_r, rho_g, pot_g, psi_L, sab_orb_sub)
 
          ! in case virial is required we need auxiliary pw

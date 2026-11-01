@@ -226,6 +226,8 @@ list(
   grrm_utils.F
   gapw_1c_basis_set.F
   gw_ri_rs_chi_sigma_kernels.F
+  gw_ri_rs_small_cell_full_kp.F
+  gw_ri_rs_small_cell_full_kp_utils.F
   gw_auto_ri_generate_RI_basis.F
   gw_auto_ri_types.F
   gw_compute_V_and_W.F

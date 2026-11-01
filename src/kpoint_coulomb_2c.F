@@ -19,7 +19,8 @@ MODULE kpoint_coulomb_2c
    USE cell_types,                      ONLY: cell_type,&
                                               get_cell,&
                                               pbc
-   USE constants_operator,              ONLY: operator_coulomb
+   USE constants_operator,              ONLY: operator_coulomb,&
+                                              operator_verfc
    USE cp_dbcsr_api,                    ONLY: &
         dbcsr_create, dbcsr_init_p, dbcsr_iterator_blocks_left, dbcsr_iterator_next_block, &
         dbcsr_iterator_start, dbcsr_iterator_stop, dbcsr_iterator_type, dbcsr_p_type, &
@@ -30,10 +31,15 @@ MODULE kpoint_coulomb_2c
    USE kinds,                           ONLY: dp
    USE kpoint_types,                    ONLY: get_kpoint_info,&
                                               kpoint_type
-   USE mathconstants,                   ONLY: gaussi,&
+   USE mathconstants,                   ONLY: fourpi,&
+                                              gaussi,&
+                                              pi,&
                                               twopi,&
-                                              z_one
+                                              z_one,&
+                                              z_zero
    USE message_passing,                 ONLY: mp_para_env_type
+   USE orbital_pointers,                ONLY: indco,&
+                                              ncoset
    USE particle_types,                  ONLY: particle_type
    USE qs_environment_types,            ONLY: get_qs_env,&
                                               qs_environment_type
@@ -692,15 +698,17 @@ CONTAINS
 !> \param basis_type ...
 !> \param ikp_start ...
 !> \param ikp_end ...
+!> \param use_ewald ...
 ! **************************************************************************************************
    SUBROUTINE build_2c_coulomb_matrix_kp_small_cell(V_k, qs_env, kpoints, size_lattice_sum, &
-                                                    basis_type, ikp_start, ikp_end)
+                                                    basis_type, ikp_start, ikp_end, use_ewald)
       COMPLEX(KIND=dp), DIMENSION(:, :, :)               :: V_k
       TYPE(qs_environment_type), POINTER                 :: qs_env
       TYPE(kpoint_type), POINTER                         :: kpoints
       INTEGER                                            :: size_lattice_sum
       CHARACTER(LEN=*), INTENT(IN)                       :: basis_type
       INTEGER                                            :: ikp_start, ikp_end
+      LOGICAL, INTENT(IN), OPTIONAL                      :: use_ewald
 
       CHARACTER(LEN=*), PARAMETER :: routineN = 'build_2c_coulomb_matrix_kp_small_cell'
 
@@ -709,7 +717,8 @@ CONTAINS
          y_min, z_max, z_min
       INTEGER, ALLOCATABLE, DIMENSION(:)                 :: bf_end_from_atom, bf_start_from_atom
       INTEGER, DIMENSION(3)                              :: nkp_grid
-      REAL(KIND=dp)                                      :: coskl, sinkl
+      LOGICAL                                            :: do_ewald
+      REAL(KIND=dp)                                      :: coskl, ewald_omega, sinkl
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :)        :: V_L
       REAL(KIND=dp), DIMENSION(3)                        :: vec_L, vec_s
       REAL(KIND=dp), DIMENSION(3, 3)                     :: hmat
@@ -732,6 +741,14 @@ CONTAINS
                                       x_min, x_max, y_min, y_max, z_min, z_max, nkp_grid)
 
       CALL get_basis_sizes(qs_env, n_atom, basis_type, bf_start_from_atom, bf_end_from_atom, n_bf)
+
+      do_ewald = .FALSE.
+      IF (PRESENT(use_ewald)) do_ewald = use_ewald
+      ewald_omega = 0.0_dp
+      IF (do_ewald) THEN
+         CALL ewald_real_space_bounds(cell, qs_kind_set, basis_type, ewald_omega, &
+                                      x_min, x_max, y_min, y_max, z_min, z_max)
+      END IF
 
       ALLOCATE (V_L(n_bf, n_bf))
 
@@ -764,7 +781,7 @@ CONTAINS
 
                         ! Compute (P 0 | Q vec_L) and add it to V_R
                         CALL add_V_L(V_L, vec_L, n_atom, bf_start_from_atom, bf_end_from_atom, &
-                                     particle_set, qs_kind_set, atomic_kind_set, basis_type, cell)
+                                     particle_set, qs_kind_set, atomic_kind_set, basis_type, cell, ewald_omega)
 
                      END DO
                   END DO
@@ -801,6 +818,10 @@ CONTAINS
          END DO
       END DO
 
+      IF (do_ewald) THEN
+         CALL add_ewald_reciprocal(V_k, qs_env, kpoints, basis_type, ewald_omega, &
+                                   bf_start_from_atom, bf_end_from_atom, ikp_start, ikp_end)
+      END IF
       CALL timestop(handle)
 
    END SUBROUTINE build_2c_coulomb_matrix_kp_small_cell
@@ -873,11 +894,12 @@ CONTAINS
 !> \param atomic_kind_set ...
 !> \param basis_type ...
 !> \param cell ...
+!> \param ewald_omega ...
 ! **************************************************************************************************
    SUBROUTINE add_V_L(V_L, vec_L, n_atom, bf_start_from_atom, bf_end_from_atom, &
-                      particle_set, qs_kind_set, atomic_kind_set, basis_type, cell)
+                      particle_set, qs_kind_set, atomic_kind_set, basis_type, cell, ewald_omega)
 
-      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :)        :: V_L
+      REAL(KIND=dp), DIMENSION(:, :)                     :: V_L
       REAL(KIND=dp), DIMENSION(3)                        :: vec_L
       INTEGER                                            :: n_atom
       INTEGER, ALLOCATABLE, DIMENSION(:)                 :: bf_start_from_atom, bf_end_from_atom
@@ -886,6 +908,7 @@ CONTAINS
       TYPE(atomic_kind_type), DIMENSION(:), POINTER      :: atomic_kind_set
       CHARACTER(LEN=*), INTENT(IN)                       :: basis_type
       TYPE(cell_type), POINTER                           :: cell
+      REAL(KIND=dp), INTENT(IN), OPTIONAL                :: ewald_omega
 
       CHARACTER(LEN=*), PARAMETER                        :: routineN = 'add_V_L'
 
@@ -930,10 +953,24 @@ CONTAINS
 
             ALLOCATE (V_L_ab(a_2 - a_1 + 1, b_2 - b_1 + 1))
 
-            CALL int_operators_r12_ab_shg(operator_coulomb, V_L_ab, rab=rab_L, &
-                                          fba=basis_set_a, fbb=basis_set_b, &
-                                          scona_shg=contr_a, sconb_shg=contr_b, &
-                                          calculate_forces=.FALSE.)
+            IF (PRESENT(ewald_omega)) THEN
+               IF (ewald_omega > 0.0_dp) THEN
+                  CALL int_operators_r12_ab_shg(operator_verfc, V_L_ab, rab=rab_L, &
+                                                fba=basis_set_a, fbb=basis_set_b, &
+                                                scona_shg=contr_a, sconb_shg=contr_b, &
+                                                omega=ewald_omega, calculate_forces=.FALSE.)
+               ELSE
+                  CALL int_operators_r12_ab_shg(operator_coulomb, V_L_ab, rab=rab_L, &
+                                                fba=basis_set_a, fbb=basis_set_b, &
+                                                scona_shg=contr_a, sconb_shg=contr_b, &
+                                                calculate_forces=.FALSE.)
+               END IF
+            ELSE
+               CALL int_operators_r12_ab_shg(operator_coulomb, V_L_ab, rab=rab_L, &
+                                             fba=basis_set_a, fbb=basis_set_b, &
+                                             scona_shg=contr_a, sconb_shg=contr_b, &
+                                             calculate_forces=.FALSE.)
+            END IF
 
             V_L(a_1:a_2, b_1:b_2) = V_L(a_1:a_2, b_1:b_2) + V_L_ab(:, :)
 
@@ -948,5 +985,192 @@ CONTAINS
       CALL timestop(handle)
 
    END SUBROUTINE add_V_L
+
+! **************************************************************************************************
+!> \brief ...
+!> \param cell ...
+!> \param qs_kinds ...
+!> \param basis_type ...
+!> \param omega ...
+!> \param x_min ...
+!> \param x_max ...
+!> \param y_min ...
+!> \param y_max ...
+!> \param z_min ...
+!> \param z_max ...
+! **************************************************************************************************
+   SUBROUTINE ewald_real_space_bounds(cell, qs_kinds, basis_type, omega, &
+                                      x_min, x_max, y_min, y_max, z_min, z_max)
+      TYPE(cell_type), POINTER                           :: cell
+      TYPE(qs_kind_type), POINTER                        :: qs_kinds(:)
+      CHARACTER(LEN=*), INTENT(IN)                       :: basis_type
+      REAL(KIND=dp), INTENT(OUT)                         :: omega
+      INTEGER, INTENT(OUT)                               :: x_min, x_max, y_min, y_max, z_min, z_max
+
+      INTEGER                                            :: bounds(3), idim, ikind, iset, lmax
+      REAL(KIND=dp)                                      :: alpha_min, beta, radius
+      TYPE(gto_basis_set_type), POINTER                  :: basis
+
+      alpha_min = HUGE(0.0_dp)
+      lmax = 0
+      DO ikind = 1, SIZE(qs_kinds)
+         CALL get_qs_kind(qs_kinds(ikind), basis_set=basis, basis_type=basis_type)
+         DO iset = 1, basis%nset
+            alpha_min = MIN(alpha_min, MINVAL(basis%zet(1:basis%npgf(iset), iset)))
+         END DO
+         lmax = MAX(lmax, MAXVAL(basis%lmax))
+      END DO
+      CPASSERT(alpha_min > 0.0_dp)
+      omega = 0.3_dp
+      beta = 1.0_dp/(2.0_dp/alpha_min + 1.0_dp/omega**2)
+      radius = SQRT((50.0_dp + 4.0_dp*lmax)/beta)
+      DO idim = 1, 3
+         bounds(idim) = CEILING(radius*SQRT(SUM(cell%h_inv(idim, :)**2))) + 1
+      END DO
+      x_min = -bounds(1)
+      x_max = bounds(1)
+      y_min = -bounds(2)
+      y_max = bounds(2)
+      z_min = -bounds(3)
+      z_max = bounds(3)
+   END SUBROUTINE ewald_real_space_bounds
+
+! **************************************************************************************************
+!> \brief ...
+!> \param V_k ...
+!> \param qs_env ...
+!> \param kpoints ...
+!> \param basis_type ...
+!> \param omega ...
+!> \param bf_start ...
+!> \param bf_end ...
+!> \param ikp_start ...
+!> \param ikp_end ...
+! **************************************************************************************************
+   SUBROUTINE add_ewald_reciprocal(V_k, qs_env, kpoints, basis_type, omega, &
+                                   bf_start, bf_end, ikp_start, ikp_end)
+      COMPLEX(KIND=dp), INTENT(INOUT)                    :: V_k(:, :, :)
+      TYPE(qs_environment_type), POINTER                 :: qs_env
+      TYPE(kpoint_type), POINTER                         :: kpoints
+      CHARACTER(LEN=*), INTENT(IN)                       :: basis_type
+      REAL(KIND=dp), INTENT(IN)                          :: omega
+      INTEGER, INTENT(IN)                                :: bf_start(:), bf_end(:), ikp_start, &
+                                                            ikp_end
+
+      COMPLEX(KIND=dp), ALLOCATABLE                      :: fourier_basis(:)
+      INTEGER                                            :: bounds(3), idim, ikind, ikp, ikp_local, &
+                                                            ix, iy, iz, lmax, n_bf
+      REAL(KIND=dp)                                      :: cutoff, p(3), p2, prefactor, q(3), &
+                                                            reciprocal(3, 3)
+      TYPE(cell_type), POINTER                           :: cell
+      TYPE(gto_basis_set_type), POINTER                  :: basis
+      TYPE(mp_para_env_type), POINTER                    :: para_env
+      TYPE(particle_type), POINTER                       :: particles(:)
+      TYPE(qs_kind_type), POINTER                        :: qs_kinds(:)
+
+      CALL get_qs_env(qs_env, cell=cell, para_env=para_env, particle_set=particles, qs_kind_set=qs_kinds)
+      n_bf = SIZE(V_k, 1)
+      ALLOCATE (fourier_basis(n_bf))
+      reciprocal = twopi*TRANSPOSE(cell%h_inv)
+      lmax = 0
+      DO ikind = 1, SIZE(qs_kinds)
+         CALL get_qs_kind(qs_kinds(ikind), basis_set=basis, basis_type=basis_type)
+         lmax = MAX(lmax, MAXVAL(basis%lmax))
+      END DO
+      cutoff = 2.0_dp*omega*SQRT(50.0_dp + 4.0_dp*lmax)
+      DO ikp = ikp_start, ikp_end
+         IF (MODULO(ikp, para_env%num_pe) /= para_env%mepos) CYCLE
+         ikp_local = (ikp - para_env%mepos)/para_env%num_pe + 1
+         IF (para_env%mepos == 0) ikp_local = ikp/para_env%num_pe
+         q = kpoints%xkp(:, ikp)
+         DO idim = 1, 3
+            bounds(idim) = CEILING(cutoff*SQRT(SUM(cell%hmat(:, idim)**2))/twopi + ABS(q(idim)))
+         END DO
+         DO ix = -bounds(1), bounds(1)
+            DO iy = -bounds(2), bounds(2)
+               DO iz = -bounds(3), bounds(3)
+                  p = MATMUL(reciprocal, q + REAL([ix, iy, iz], dp))
+                  p2 = SUM(p*p)
+                  IF (p2 > cutoff**2) CYCLE
+                  CALL gaussian_basis_fourier(p, particles, qs_kinds, cell, basis_type, &
+                                              bf_start, bf_end, fourier_basis)
+                  IF (p2 < 1.0E-24_dp) THEN
+                     prefactor = -pi/(cell%deth*omega**2)
+                  ELSE
+                     prefactor = fourpi*EXP(-p2/(4.0_dp*omega**2))/(cell%deth*p2)
+                  END IF
+                  CALL zgerc(n_bf, n_bf, CMPLX(prefactor, 0.0_dp, dp), fourier_basis, 1, &
+                             fourier_basis, 1, V_k(:, :, ikp_local), n_bf)
+               END DO
+            END DO
+         END DO
+      END DO
+      DEALLOCATE (fourier_basis)
+   END SUBROUTINE add_ewald_reciprocal
+
+! **************************************************************************************************
+!> \brief ...
+!> \param p ...
+!> \param particles ...
+!> \param qs_kinds ...
+!> \param cell ...
+!> \param basis_type ...
+!> \param bf_start ...
+!> \param bf_end ...
+!> \param values ...
+! **************************************************************************************************
+   SUBROUTINE gaussian_basis_fourier(p, particles, qs_kinds, cell, basis_type, &
+                                     bf_start, bf_end, values)
+      REAL(KIND=dp), INTENT(IN)                          :: p(3)
+      TYPE(particle_type), POINTER                       :: particles(:)
+      TYPE(qs_kind_type), POINTER                        :: qs_kinds(:)
+      TYPE(cell_type), POINTER                           :: cell
+      CHARACTER(LEN=*), INTENT(IN)                       :: basis_type
+      INTEGER, INTENT(IN)                                :: bf_start(:), bf_end(:)
+      COMPLEX(KIND=dp), INTENT(OUT)                      :: values(:)
+
+      COMPLEX(KIND=dp)                                   :: phase
+      COMPLEX(KIND=dp), ALLOCATABLE                      :: moments(:, :), primitive(:)
+      INTEGER                                            :: iatom, ico, idim, ikind, il, ipgf, iset, &
+                                                            isgf, lmax, ncart, offset
+      REAL(KIND=dp)                                      :: alpha, centre(3)
+      TYPE(gto_basis_set_type), POINTER                  :: basis
+
+      values = z_zero
+      DO iatom = 1, SIZE(particles)
+         ikind = particles(iatom)%atomic_kind%kind_number
+         CALL get_qs_kind(qs_kinds(ikind), basis_set=basis, basis_type=basis_type)
+         centre = pbc(particles(iatom)%r, cell)
+         phase = EXP(gaussi*SUM(p*centre))
+         CPASSERT(bf_end(iatom) - bf_start(iatom) + 1 == basis%nsgf)
+         DO iset = 1, basis%nset
+            lmax = basis%lmax(iset)
+            ncart = ncoset(lmax)
+            ALLOCATE (moments(0:lmax, 3), primitive(ncart*basis%npgf(iset)))
+            primitive = z_zero
+            DO ipgf = 1, basis%npgf(iset)
+               alpha = basis%zet(ipgf, iset)
+               DO idim = 1, 3
+                  moments(0, idim) = SQRT(pi/alpha)*EXP(-p(idim)**2/(4.0_dp*alpha))
+                  IF (lmax > 0) moments(1, idim) = gaussi*p(idim)*moments(0, idim)/(2.0_dp*alpha)
+                  DO il = 2, lmax
+                     moments(il, idim) = (gaussi*p(idim)*moments(il - 1, idim) + &
+                                          REAL(il - 1, dp)*moments(il - 2, idim))/(2.0_dp*alpha)
+                  END DO
+               END DO
+               DO ico = ncoset(basis%lmin(iset) - 1) + 1, ncart
+                  primitive((ipgf - 1)*ncart + ico) = &
+                     moments(indco(1, ico), 1)*moments(indco(2, ico), 2)*moments(indco(3, ico), 3)
+               END DO
+            END DO
+            offset = basis%first_sgf(1, iset)
+            DO isgf = offset, offset + basis%nsgf_set(iset) - 1
+               values(bf_start(iatom) + isgf - 1) = &
+                  phase*SUM(basis%sphi(1:SIZE(primitive), isgf)*primitive)
+            END DO
+            DEALLOCATE (moments, primitive)
+         END DO
+      END DO
+   END SUBROUTINE gaussian_basis_fourier
 
 END MODULE kpoint_coulomb_2c

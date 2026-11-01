@@ -64,6 +64,9 @@ MODULE post_scf_bandstructure_types
 
    TYPE post_scf_bandstructure_type
 
+      ! Concrete RI-RS full-k work type and lifecycle are defined in its utils module.
+      CLASS(*), ALLOCATABLE :: gwkp_env
+
       ! decide which calculations will be done
       LOGICAL                                         :: do_gw = .FALSE., &
                                                          do_soc = .FALSE., &
@@ -102,10 +105,10 @@ MODULE post_scf_bandstructure_types
 
       ! parameters for RI-RS implementation of GW
       TYPE(ri_rs_env)                                 :: ri_rs
-      ! Eigenvalue self-consistency settings and current GW iteration.
-      INTEGER                                         :: evgw0_iter = 20
+
+      ! Eigenvalue self-consistency settings
+      INTEGER                                         :: evgw0_n_iter = 1
       REAL(KIND=dp)                                   :: evgw0_eps_iter = 5.0E-5_dp
-      INTEGER                                         :: evgw0_i_iter = 0
 
       ! Parameters for automatic RI basis set optimization.
       TYPE(auto_ri_type)                              :: auto_ri = auto_ri_type()

@@ -156,18 +156,19 @@ CONTAINS
 !> \param para_env_sub ...
 !> \param my_group_L_start ...
 !> \param my_group_L_end ...
-!> \param natom ...
+!> \param grid_cutoffs Plane-wave and relative cutoffs in Hartree.
 !> \param potential_parameter ...
 !> \param sab_orb_sub ...
 !> \param L_local_col ...
 !> \param kind_of ...
 ! **************************************************************************************************
    SUBROUTINE mp2_eri_2c_integrate_gpw(qs_env, para_env_sub, my_group_L_start, my_group_L_end, &
-                                       natom, potential_parameter, sab_orb_sub, L_local_col, kind_of)
+                                       grid_cutoffs, potential_parameter, sab_orb_sub, L_local_col, kind_of)
 
       TYPE(qs_environment_type), INTENT(IN), POINTER     :: qs_env
       TYPE(mp_para_env_type), INTENT(IN), POINTER        :: para_env_sub
-      INTEGER, INTENT(IN)                                :: my_group_L_start, my_group_L_end, natom
+      INTEGER, INTENT(IN)                                :: my_group_L_start, my_group_L_end
+      REAL(KIND=dp), INTENT(IN)                          :: grid_cutoffs(2)
       TYPE(libint_potential_type), INTENT(IN)            :: potential_parameter
       TYPE(neighbor_list_set_p_type), DIMENSION(:), &
          INTENT(IN), POINTER                             :: sab_orb_sub
@@ -177,7 +178,7 @@ CONTAINS
       CHARACTER(LEN=*), PARAMETER :: routineN = 'mp2_eri_2c_integrate_gpw'
 
       INTEGER :: dir, handle, handle2, i_counter, iatom, igrid_level, ikind, ipgf, iset, lb(3), &
-         LLL, location(3), max_nseta, na1, na2, ncoa, nseta, offset, sgfa, tp(3), ub(3)
+         LLL, location(3), max_nseta, na1, na2, natom, ncoa, nseta, offset, sgfa, tp(3), ub(3)
       INTEGER, ALLOCATABLE, DIMENSION(:, :)              :: offset_2d
       INTEGER, DIMENSION(:), POINTER                     :: la_max, la_min, npgfa, nsgfa
       INTEGER, DIMENSION(:, :), POINTER                  :: first_sgfa
@@ -206,10 +207,12 @@ CONTAINS
 
       CALL timeset(routineN, handle)
 
-      CALL prepare_gpw(qs_env, dft_control, e_cutoff_old, cutoff_old, relative_cutoff_old, para_env_sub, pw_env_sub, &
+      CALL prepare_gpw(qs_env, grid_cutoffs, e_cutoff_old, cutoff_old, relative_cutoff_old, para_env_sub, pw_env_sub, &
                        auxbas_pw_pool, poisson_env, task_list_sub, rho_r, rho_g, pot_g, psi_L, sab_orb_sub)
 
-      CALL get_qs_env(qs_env, cell=cell, qs_kind_set=qs_kind_set, atomic_kind_set=atomic_kind_set, particle_set=particle_set)
+      natom = SIZE(kind_of)
+      CALL get_qs_env(qs_env, dft_control=dft_control, cell=cell, qs_kind_set=qs_kind_set, &
+                      atomic_kind_set=atomic_kind_set, particle_set=particle_set)
 
       L_local_col = 0.0_dp
 
@@ -942,7 +945,7 @@ CONTAINS
 ! **************************************************************************************************
 !> \brief Prepares GPW calculation for RI-MP2/RI-RPA
 !> \param qs_env ...
-!> \param dft_control ...
+!> \param grid_cutoffs Plane-wave and relative cutoffs in Hartree.
 !> \param e_cutoff_old ...
 !> \param cutoff_old ...
 !> \param relative_cutoff_old ...
@@ -957,10 +960,10 @@ CONTAINS
 !> \param psi_L ...
 !> \param sab_orb_sub ...
 ! **************************************************************************************************
-   SUBROUTINE prepare_gpw(qs_env, dft_control, e_cutoff_old, cutoff_old, relative_cutoff_old, para_env_sub, pw_env_sub, &
+   SUBROUTINE prepare_gpw(qs_env, grid_cutoffs, e_cutoff_old, cutoff_old, relative_cutoff_old, para_env_sub, pw_env_sub, &
                           auxbas_pw_pool, poisson_env, task_list_sub, rho_r, rho_g, pot_g, psi_L, sab_orb_sub)
       TYPE(qs_environment_type), INTENT(IN), POINTER     :: qs_env
-      TYPE(dft_control_type), INTENT(IN), POINTER        :: dft_control
+      REAL(KIND=dp), INTENT(IN)                          :: grid_cutoffs(2)
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:), &
          INTENT(OUT)                                     :: e_cutoff_old
       REAL(KIND=dp), INTENT(OUT)                         :: cutoff_old, relative_cutoff_old
@@ -980,6 +983,7 @@ CONTAINS
       INTEGER                                            :: handle, i_multigrid, n_multigrid
       LOGICAL                                            :: skip_load_balance_distributed
       REAL(KIND=dp)                                      :: progression_factor
+      TYPE(dft_control_type), POINTER                    :: dft_control
       TYPE(qs_ks_env_type), POINTER                      :: ks_env
 
       CALL timeset(routineN, handle)
@@ -993,7 +997,7 @@ CONTAINS
       e_cutoff_old(:) = dft_control%qs_control%e_cutoff
       cutoff_old = dft_control%qs_control%cutoff
 
-      dft_control%qs_control%cutoff = qs_env%mp2_env%mp2_gpw%cutoff*0.5_dp
+      dft_control%qs_control%cutoff = grid_cutoffs(1)
       dft_control%qs_control%e_cutoff(1) = dft_control%qs_control%cutoff
       DO i_multigrid = 2, n_multigrid
          dft_control%qs_control%e_cutoff(i_multigrid) = dft_control%qs_control%e_cutoff(i_multigrid - 1) &
@@ -1001,7 +1005,7 @@ CONTAINS
       END DO
 
       relative_cutoff_old = dft_control%qs_control%relative_cutoff
-      dft_control%qs_control%relative_cutoff = qs_env%mp2_env%mp2_gpw%relative_cutoff*0.5_dp
+      dft_control%qs_control%relative_cutoff = grid_cutoffs(2)
 
       ! a pw_env
       NULLIFY (pw_env_sub)

@@ -643,7 +643,10 @@ CONTAINS
 
          ELSE IF (do_gpw) THEN
 
-            CALL prepare_gpw(qs_env, dft_control, e_cutoff_old, cutoff_old, relative_cutoff_old, para_env_sub, pw_env_sub, &
+            CALL get_qs_env(qs_env, dft_control=dft_control)
+            CALL prepare_gpw(qs_env, &
+                             [qs_env%mp2_env%mp2_gpw%cutoff, qs_env%mp2_env%mp2_gpw%relative_cutoff]*0.5_dp, &
+                             e_cutoff_old, cutoff_old, relative_cutoff_old, para_env_sub, pw_env_sub, &
                              auxbas_pw_pool, poisson_env, task_list_sub, rho_r, rho_g, pot_g, psi_L, sab_orb_sub)
 
             DO i_counter = 1, my_group_L_size

@@ -2804,7 +2804,10 @@ CONTAINS
       END IF
 
       !sab_orb and task_list_ext are essentially dummies
-      CALL prepare_gpw(qs_env, dft_control, e_cutoff_old, cutoff_old, relative_cutoff_old, para_env_ext, pw_env_ext, &
+      CALL get_qs_env(qs_env, dft_control=dft_control)
+      CALL prepare_gpw(qs_env, &
+                       [qs_env%mp2_env%mp2_gpw%cutoff, qs_env%mp2_env%mp2_gpw%relative_cutoff]*0.5_dp, &
+                       e_cutoff_old, cutoff_old, relative_cutoff_old, para_env_ext, pw_env_ext, &
                        auxbas_pw_pool, poisson_env, task_list_ext, rho_r, rho_g, pot_g, psi_L, sab_orb)
 
       IF (use_virial) THEN

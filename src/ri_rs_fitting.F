@@ -11,7 +11,9 @@
 !>      09.2026 created Jan Wilhelm
 ! **************************************************************************************************
 MODULE ri_rs_fitting
-   USE cp_blacs_env,                    ONLY: cp_blacs_env_type
+   USE cp_blacs_env,                    ONLY: cp_blacs_env_create,&
+                                              cp_blacs_env_release,&
+                                              cp_blacs_env_type
    USE cp_dbcsr_api,                    ONLY: dbcsr_put_block,&
                                               dbcsr_type
    USE cp_fm_cholesky,                  ONLY: cp_fm_cholesky_decompose,&
@@ -25,7 +27,8 @@ MODULE ri_rs_fitting
                                               cp_fm_release,&
                                               cp_fm_set_submatrix,&
                                               cp_fm_type
-   USE kinds,                           ONLY: dp
+   USE kinds,                           ONLY: dp,&
+                                              int_8
    USE message_passing,                 ONLY: mp_para_env_type
 #include "./base/base_uses.f90"
 
@@ -170,241 +173,420 @@ CONTAINS
    END SUBROUTINE factor_ri_rs_fit
 
 ! **************************************************************************************************
-!> \brief Evaluate the normalized cluster residual and its exact derivative in AO space.
+!> \brief Evaluate the normalized cluster residual and its grid-coordinate derivative.
 !>
-!>        V_l = sqrt(d_l) phi_l, S = V V^T, K = S∘S + λI, and K Z' = b, with
-!>        b_lP = V_l^T B_P V_l. B_P is the symmetric matrix defined by the upper AO triangle.
-!>        The objective is ||B - A Z'||²/||B||², A_:l = svec(V_l V_l^T), without a penalty term.
-!>        For λ>0 the derivative includes the response of the regularized coefficients.
-!>        Each RI-column panel reuses V B_P for the RHS and gradient before releasing the panel.
-!>        The balancing convention and RI-RS reference are given in solve_ri_rs_fit.
-!> \param phi unscaled AO values indexed (grid point, AO)
-!> \param int_3c three-center integrals indexed (AO, AO, RI); only the upper AO triangle is used
-!> \param tikhonov regularization in the Jacobi-scaled space
-!> \param normalized_error normalized squared residual
-!> \param fit_successful false if the target is empty or the regularized fit cannot be solved
-!> \param ao_gradient optional derivative with respect to the unscaled AO values
-!> \param max_abs_error optional largest absolute unweighted integral error
-!> \param workspace_budget_bytes optional total budget for evaluator-owned gradient workspaces;
-!>        the caller deducts its own arrays first. Reserve all fixed workspaces before sizing
-!>        the product cache. An absent or nonpositive budget streams one RI column.
+!>    Let ϕ_l contain the AO values ϕ_μ(r_l), and let B_P be the symmetric matrix of
+!>    three-center integrals (μν|P). svec stores the upper triangle, multiplying off-diagonal
+!>    entries by sqrt(2), so its Euclidean norm equals the full matrix Frobenius norm.
+!>
+!>    d_l = 1 / sqrt(max((Σ_μ ϕ_μ(r_l)²)², jacobi_floor)),  V_l = sqrt(d_l) ϕ_l,
+!>    A_:l = svec(V_l V_l^T),  B_:P = svec(B_P),  S = V V^T,
+!>    K = A^T A + λ I = S∘S + λ I,  b = A^T B,  K Z′ = b.
+!>
+!>    Here λ is tikhonov and ∘ denotes elementwise multiplication. The objective is
+!>    E = ||B - A Z′||² / ||B||², without a penalty term. For λ > 0 the derivative
+!>    includes the response of the regularized coefficients:
+!>
+!>    K Y = Z′,  R = B - A Z′,
+!>    ∂E/∂A = 2 [λ (A Y) Z′^T - R (Z′ + λ Y)^T] / ||B||².
+!>
+!>    The coordinate derivative contracts ∂E/∂A with ∂A/∂r_lα, including the derivative
+!>    of d_l above the floor. For λ = 0 the numerical pseudoinverse is used; the residual
+!>    derivative applies on a fixed-rank branch. The balancing convention is in solve_ri_rs_fit.
+!>    K is independent of P: factor it once and solve panels of RI columns. Each rank holds
+!>    complete AO-pair columns for its RI functions. Fixed AO-pair blocks and ordered sums
+!>    over RI columns keep the summation order independent of their MPI distribution.
+!> \param Phi_l_mu Unscaled AO values ϕ_μ(r_l), indexed (grid point, AO).
+!> \param dPhi_alpha_l_mu AO coordinate derivatives ∂ϕ_μ(r_l)/∂r_lα, indexed (α, grid point, AO).
+!> \param Int_3c_munu_P Symmetry-weighted upper AO pairs for local RI columns, B above;
+!>    pair index ν(ν-1)/2 + μ for 1 <= μ <= ν <= nAO, with nAO(nAO+1)/2 rows.
+!> \param Int_3c_norm2 Squared norm ||B||² summed over all RI columns in the atom MPI group.
+!> \param tikhonov Regularization λ in the Jacobi-scaled fitting equations.
+!> \param atom_env MPI group distributing the cluster's RI columns and large fitting matrices.
+!> \param available_GB Available memory estimate per rank, used to select the local factorization.
+!> \param normalized_error Normalized squared residual E, without the regularization penalty.
+!> \param coordinate_gradient Derivative ∂E/∂r_lα, indexed (α, grid point).
+!> \param max_abs_error Largest absolute unweighted three-center-integral error.
+!> \param fit_successful False for an empty target or a failed regularized factorization.
 ! **************************************************************************************************
-   SUBROUTINE evaluate_ri_rs_fit(phi, int_3c, tikhonov, normalized_error, fit_successful, &
-                                 ao_gradient, max_abs_error, workspace_budget_bytes)
-      REAL(KIND=dp), DIMENSION(:, :), INTENT(IN)         :: phi
-      REAL(KIND=dp), DIMENSION(:, :, :), INTENT(IN)      :: int_3c
-      REAL(KIND=dp), INTENT(IN)                          :: tikhonov
-      REAL(KIND=dp), INTENT(OUT)                         :: normalized_error
+   SUBROUTINE evaluate_ri_rs_fit(Phi_l_mu, dPhi_alpha_l_mu, Int_3c_munu_P, &
+                                 Int_3c_norm2, tikhonov, atom_env, available_GB, &
+                                 normalized_error, coordinate_gradient, max_abs_error, fit_successful)
+      REAL(KIND=dp), INTENT(IN)                          :: Phi_l_mu(:, :), &
+                                                            dPhi_alpha_l_mu(:, :, :), &
+                                                            Int_3c_munu_P(:, :), Int_3c_norm2, &
+                                                            tikhonov
+      TYPE(mp_para_env_type), POINTER                    :: atom_env
+      REAL(KIND=dp), INTENT(IN)                          :: available_GB
+      REAL(KIND=dp), INTENT(OUT)                         :: normalized_error, &
+                                                            coordinate_gradient(:, :), &
+                                                            max_abs_error
       LOGICAL, INTENT(OUT)                               :: fit_successful
-      REAL(KIND=dp), DIMENSION(:, :), INTENT(OUT), &
-         OPTIONAL                                        :: ao_gradient
-      REAL(KIND=dp), INTENT(OUT), OPTIONAL               :: max_abs_error
-      REAL(KIND=dp), INTENT(IN), OPTIONAL                :: workspace_budget_bytes
 
-      CHARACTER(LEN=*), PARAMETER :: routineN = 'evaluate_ri_rs_fit'
-      INTEGER, PARAMETER                                 :: residual_block_size = 64
+      CHARACTER(len=*), PARAMETER :: routineN = 'evaluate_ri_rs_fit'
+      INTEGER, PARAMETER                                 :: local_cholesky_limit = 3072, &
+                                                            pair_block_size = 128, &
+                                                            ri_panel_size = 32
 
-      INTEGER                                            :: first, handle, handle2, i, icache, imu, &
-                                                            info, inu, ip, j, last, n_ao, &
-                                                            n_cached, n_grid, n_panel, n_ri, &
-                                                            panel_first, panel_last
-      REAL(KIND=dp) :: coefficient_norm2, error_scale, fixed_bytes, integral_norm2, na, ng, &
-         projection, residual_norm2, roundoff_estimate, row_norm2, value, weight
-      REAL(KIND=dp), ALLOCATABLE :: coefficient_work(:, :), factor(:, :), jacobi_scale(:), &
-         overlap(:, :), products(:, :, :), residual(:, :), v(:, :), z_prime(:, :)
+      INTEGER :: contribution_sum_handle, factor_handle, first_owned_RI, first_pair, first_RI, &
+         fit_derivative_handle, fit_solve_handle, handle, i_ao_pair, icartesian, ieigenvalue, &
+         igrid_point, imu, inu, ip, jp, lapack_info, last_owned_RI, last_pair, local_first_col, &
+         local_first_RI, local_last_RI, n_grid_points, nAO, nblock, ncol_local, ncols, &
+         ncols_local, npairs, nRI, nrow_local, rhs_sum_handle, ri_block_size
+      INTEGER(KIND=int_8)                                :: available_bytes, factor_bytes
+      INTEGER, ALLOCATABLE                               :: mu_of_pair(:), nu_of_pair(:)
+      INTEGER, POINTER                                   :: col_indices(:), row_indices(:)
+      LOGICAL                                            :: local_cholesky
+      REAL(KIND=dp)                                      :: dPhi_munu_l, fit_rank_tolerance, &
+                                                            jacobi_scale, Phi_munu_norm2, &
+                                                            scaling_projection
+      REAL(KIND=dp), ALLOCATABLE :: col_values(:, :), contributions(:, :), dE_dPhi_munu_l(:, :), &
+         dPhi_munu_l_scaled(:), fit_eigenvalues(:), fit_eigenvectors(:, :), &
+         fit_projected_rhs(:, :), fit_work(:), integral_panel(:, :), jacobi_scaling(:), &
+         local_factor(:, :), pair_symmetry(:), Phi_munu_l(:, :), Phi_munu_l_scaled(:, :), &
+         Phi_munu_norm2_l(:), residual(:, :), response(:, :), rhs(:, :), row_values(:, :), &
+         Y_effective_lP(:, :), Y_lP(:, :), Z_prime_lP(:, :)
+      REAL(KIND=dp), CONTIGUOUS, POINTER                 :: local_data(:, :)
+      TYPE(cp_blacs_env_type), POINTER                   :: blacs_env
+      TYPE(cp_fm_struct_type), POINTER                   :: fm_struct_b, fm_struct_D
+      TYPE(cp_fm_type)                                   :: fm_b, fm_D
 
       CALL timeset(routineN, handle)
-      n_grid = SIZE(phi, 1)
-      n_ao = SIZE(phi, 2)
-      n_ri = SIZE(int_3c, 3)
-      CPASSERT(SIZE(int_3c, 1) == n_ao .AND. SIZE(int_3c, 2) == n_ao)
-      CPASSERT(tikhonov >= 0.0_dp)
-      IF (PRESENT(ao_gradient)) THEN
-         CPASSERT(ALL(SHAPE(ao_gradient) == SHAPE(phi)))
-         ao_gradient(:, :) = 0.0_dp
-      END IF
-      normalized_error = HUGE(normalized_error)
-      IF (PRESENT(max_abs_error)) max_abs_error = HUGE(max_abs_error)
-      fit_successful = .FALSE.
-      IF (n_grid < 1 .OR. n_ri < 1) THEN
-         CALL timestop(handle)
-         RETURN
-      END IF
-      integral_norm2 = 0.0_dp
-      DO ip = 1, n_ri
-         DO inu = 1, n_ao
-            integral_norm2 = integral_norm2 + int_3c(inu, inu, ip)**2 + &
-                             2.0_dp*DOT_PRODUCT(int_3c(1:inu - 1, inu, ip), int_3c(1:inu - 1, inu, ip))
-         END DO
-      END DO
-      IF (integral_norm2 <= TINY(1.0_dp)) THEN
-         CALL timestop(handle)
-         RETURN
-      END IF
 
-      n_panel = n_ri
-      n_cached = 1
-      IF (PRESENT(ao_gradient)) THEN
-         n_panel = 1
-         IF (PRESENT(workspace_budget_bytes)) THEN
-            IF (workspace_budget_bytes > 0.0_dp) THEN
-               ng = REAL(n_grid, dp)
-               na = REAL(n_ao, dp)
-               ! Reserve factor, overlap, V, two coefficient arrays, Jacobi scales and the
-               ! largest residual panel before assigning all remaining budget to V B_P.
-               fixed_bytes = 8.0_dp*(2.0_dp*ng**2 + ng*na + 2.0_dp*ng*REAL(n_ri, dp) + ng + &
-                                     na*MIN(na, REAL(residual_block_size, dp)))
-               n_panel = INT(MIN(REAL(n_ri, dp), MAX(0.0_dp, &
-                                                     (workspace_budget_bytes - fixed_bytes)/(8.0_dp*ng*na))))
-               IF (n_panel < 1) THEN
-                  CPABORT("RI-RS minimum fit workspace exceeds memory budget")
-               END IF
-            END IF
-         END IF
-         n_cached = n_panel
-         CALL factor_ri_rs_fit(phi, tikhonov, factor, jacobi_scale, info, overlap)
-      ELSE
-         CALL factor_ri_rs_fit(phi, tikhonov, factor, jacobi_scale, info)
-      END IF
-      IF (info /= 0) THEN
+      n_grid_points = SIZE(Phi_l_mu, 1)
+      nAO = SIZE(Phi_l_mu, 2)
+      npairs = nAO*(nAO + 1)/2
+      nRI = SIZE(Int_3c_munu_P, 2)
+      CALL atom_env%sum(nRI)
+      first_owned_RI = nRI*atom_env%mepos/atom_env%num_pe + 1
+      last_owned_RI = nRI*(atom_env%mepos + 1)/atom_env%num_pe
+      CPASSERT(SIZE(Int_3c_munu_P, 1) == npairs)
+      CPASSERT(SIZE(Int_3c_munu_P, 2) == last_owned_RI - first_owned_RI + 1)
+      CPASSERT(ALL(SHAPE(coordinate_gradient) == [3, n_grid_points]))
+      normalized_error = HUGE(normalized_error)
+      coordinate_gradient = 0.0_dp
+      max_abs_error = 0.0_dp
+      fit_successful = .FALSE.
+      IF (n_grid_points < 1 .OR. nRI < 1 .OR. Int_3c_norm2 <= TINY(1.0_dp)) THEN
          CALL timestop(handle)
          RETURN
       END IF
-      ALLOCATE (v(n_grid, n_ao), products(n_grid, n_ao, n_cached), &
-                coefficient_work(n_grid, n_ri), z_prime(n_grid, n_ri))
-      DO imu = 1, n_ao
-         v(:, imu) = SQRT(jacobi_scale)*phi(:, imu)
-      END DO
-      ! K is independent of P. Solve a panel of RHSs and consume its cached products immediately.
-      ! Keep Z' and the coefficient response for the final grid-space symmetric product.
-      value = 0.0_dp
-      coefficient_norm2 = 0.0_dp
-      CALL timeset(routineN//'_ri_panels', handle2)
-      DO panel_first = 1, n_ri, n_panel
-         panel_last = MIN(panel_first + n_panel - 1, n_ri)
-         DO ip = panel_first, panel_last
-            icache = 1
-            IF (PRESENT(ao_gradient)) icache = ip - panel_first + 1
-            CALL dsymm('R', 'U', n_grid, n_ao, 1.0_dp, int_3c(:, :, ip), n_ao, v, n_grid, &
-                       0.0_dp, products(:, :, icache), n_grid)
-            DO i = 1, n_grid
-               coefficient_work(i, ip) = DOT_PRODUCT(v(i, :), products(i, :, icache))
-            END DO
+      ALLOCATE (mu_of_pair(npairs), nu_of_pair(npairs), pair_symmetry(npairs))
+      DO inu = 1, nAO
+         DO imu = 1, inu
+            i_ao_pair = inu*(inu - 1)/2 + imu
+            mu_of_pair(i_ao_pair) = imu
+            nu_of_pair(i_ao_pair) = inu
+            pair_symmetry(i_ao_pair) = SQRT(REAL(2 - MERGE(1, 0, imu == inu), dp))
          END DO
-         z_prime(:, panel_first:panel_last) = coefficient_work(:, panel_first:panel_last)
-         CALL dpotrs('L', n_grid, panel_last - panel_first + 1, factor, n_grid, &
-                     z_prime(:, panel_first:panel_last), n_grid, info)
-         IF (info /= 0) THEN
-            CALL timestop(handle2)
+      END DO
+      available_bytes = INT(0.8_dp*MAX(0.0_dp, available_GB)*1.0E9_dp, int_8)
+      factor_bytes = 8_int_8*INT(n_grid_points, int_8)**2
+      local_cholesky = tikhonov > 0.0_dp .AND. n_grid_points <= local_cholesky_limit .AND. &
+                       factor_bytes <= available_bytes/20_int_8
+      NULLIFY (fm_struct_D, fm_struct_b, blacs_env)
+      IF (.NOT. local_cholesky) THEN
+         CALL cp_blacs_env_create(blacs_env=blacs_env, para_env=atom_env)
+         CALL cp_fm_struct_create(fm_struct_D, para_env=atom_env, context=blacs_env, &
+                                  nrow_global=n_grid_points, ncol_global=n_grid_points)
+      END IF
+      ri_block_size = MIN(ri_panel_size, nRI)
+      ALLOCATE (jacobi_scaling(n_grid_points), Phi_munu_norm2_l(n_grid_points))
+      DO igrid_point = 1, n_grid_points
+         Phi_munu_norm2 = SUM(Phi_l_mu(igrid_point, :)**2)**2
+         Phi_munu_norm2_l(igrid_point) = Phi_munu_norm2
+         jacobi_scaling(igrid_point) = 1.0_dp/SQRT(MAX(Phi_munu_norm2, jacobi_floor))
+      END DO
+      IF (local_cholesky) THEN
+         CALL timeset("rirs_grid_local_factor", factor_handle)
+
+         ALLOCATE (local_factor(n_grid_points, n_grid_points))
+         CALL dgemm('N', 'T', n_grid_points, n_grid_points, nAO, 1.0_dp, &
+                    Phi_l_mu, n_grid_points, Phi_l_mu, n_grid_points, &
+                    0.0_dp, local_factor, n_grid_points)
+         ! D′_ll′ = s_l s_l′ [Σ_μ ϕ_μ(r_l) ϕ_μ(r_l′)]² + λ δ_ll′.
+         ! Here s is jacobi_scaling and λ is tikhonov.
+         DO ip = 1, n_grid_points
+            DO igrid_point = 1, n_grid_points
+               local_factor(igrid_point, ip) = local_factor(igrid_point, ip)**2* &
+                                               jacobi_scaling(igrid_point)*jacobi_scaling(ip)
+            END DO
+            local_factor(ip, ip) = local_factor(ip, ip) + tikhonov
+         END DO
+         CALL dpotrf('U', n_grid_points, local_factor, n_grid_points, lapack_info)
+         CALL timestop(factor_handle)
+      ELSE
+         CALL cp_fm_create(fm_D, fm_struct_D)
+         CALL cp_fm_get_info(fm_D, nrow_local=nrow_local, ncol_local=ncol_local, &
+                             row_indices=row_indices, col_indices=col_indices, &
+                             local_data=local_data)
+         IF (nrow_local > 0 .AND. ncol_local > 0) THEN
+            ALLOCATE (row_values(nrow_local, nAO), col_values(nAO, ncol_local))
+            DO imu = 1, nAO
+               row_values(:, imu) = Phi_l_mu(row_indices(:nrow_local), imu)
+               col_values(imu, :) = Phi_l_mu(col_indices(:ncol_local), imu)
+            END DO
+            CALL dgemm('N', 'N', nrow_local, ncol_local, nAO, 1.0_dp, &
+                       row_values, nrow_local, col_values, nAO, 0.0_dp, &
+                       local_data, SIZE(local_data, 1))
+            DO ip = 1, ncol_local
+               DO igrid_point = 1, nrow_local
+                  local_data(igrid_point, ip) = local_data(igrid_point, ip)**2* &
+                                                jacobi_scaling(row_indices(igrid_point))* &
+                                                jacobi_scaling(col_indices(ip))
+                  IF (row_indices(igrid_point) == col_indices(ip)) THEN
+                     local_data(igrid_point, ip) = local_data(igrid_point, ip) + tikhonov
+                  END IF
+               END DO
+            END DO
+            DEALLOCATE (row_values, col_values)
+         END IF
+      END IF
+      IF (tikhonov <= 0.0_dp) THEN
+         ! The Moore-Penrose solution of D gives the unregularized
+         ! minimum-norm least-squares fit even when the grid is redundant.
+         ALLOCATE (fit_eigenvectors(n_grid_points, n_grid_points), &
+                   fit_eigenvalues(n_grid_points), &
+                   fit_work(MAX(1, 3*n_grid_points - 1)), &
+                   fit_projected_rhs(n_grid_points, ri_block_size))
+         CALL cp_fm_get_submatrix(fm_D, fit_eigenvectors)
+         CALL dsyev('V', 'L', n_grid_points, fit_eigenvectors, n_grid_points, &
+                    fit_eigenvalues, fit_work, SIZE(fit_work), lapack_info)
+         IF (lapack_info /= 0) CPABORT('Unregularized RI-RS grid-fit eigensolver failed')
+         fit_rank_tolerance = EPSILON(1.0_dp)*REAL(n_grid_points, dp)* &
+                              MAXVAL(ABS(fit_eigenvalues))
+         IF (MINVAL(fit_eigenvalues) < -10.0_dp*fit_rank_tolerance) THEN
+            CPABORT('Unregularized RI-RS grid-fit matrix is not positive semidefinite')
+         END IF
+         IF (.NOT. ANY(fit_eigenvalues > fit_rank_tolerance)) THEN
+            CPABORT('Unregularized RI-RS grid-fit matrix has zero numerical rank')
+         END IF
+      ELSE
+         IF (.NOT. local_cholesky) THEN
+            CALL cp_fm_cholesky_decompose(fm_D, n=n_grid_points, info_out=lapack_info)
+         END IF
+         IF (lapack_info /= 0) THEN
+            IF (local_cholesky) THEN
+               DEALLOCATE (local_factor)
+            ELSE
+               CALL cp_fm_release(fm_D)
+               CALL cp_fm_struct_release(fm_struct_D)
+               CALL cp_blacs_env_release(blacs_env)
+            END IF
             CALL timestop(handle)
+
             RETURN
          END IF
-         DO ip = panel_first, panel_last
-            value = value + DOT_PRODUCT(z_prime(:, ip), coefficient_work(:, ip))
-            coefficient_norm2 = coefficient_norm2 + DOT_PRODUCT(z_prime(:, ip), z_prime(:, ip))
-         END DO
-
-         IF (PRESENT(ao_gradient)) THEN
-            ! Reuse the RHS for Y = K^-1 Z' and then C = Z' + λY; λ=0 needs no response solve.
-            coefficient_work(:, panel_first:panel_last) = z_prime(:, panel_first:panel_last)
-            IF (tikhonov > 0.0_dp) THEN
-               CALL dpotrs('L', n_grid, panel_last - panel_first + 1, factor, n_grid, &
-                           coefficient_work(:, panel_first:panel_last), n_grid, info)
-               IF (info /= 0) THEN
-                  CALL timestop(handle2)
-                  CALL timestop(handle)
-                  RETURN
-               END IF
-               coefficient_work(:, panel_first:panel_last) = z_prime(:, panel_first:panel_last) + &
-                                                             tikhonov*coefficient_work(:, panel_first:panel_last)
-            END IF
-            ! Accumulate -Σ_P C_lP (V B_P)_l while the panel products are still available.
-            DO ip = panel_first, panel_last
-               icache = ip - panel_first + 1
-               DO imu = 1, n_ao
-                  ao_gradient(:, imu) = ao_gradient(:, imu) - coefficient_work(:, ip)*products(:, imu, icache)
-               END DO
-            END DO
-            IF (tikhonov > 0.0_dp) THEN
-               ! Retain T = C - Z'/2 = Z'/2 + λY for M = Z'T^T + TZ'^T below.
-               coefficient_work(:, panel_first:panel_last) = coefficient_work(:, panel_first:panel_last) - &
-                                                             0.5_dp*z_prime(:, panel_first:panel_last)
-            END IF
-         END IF
-      END DO
-      CALL timestop(handle2)
-      ! K Z' = b implies ||B-AZ'||² = ||B||² - tr(Z'^T b) - λ ||Z'||².
-      weight = tikhonov*coefficient_norm2
-      residual_norm2 = integral_norm2 - value - weight
-      error_scale = integral_norm2 + ABS(value) + weight
-      ! Large coefficients can also amplify the factorization's backward error. The scaled
-      ! Gram has diagonal <= 1, hence ||K||_2 <= n_grid + λ; use a conservative roundoff estimate.
-      roundoff_estimate = 8.0_dp*EPSILON(1.0_dp)*REAL(n_grid, dp)* &
-                          (REAL(n_grid, dp) + tikhonov)*coefficient_norm2
-      ! Near an exact fit, use bounded AO-column panels to avoid cancellation. This path also
-      ! supplies the final maximum-error diagnostic, without storing a pair-by-RI residual.
-      IF (PRESENT(max_abs_error) .OR. &
-          residual_norm2 <= MAX(SQRT(EPSILON(1.0_dp))*error_scale, roundoff_estimate)) THEN
-         CALL timeset(routineN//'_residual', handle2)
-         ALLOCATE (residual(n_ao, MIN(residual_block_size, n_ao)))
-         residual_norm2 = 0.0_dp
-         IF (PRESENT(max_abs_error)) max_abs_error = 0.0_dp
-         DO ip = 1, n_ri
-            DO first = 1, n_ao, residual_block_size
-               last = MIN(first + residual_block_size - 1, n_ao)
-               DO inu = first, last
-                  products(:, inu - first + 1, 1) = z_prime(:, ip)*v(:, inu)
-               END DO
-               CALL dgemm('T', 'N', n_ao, last - first + 1, n_grid, -1.0_dp, v, n_grid, products(:, :, 1), n_grid, &
-                          0.0_dp, residual, n_ao)
-               DO inu = first, last
-                  DO imu = 1, inu
-                     value = int_3c(imu, inu, ip) + residual(imu, inu - first + 1)
-                     weight = REAL(2 - MERGE(1, 0, imu == inu), dp)
-                     residual_norm2 = residual_norm2 + weight*value**2
-                     IF (PRESENT(max_abs_error)) max_abs_error = MAX(max_abs_error, ABS(value))
-                  END DO
-               END DO
-            END DO
-         END DO
-         CALL timestop(handle2)
       END IF
-      DEALLOCATE (products)
-      normalized_error = residual_norm2/integral_norm2
-
-      IF (PRESENT(ao_gradient)) THEN
-         CALL timeset(routineN//'_gradient', handle2)
-         ! All panel solves are complete. Reuse the factor for M = Z'Z'^T + λ(Z'Y^T + YZ'^T).
-         IF (tikhonov > 0.0_dp) THEN
-            CALL dsyr2k('L', 'N', n_grid, n_ri, 1.0_dp, z_prime, n_grid, coefficient_work, n_grid, &
-                        0.0_dp, factor, n_grid)
+      IF (.NOT. local_cholesky) THEN
+         CALL cp_fm_struct_create(fm_struct_b, template_fmstruct=fm_struct_D, &
+                                  nrow_global=n_grid_points, ncol_global=ri_block_size, force_block=.TRUE.)
+         CALL cp_fm_create(fm_b, fm_struct_b)
+      END IF
+      ALLOCATE (rhs(n_grid_points, ri_block_size), Z_prime_lP(n_grid_points, ri_block_size), &
+                Y_lP(n_grid_points, ri_block_size), Y_effective_lP(n_grid_points, ri_block_size), &
+                Phi_munu_l(pair_block_size, n_grid_points), Phi_munu_l_scaled(pair_block_size, n_grid_points), &
+                residual(pair_block_size, ri_block_size), response(pair_block_size, ri_block_size), &
+                dE_dPhi_munu_l(pair_block_size, n_grid_points), &
+                dPhi_munu_l_scaled(pair_block_size), contributions(1 + 3*n_grid_points, ri_block_size), &
+                integral_panel(pair_block_size, ri_block_size))
+      ! K is independent of P. Reuse its factorization for each panel of right-hand sides.
+      normalized_error = 0.0_dp
+      DO first_RI = 1, nRI, ri_block_size
+         ncols = MIN(ri_block_size, nRI - first_RI + 1)
+         local_first_RI = MAX(first_RI, first_owned_RI)
+         local_last_RI = MIN(first_RI + ncols - 1, last_owned_RI)
+         ncols_local = MAX(0, local_last_RI - local_first_RI + 1)
+         rhs = 0.0_dp
+         IF (ncols_local > 0) THEN
+            local_first_col = local_first_RI - first_RI + 1
+            DO first_pair = 1, npairs, pair_block_size
+               last_pair = MIN(first_pair + pair_block_size - 1, npairs)
+               nblock = last_pair - first_pair + 1
+               CALL fill_pair_products(Phi_l_mu, jacobi_scaling, mu_of_pair, nu_of_pair, &
+                                       pair_symmetry, first_pair, nblock, Phi_munu_l, Phi_munu_l_scaled)
+               integral_panel(1:nblock, 1:ncols_local) = &
+                  Int_3c_munu_P(first_pair:last_pair, &
+                                local_first_RI - first_owned_RI + 1:local_last_RI - first_owned_RI + 1)
+               CALL dgemm('T', 'N', n_grid_points, ncols_local, nblock, 1.0_dp, &
+                          Phi_munu_l_scaled, pair_block_size, integral_panel, pair_block_size, &
+                          1.0_dp, rhs(:, local_first_col:), n_grid_points)
+            END DO
+         END IF
+         IF (.NOT. local_cholesky) THEN
+            CALL timeset('rirs_fit_rhs_sum', rhs_sum_handle)
+            CALL atom_env%sum(rhs)
+            CALL timestop(rhs_sum_handle)
+         END IF
+         Z_prime_lP = 0.0_dp
+         Y_lP = 0.0_dp
+         CALL timeset('rirs_fit_solve', fit_solve_handle)
+         IF (tikhonov <= 0.0_dp) THEN
+            DO ip = 1, ncols
+               fit_projected_rhs(:, ip) = MATMUL(TRANSPOSE(fit_eigenvectors), rhs(:, ip))
+               DO ieigenvalue = 1, n_grid_points
+                  IF (fit_eigenvalues(ieigenvalue) > fit_rank_tolerance) THEN
+                     fit_projected_rhs(ieigenvalue, ip) = &
+                        fit_projected_rhs(ieigenvalue, ip)/fit_eigenvalues(ieigenvalue)
+                  ELSE
+                     fit_projected_rhs(ieigenvalue, ip) = 0.0_dp
+                  END IF
+               END DO
+               Z_prime_lP(:, ip) = MATMUL(fit_eigenvectors, fit_projected_rhs(:, ip))
+            END DO
+         ELSE IF (local_cholesky) THEN
+            IF (ncols_local > 0) THEN
+               local_first_col = local_first_RI - first_RI + 1
+               Z_prime_lP(:, local_first_col:local_first_col + ncols_local - 1) = &
+                  rhs(:, local_first_col:local_first_col + ncols_local - 1)
+               CALL dpotrs('U', n_grid_points, ncols_local, local_factor, n_grid_points, &
+                           Z_prime_lP(:, local_first_col:), n_grid_points, lapack_info)
+               IF (lapack_info /= 0) CPABORT('RI-RS grid fit Cholesky solve failed')
+               Y_lP(:, local_first_col:local_first_col + ncols_local - 1) = &
+                  Z_prime_lP(:, local_first_col:local_first_col + ncols_local - 1)
+               CALL dpotrs('U', n_grid_points, ncols_local, local_factor, n_grid_points, &
+                           Y_lP(:, local_first_col:), n_grid_points, lapack_info)
+               IF (lapack_info /= 0) CPABORT('RI-RS grid fit response solve failed')
+            END IF
          ELSE
-            CALL dsyrk('L', 'N', n_grid, n_ri, 1.0_dp, z_prime, n_grid, 0.0_dp, factor, n_grid)
+            CALL cp_fm_set_submatrix(fm_b, rhs)
+            CALL cp_fm_cholesky_solve(fm_D, fm_b, n=n_grid_points, info_out=lapack_info)
+            IF (lapack_info /= 0) CPABORT('RI-RS grid fit Cholesky solve failed')
+            CALL cp_fm_get_submatrix(fm_b, Z_prime_lP)
+            CALL cp_fm_cholesky_solve(fm_D, fm_b, n=n_grid_points, info_out=lapack_info)
+            IF (lapack_info /= 0) CPABORT('RI-RS grid fit response solve failed')
+            CALL cp_fm_get_submatrix(fm_b, Y_lP)
          END IF
-         DO j = 1, n_grid
-            DO i = j, n_grid
-               factor(i, j) = factor(i, j)*overlap(i, j)
+         CALL timestop(fit_solve_handle)
+         ! Keep Z′ and Y = K^(-1) Z′ for the coefficient response in the residual derivative.
+         Y_effective_lP(:, :) = Z_prime_lP + tikhonov*Y_lP
+         contributions = 0.0_dp
+         CALL timeset('rirs_fit_derivative', fit_derivative_handle)
+         DO first_pair = 1, npairs, pair_block_size
+            IF (ncols_local == 0) CYCLE
+            last_pair = MIN(first_pair + pair_block_size - 1, npairs)
+            nblock = last_pair - first_pair + 1
+            CALL fill_pair_products(Phi_l_mu, jacobi_scaling, mu_of_pair, nu_of_pair, &
+                                    pair_symmetry, first_pair, nblock, Phi_munu_l, Phi_munu_l_scaled)
+            ! The AO-pair derivatives depend on the grid and pair block, not on the RI column.
+            ! Store the local RI residuals before contracting each derivative only once.
+            local_first_col = local_first_RI - first_RI + 1
+            integral_panel(1:nblock, 1:ncols_local) = &
+               Int_3c_munu_P(first_pair:last_pair, &
+                             local_first_RI - first_owned_RI + 1:local_last_RI - first_owned_RI + 1)
+            ! K Z′ = b implies ||B-AZ′||² = ||B||² - tr(Z′^T b) - λ ||Z′||².
+            ! Form B-AZ′ explicitly here to avoid cancellation between these large terms.
+            residual(1:nblock, local_first_col:local_first_col + ncols_local - 1) = &
+               integral_panel(1:nblock, 1:ncols_local)
+            CALL dgemm('N', 'N', nblock, ncols_local, n_grid_points, -1.0_dp, &
+                       Phi_munu_l_scaled, pair_block_size, Z_prime_lP(:, local_first_col:), n_grid_points, &
+                       1.0_dp, residual(:, local_first_col:), pair_block_size)
+            CALL dgemm('N', 'N', nblock, ncols_local, n_grid_points, 1.0_dp, &
+                       Phi_munu_l_scaled, pair_block_size, Y_lP(:, local_first_col:), n_grid_points, &
+                       0.0_dp, response(:, local_first_col:), pair_block_size)
+            DO ip = local_first_RI, local_last_RI
+               jp = ip - first_RI + 1
+               contributions(1, jp) = contributions(1, jp) + &
+                                      SUM(residual(1:nblock, jp)**2)/Int_3c_norm2
+               max_abs_error = MAX(max_abs_error, &
+                                   MAXVAL(ABS(residual(1:nblock, jp))/pair_symmetry(first_pair:last_pair)))
+            END DO
+            ! Sum the RI response across the locally owned columns with matrix products.
+            CALL dgemm('N', 'T', nblock, n_grid_points, ncols_local, &
+                       2.0_dp*tikhonov/Int_3c_norm2, response(:, local_first_col:), &
+                       pair_block_size, Z_prime_lP(:, local_first_col:), n_grid_points, &
+                       0.0_dp, dE_dPhi_munu_l, pair_block_size)
+            CALL dgemm('N', 'T', nblock, n_grid_points, ncols_local, &
+                       -2.0_dp/Int_3c_norm2, residual(:, local_first_col:), &
+                       pair_block_size, Y_effective_lP(:, local_first_col:), n_grid_points, &
+                       1.0_dp, dE_dPhi_munu_l, pair_block_size)
+            DO igrid_point = 1, n_grid_points
+               jacobi_scale = jacobi_scaling(igrid_point)
+               DO icartesian = 1, 3
+                  DO i_ao_pair = 1, nblock
+                     imu = mu_of_pair(first_pair + i_ao_pair - 1)
+                     inu = nu_of_pair(first_pair + i_ao_pair - 1)
+                     dPhi_munu_l = pair_symmetry(first_pair + i_ao_pair - 1)*( &
+                                   dPhi_alpha_l_mu(icartesian, igrid_point, imu)*Phi_l_mu(igrid_point, inu) + &
+                                   Phi_l_mu(igrid_point, imu)*dPhi_alpha_l_mu(icartesian, igrid_point, inu))
+                     dPhi_munu_l_scaled(i_ao_pair) = jacobi_scale*dPhi_munu_l
+                  END DO
+                  IF (Phi_munu_norm2_l(igrid_point) > jacobi_floor) THEN
+                     scaling_projection = 2.0_dp*SUM(Phi_l_mu(igrid_point, :)**2)* &
+                                          SUM(Phi_l_mu(igrid_point, :)*dPhi_alpha_l_mu(icartesian, igrid_point, :))
+                     dPhi_munu_l_scaled(1:nblock) = dPhi_munu_l_scaled(1:nblock) - &
+                                                    jacobi_scale**3*Phi_munu_l(1:nblock, igrid_point)*scaling_projection
+                  END IF
+                  jp = local_first_RI - first_RI + 1
+                  contributions(1 + 3*(igrid_point - 1) + icartesian, jp) = &
+                     contributions(1 + 3*(igrid_point - 1) + icartesian, jp) + &
+                     DOT_PRODUCT(dE_dPhi_munu_l(1:nblock, igrid_point), dPhi_munu_l_scaled(1:nblock))
+               END DO
             END DO
          END DO
-         ! Add (M∘S)V to the accumulated negative term, then normalize the AO gradient.
-         CALL dsymm('L', 'L', n_grid, n_ao, 1.0_dp, factor, n_grid, v, n_grid, &
-                    1.0_dp, ao_gradient, n_grid)
-         ao_gradient(:, :) = (4.0_dp/integral_norm2)*ao_gradient
-         ! V_l = sqrt(d_l) phi_l. Differentiate the normalization only above the floor;
-         ! on the clamped branch d_l is constant, including at the branch boundary.
-         DO i = 1, n_grid
-            row_norm2 = DOT_PRODUCT(phi(i, :), phi(i, :))
-            IF (row_norm2 > SQRT(jacobi_floor)) THEN
-               projection = DOT_PRODUCT(phi(i, :), ao_gradient(i, :))/row_norm2
-               ao_gradient(i, :) = ao_gradient(i, :) - projection*phi(i, :)
-            END IF
-            ao_gradient(i, :) = SQRT(jacobi_scale(i))*ao_gradient(i, :)
+         CALL timestop(fit_derivative_handle)
+         DO ip = 1, ncols
+            normalized_error = normalized_error + contributions(1, ip)
+            coordinate_gradient = coordinate_gradient + RESHAPE(contributions(2:, ip), SHAPE(coordinate_gradient))
          END DO
-         CALL timestop(handle2)
-      END IF
+      END DO
+      CALL timeset('rirs_fit_contribution_sum', contribution_sum_handle)
+      contributions(1, 1) = normalized_error
+      contributions(2:, 1) = RESHAPE(coordinate_gradient, [3*n_grid_points])
+      CALL atom_env%sum(contributions(:, 1))
+      normalized_error = contributions(1, 1)
+      coordinate_gradient = RESHAPE(contributions(2:, 1), SHAPE(coordinate_gradient))
+      CALL timestop(contribution_sum_handle)
+      CALL atom_env%max(max_abs_error)
       fit_successful = .TRUE.
+      IF (local_cholesky) THEN
+         DEALLOCATE (local_factor)
+      ELSE
+         CALL cp_fm_release(fm_b)
+         CALL cp_fm_release(fm_D)
+         CALL cp_fm_struct_release(fm_struct_b)
+         CALL cp_fm_struct_release(fm_struct_D)
+         CALL cp_blacs_env_release(blacs_env)
+      END IF
+
       CALL timestop(handle)
+
    END SUBROUTINE evaluate_ri_rs_fit
+
+! **************************************************************************************************
+!> \brief Evaluate AO-pair products for the current block of pairs.
+!> \param Phi_l_mu ...
+!> \param jacobi_scaling ...
+!> \param mu_of_pair ...
+!> \param nu_of_pair ...
+!> \param pair_symmetry ...
+!> \param first_pair ...
+!> \param nblock ...
+!> \param Phi_munu_l ...
+!> \param Phi_munu_l_scaled ...
+! **************************************************************************************************
+   SUBROUTINE fill_pair_products(Phi_l_mu, jacobi_scaling, mu_of_pair, nu_of_pair, &
+                                 pair_symmetry, first_pair, nblock, Phi_munu_l, Phi_munu_l_scaled)
+      REAL(KIND=dp), INTENT(IN)                          :: Phi_l_mu(:, :), jacobi_scaling(:)
+      INTEGER, INTENT(IN)                                :: mu_of_pair(:), nu_of_pair(:)
+      REAL(KIND=dp), INTENT(IN)                          :: pair_symmetry(:)
+      INTEGER, INTENT(IN)                                :: first_pair, nblock
+      REAL(KIND=dp), INTENT(OUT)                         :: Phi_munu_l(:, :), Phi_munu_l_scaled(:, :)
+
+      INTEGER                                            :: i_ao_pair, igrid_point, imu, inu
+
+      DO igrid_point = 1, SIZE(Phi_l_mu, 1)
+         DO i_ao_pair = 1, nblock
+            imu = mu_of_pair(first_pair + i_ao_pair - 1)
+            inu = nu_of_pair(first_pair + i_ao_pair - 1)
+            Phi_munu_l(i_ao_pair, igrid_point) = &
+               pair_symmetry(first_pair + i_ao_pair - 1)* &
+               Phi_l_mu(igrid_point, imu)*Phi_l_mu(igrid_point, inu)
+         END DO
+         Phi_munu_l_scaled(1:nblock, igrid_point) = &
+            jacobi_scaling(igrid_point)*Phi_munu_l(1:nblock, igrid_point)
+      END DO
+   END SUBROUTINE fill_pair_products
 
 ! **************************************************************************************************
 !> \brief Multiplies every matrix row by the corresponding diagonal entry:

@@ -1043,7 +1043,8 @@ CONTAINS
                .OR. (potential_type == do_potential_id .AND. qs_env%mp2_env%eri_method == do_eri_mme)) THEN
 
          CALL mp2_eri_2c_integrate_gpw(qs_env, para_env_sub, my_group_L_start, my_group_L_end, &
-                                       natom, potential, sab_orb_sub, L_local_col, kind_of)
+                                       [qs_env%mp2_env%mp2_gpw%cutoff, qs_env%mp2_env%mp2_gpw%relative_cutoff]*0.5_dp, &
+                                       potential, sab_orb_sub, L_local_col, kind_of)
 
       ELSE
          CPABORT("unknown ERI method")

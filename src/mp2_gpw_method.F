@@ -50,7 +50,8 @@ MODULE mp2_gpw_method
    USE pw_types,                        ONLY: pw_c1d_gs_type,&
                                               pw_r3d_rs_type
    USE qs_collocate_density,            ONLY: collocate_function
-   USE qs_environment_types,            ONLY: qs_environment_type
+   USE qs_environment_types,            ONLY: get_qs_env,&
+                                              qs_environment_type
    USE qs_integrate_potential,          ONLY: integrate_v_rspace
    USE qs_kind_types,                   ONLY: qs_kind_type
    USE qs_neighbor_list_types,          ONLY: neighbor_list_set_p_type
@@ -214,7 +215,10 @@ CONTAINS
       END IF
 
       ! Get everything for GPW calculations
-      CALL prepare_gpw(qs_env, dft_control, e_cutoff_old, cutoff_old, relative_cutoff_old, para_env_sub, pw_env_sub, &
+      CALL get_qs_env(qs_env, dft_control=dft_control)
+      CALL prepare_gpw(qs_env, &
+                       [qs_env%mp2_env%mp2_gpw%cutoff, qs_env%mp2_env%mp2_gpw%relative_cutoff]*0.5_dp, &
+                       e_cutoff_old, cutoff_old, relative_cutoff_old, para_env_sub, pw_env_sub, &
                        auxbas_pw_pool, poisson_env, task_list_sub, rho_r, rho_g, pot_g, psi_a, sab_orb_sub)
 
       wfn_size = REAL(SIZE(rho_r%array), KIND=dp)
