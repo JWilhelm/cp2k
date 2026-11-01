@@ -117,15 +117,15 @@ CONTAINS
 ! **************************************************************************************************
    SUBROUTINE compute_d_lP_R(bs_env, grid_points, cells_R_d_lP, d_lP_R, &
                              qpoints, charge_lq)
-      TYPE(post_scf_bandstructure_type), POINTER      :: bs_env
-      REAL(dp), INTENT(IN)                            :: grid_points(:, :)
-      INTEGER, INTENT(IN)                             :: cells_R_d_lP(:, :)
-      REAL(dp), ALLOCATABLE, INTENT(OUT)              :: d_lP_R(:, :, :)
-      REAL(dp), INTENT(IN), OPTIONAL                  :: qpoints(:, :)
-      COMPLEX(dp), ALLOCATABLE, INTENT(OUT), OPTIONAL :: charge_lq(:, :)
+      TYPE(post_scf_bandstructure_type), POINTER         :: bs_env
+      REAL(dp), INTENT(IN)                               :: grid_points(:, :)
+      INTEGER, INTENT(IN)                                :: cells_R_d_lP(:, :)
+      REAL(dp), ALLOCATABLE, INTENT(OUT)                 :: d_lP_R(:, :, :)
+      REAL(dp), INTENT(IN), OPTIONAL                     :: qpoints(:, :)
+      COMPLEX(dp), ALLOCATABLE, INTENT(OUT), OPTIONAL    :: charge_lq(:, :)
 
-      INTEGER                                         :: first_l, handle, last_l, n_P
-      TYPE(uniform_settings_type)                     :: settings
+      INTEGER                                            :: first_l, handle, last_l, n_P
+      TYPE(uniform_settings_type)                        :: settings
 
       IF (bs_env%unit_nr > 0) THEN
          WRITE (bs_env%unit_nr, '(T2,A,T72,A9)') 'd_lP method', 'NUMERICAL'
@@ -166,13 +166,13 @@ CONTAINS
 !> \param cutoffs ...
 ! **************************************************************************************************
    SUBROUTINE compute_d_lP_cutoffs(bs_env, cutoffs)
-      TYPE(post_scf_bandstructure_type), POINTER :: bs_env
-      REAL(dp), ALLOCATABLE, INTENT(OUT)         :: cutoffs(:)
+      TYPE(post_scf_bandstructure_type), POINTER         :: bs_env
+      REAL(dp), ALLOCATABLE, INTENT(OUT)                 :: cutoffs(:)
 
-      INTEGER                                    :: iatom, ikind
-      REAL(dp)                                   :: accuracy, ao_max, ao_min, ri_max, ri_min
-      TYPE(gto_basis_set_type), POINTER          :: basis
-      TYPE(particle_type), POINTER               :: particles(:)
+      INTEGER                                            :: iatom, ikind
+      REAL(dp)                                           :: accuracy, ao_max, ao_min, ri_max, ri_min
+      TYPE(gto_basis_set_type), POINTER                  :: basis
+      TYPE(particle_type), POINTER                       :: particles(:)
 
       particles => bs_env%ri_rs%particle_set
       accuracy = d_lP_integration_accuracy(bs_env)
@@ -203,8 +203,8 @@ CONTAINS
 !> \param last_l Last locally owned grid row.
 ! **************************************************************************************************
    SUBROUTINE get_local_l_range(n_grid, n_ranks, i_rank, first_l, last_l)
-      INTEGER, INTENT(IN)  :: n_grid, n_ranks, i_rank
-      INTEGER, INTENT(OUT) :: first_l, last_l
+      INTEGER, INTENT(IN)                                :: n_grid, n_ranks, i_rank
+      INTEGER, INTENT(OUT)                               :: first_l, last_l
 
       CPASSERT(i_rank >= 0 .AND. i_rank < n_ranks)
       first_l = INT(INT(n_grid, int_8)*INT(i_rank, int_8)/INT(n_ranks, int_8)) + 1
@@ -223,22 +223,22 @@ CONTAINS
 !> \param phase_start ...
 ! **************************************************************************************************
    SUBROUTINE write_ri_rs_progress(unit_nr, phase, n_done, n_total, next_progress, phase_start)
-      INTEGER, INTENT(IN)             :: unit_nr
-      CHARACTER(LEN=*), INTENT(IN)    :: phase
-      INTEGER(KIND=int_8), INTENT(IN) :: n_done, n_total
-      INTEGER, INTENT(INOUT)          :: next_progress
-      REAL(KIND=dp), INTENT(IN)       :: phase_start
+      INTEGER, INTENT(IN)                                :: unit_nr
+      CHARACTER(LEN=*), INTENT(IN)                       :: phase
+      INTEGER(KIND=int_8), INTENT(IN)                    :: n_done, n_total
+      INTEGER, INTENT(INOUT)                             :: next_progress
+      REAL(KIND=dp), INTENT(IN)                          :: phase_start
 
-      REAL(KIND=dp), PARAMETER        :: milestones(9) = [0.1_dp, 0.3_dp, 1.0_dp, 3.0_dp, 10.0_dp, 30.0_dp , 60.0_dp, 90.0_dp, &
-                                         100.0_dp]
+      REAL(KIND=dp), PARAMETER :: milestones(9) = [0.1_dp, 0.3_dp, 1.0_dp, 3.0_dp, 10.0_dp, 30.0_dp&
+         , 60.0_dp, 90.0_dp, 100.0_dp]
 
-      CHARACTER(LEN=100)              :: progress_line
-      CHARACTER(LEN=20)               :: count_text
-      CHARACTER(LEN=32)               :: phase_text
-      CHARACTER(LEN=64)               :: progress_format
-      CHARACTER(LEN=8)                :: time_text
-      INTEGER                         :: count_width, previous_progress
-      REAL(KIND=dp)                   :: percent_done, phase_time
+      CHARACTER(LEN=100)                                 :: progress_line
+      CHARACTER(LEN=20)                                  :: count_text
+      CHARACTER(LEN=32)                                  :: phase_text
+      CHARACTER(LEN=64)                                  :: progress_format
+      CHARACTER(LEN=8)                                   :: time_text
+      INTEGER                                            :: count_width, previous_progress
+      REAL(KIND=dp)                                      :: percent_done, phase_time
 
       IF (unit_nr <= 0 .OR. n_total <= 0) RETURN
       percent_done = 100.0_dp*REAL(n_done, dp)/REAL(n_total, dp)
@@ -519,16 +519,16 @@ CONTAINS
 !> \param charge_lq ...
 ! **************************************************************************************************
    SUBROUTINE accumulate_fourier_charge(points, field, q_cart, weight, charge_lq)
-      REAL(dp), INTENT(IN)             :: points(:, :)
-      REAL(dp), CONTIGUOUS, INTENT(IN) :: field(:, :)
-      REAL(dp), INTENT(IN)             :: q_cart(:, :), weight
-      COMPLEX(dp), INTENT(INOUT)       :: charge_lq(:, :)
+      REAL(dp), INTENT(IN)                               :: points(:, :)
+      REAL(dp), CONTIGUOUS, INTENT(IN)                   :: field(:, :)
+      REAL(dp), INTENT(IN)                               :: q_cart(:, :), weight
+      COMPLEX(dp), INTENT(INOUT)                         :: charge_lq(:, :)
 
-      INTEGER, PARAMETER               :: row_block = 64
+      INTEGER, PARAMETER                                 :: row_block = 64
 
-      COMPLEX(dp)                      :: phase
-      INTEGER                          :: first_l, ig, il, iq, nblock, ng, nl, nq
-      REAL(dp), ALLOCATABLE            :: charge_parts(:, :), phase_parts(:, :)
+      COMPLEX(dp)                                        :: phase
+      INTEGER                                            :: first_l, ig, il, iq, nblock, ng, nl, nq
+      REAL(dp), ALLOCATABLE                              :: charge_parts(:, :), phase_parts(:, :)
 
       ng = SIZE(points, 2)
       nl = SIZE(field, 2)
@@ -577,14 +577,15 @@ CONTAINS
 !> \param report ...
 ! **************************************************************************************************
    SUBROUTINE prepare_d_lP_integration_grid(bs_env, grid_points, settings, report)
-      TYPE(post_scf_bandstructure_type), POINTER :: bs_env
-      REAL(dp), INTENT(IN)                       :: grid_points(:, :)
-      TYPE(uniform_settings_type), INTENT(OUT)   :: settings
-      LOGICAL, INTENT(IN), OPTIONAL              :: report
+      TYPE(post_scf_bandstructure_type), POINTER         :: bs_env
+      REAL(dp), INTENT(IN)                               :: grid_points(:, :)
+      TYPE(uniform_settings_type), INTENT(OUT)           :: settings
+      LOGICAL, INTENT(IN), OPTIONAL                      :: report
 
-      INTEGER(int_8)                             :: npoints
-      LOGICAL                                    :: report_settings
-      REAL(dp)                                   :: exponent_max, exponent_min, padding_safety, spacing_prefactor
+      INTEGER(int_8)                                     :: npoints
+      LOGICAL                                            :: report_settings
+      REAL(dp)                                           :: exponent_max, exponent_min, &
+                                                            padding_safety, spacing_prefactor
 
       settings%accuracy = d_lP_integration_accuracy(bs_env)
       IF (bs_env%ri_metric%potential_type /= do_potential_coulomb .AND. &
@@ -621,15 +622,16 @@ CONTAINS
 !> \param settings ...
 ! **************************************************************************************************
    SUBROUTINE build_d_lP_integration_grid(bs_env, grid_points, settings)
-      TYPE(post_scf_bandstructure_type), POINTER :: bs_env
-      REAL(dp), INTENT(IN)                       :: grid_points(:, :)
-      TYPE(uniform_settings_type), INTENT(INOUT) :: settings
+      TYPE(post_scf_bandstructure_type), POINTER         :: bs_env
+      REAL(dp), INTENT(IN)                               :: grid_points(:, :)
+      TYPE(uniform_settings_type), INTENT(INOUT)         :: settings
 
-      INTEGER                                    :: idir, subdivisions(3)
-      REAL(dp)                                   :: box_center(3), box_extent(3), eigenvalues(3), inverse_step(3, 3), &
-                                                    metric(3, 3), scale, upper(3)
-      TYPE(cell_type), POINTER                   :: cell
-      TYPE(particle_type), POINTER               :: particles(:)
+      INTEGER                                            :: idir, subdivisions(3)
+      REAL(dp)                                           :: box_center(3), box_extent(3), &
+                                                            eigenvalues(3), inverse_step(3, 3), &
+                                                            metric(3, 3), scale, upper(3)
+      TYPE(cell_type), POINTER                           :: cell
+      TYPE(particle_type), POINTER                       :: particles(:)
 
       CPASSERT(SIZE(grid_points, 1) == 3 .AND. SIZE(grid_points, 2) > 0)
       CPASSERT(settings%spacing > 0.0_dp)
@@ -686,12 +688,13 @@ CONTAINS
 !> \param blocks ...
 ! **************************************************************************************************
    SUBROUTINE group_points_l_by_position(grid_points, edge, blocks)
-      REAL(dp), INTENT(IN)                      :: grid_points(:, :), edge
-      TYPE(l_block_partition_type), INTENT(OUT) :: blocks
+      REAL(dp), INTENT(IN)                               :: grid_points(:, :), edge
+      TYPE(l_block_partition_type), INTENT(OUT)          :: blocks
 
-      INTEGER                                   :: cube(3), iblock, idir, il, insert
-      INTEGER, ALLOCATABLE                      :: block_of_l(:), counts(:), cubes(:, :), next(:)
-      REAL(dp)                                  :: origin(3)
+      INTEGER                                            :: cube(3), iblock, idir, il, insert
+      INTEGER, ALLOCATABLE                               :: block_of_l(:), counts(:), cubes(:, :), &
+                                                            next(:)
+      REAL(dp)                                           :: origin(3)
 
       CPASSERT(edge > 0.0_dp)
       origin = MINVAL(grid_points, DIM=2)
@@ -746,12 +749,12 @@ CONTAINS
 !> \param exponent_max ...
 ! **************************************************************************************************
    SUBROUTINE ao_exponent_range(bs_env, exponent_min, exponent_max)
-      TYPE(post_scf_bandstructure_type), POINTER :: bs_env
-      REAL(dp), INTENT(OUT)                      :: exponent_min, exponent_max
+      TYPE(post_scf_bandstructure_type), POINTER         :: bs_env
+      REAL(dp), INTENT(OUT)                              :: exponent_min, exponent_max
 
-      INTEGER                                    :: ikind, ipgf, iset
-      REAL(dp)                                   :: exponent
-      TYPE(gto_basis_set_type), POINTER          :: basis
+      INTEGER                                            :: ikind, ipgf, iset
+      REAL(dp)                                           :: exponent
+      TYPE(gto_basis_set_type), POINTER                  :: basis
 
       exponent_min = HUGE(1.0_dp)
       exponent_max = 0.0_dp
@@ -779,8 +782,8 @@ CONTAINS
 !> \return ...
 ! **************************************************************************************************
    FUNCTION d_lP_integration_accuracy(bs_env) RESULT(accuracy)
-      TYPE(post_scf_bandstructure_type), POINTER :: bs_env
-      REAL(dp)                                   :: accuracy
+      TYPE(post_scf_bandstructure_type), POINTER         :: bs_env
+      REAL(dp)                                           :: accuracy
 
       IF (.NOT. ieee_is_finite(bs_env%eps_filter) .OR. &
           bs_env%eps_filter <= 0.0_dp .OR. bs_env%eps_filter >= 1.0_dp) THEN
@@ -797,11 +800,11 @@ CONTAINS
 !> \param exponent_max ...
 ! **************************************************************************************************
    SUBROUTINE basis_exponent_range(basis, exponent_min, exponent_max)
-      TYPE(gto_basis_set_type), POINTER :: basis
-      REAL(dp), INTENT(OUT)             :: exponent_min, exponent_max
+      TYPE(gto_basis_set_type), POINTER                  :: basis
+      REAL(dp), INTENT(OUT)                              :: exponent_min, exponent_max
 
-      INTEGER                           :: ipgf, iset
-      REAL(dp)                          :: exponent
+      INTEGER                                            :: ipgf, iset
+      REAL(dp)                                           :: exponent
 
       CPASSERT(ASSOCIATED(basis))
       exponent_min = HUGE(1.0_dp)
@@ -854,41 +857,42 @@ CONTAINS
 ! **************************************************************************************************
    SUBROUTINE integrate_d_lP_R(bs_env, grid_points, cells_R_d_lP, settings, d_lP_R, first_l, &
                                qpoints, charge_lq)
-      TYPE(post_scf_bandstructure_type), POINTER   :: bs_env
-      REAL(dp), INTENT(IN)                         :: grid_points(:, :)
-      INTEGER, INTENT(IN)                          :: cells_R_d_lP(:, :)
-      TYPE(uniform_settings_type), INTENT(IN)      :: settings
-      REAL(dp), INTENT(OUT)                        :: d_lP_R(:, :, :)
-      INTEGER, INTENT(IN)                          :: first_l
-      REAL(dp), INTENT(IN), OPTIONAL               :: qpoints(:, :)
-      COMPLEX(dp), INTENT(OUT), OPTIONAL           :: charge_lq(:, :)
+      TYPE(post_scf_bandstructure_type), POINTER         :: bs_env
+      REAL(dp), INTENT(IN)                               :: grid_points(:, :)
+      INTEGER, INTENT(IN)                                :: cells_R_d_lP(:, :)
+      TYPE(uniform_settings_type), INTENT(IN)            :: settings
+      REAL(dp), INTENT(OUT)                              :: d_lP_R(:, :, :)
+      INTEGER, INTENT(IN)                                :: first_l
+      REAL(dp), INTENT(IN), OPTIONAL                     :: qpoints(:, :)
+      COMPLEX(dp), INTENT(OUT), OPTIONAL                 :: charge_lq(:, :)
 
-      INTEGER, PARAMETER                           :: quadrature_block_edge = 8, &
-                                                      quadrature_block_size = quadrature_block_edge**3
+      INTEGER, PARAMETER :: quadrature_block_edge = 8, &
+         quadrature_block_size = quadrature_block_edge**3
 
-      INTEGER                                      :: counts(3), handle, iatom, ibatch, iblock, idir, ig, igroup, il, &
-                                                      indices(quadrature_block_size), integration_rank, irank, it, last_rank, &
-                                                      next_progress, ngroups, nkeep, nl, np, npoints, nranks, nreceived, &
-                                                      position, quadrature_block_counts(3), quadrature_block_first(3), &
-                                                      quadrature_block_points(3), rank, ranks_per_batch
-      INTEGER(int_8)                               :: block_contractions, coalesced_contractions, contraction_products, &
-                                                      index_grid, iquadrature_block, iround, n_completed_quadrature_blocks, &
-                                                      n_local_quadrature_blocks, nquadrature_blocks, nrounds, ntotal, &
-                                                      potential_points, screened_blocks
-      INTEGER, ALLOCATABLE                         :: kept_per_rank(:), local_cells(:, :), recv_counts(:), recv_offsets(:)
-      LOGICAL, ALLOCATABLE                         :: include_l_blocks_P_R(:, :, :), include_lP_R(:, :, :)
-      REAL(dp)                                     :: bound, discarded, elapsed, field_bound(quadrature_block_size), lower(3), &
-                                                      mesh_index(3), omitted, points(3, quadrature_block_size), prep_start, &
-                                                      RI_center_R(3), threshold, weight
-      REAL(dp), ALLOCATABLE                        :: cutoffs_lP(:), cyclic_d_lP_R(:, :, :), envelopes(:, :), &
-                                                      local_d_lP_R(:, :, :), q_cart(:, :), receive_fields(:), send_fields(:)
-      REAL(dp)                                     :: field(quadrature_block_size, SIZE(grid_points, 2))
-      TYPE(ao_image_type), ALLOCATABLE             :: images(:)
-      TYPE(cell_type), POINTER                     :: cell
-      TYPE(l_block_partition_type)                 :: blocks
-      TYPE(mp_comm_type)                           :: field_comm, integration_comm
-      TYPE(particle_type), POINTER                 :: particles(:)
-      TYPE(radial_interpolation_type), ALLOCATABLE :: aux_potentials(:)
+      INTEGER :: counts(3), handle, iatom, ibatch, iblock, idir, ig, igroup, il, &
+         indices(quadrature_block_size), integration_rank, irank, it, last_rank, next_progress, &
+         ngroups, nkeep, nl, np, npoints, nranks, nreceived, position, quadrature_block_counts(3), &
+         quadrature_block_first(3), quadrature_block_points(3), rank, ranks_per_batch
+      INTEGER(int_8) :: block_contractions, coalesced_contractions, contraction_products, &
+         index_grid, iquadrature_block, iround, n_completed_quadrature_blocks, &
+         n_local_quadrature_blocks, nquadrature_blocks, nrounds, ntotal, potential_points, &
+         screened_blocks
+      INTEGER, ALLOCATABLE                               :: kept_per_rank(:), local_cells(:, :), &
+                                                            recv_counts(:), recv_offsets(:)
+      LOGICAL, ALLOCATABLE                               :: include_l_blocks_P_R(:, :, :), &
+                                                            include_lP_R(:, :, :)
+      REAL(dp) :: bound, discarded, elapsed, field_bound(quadrature_block_size), lower(3), &
+         mesh_index(3), omitted, points(3, quadrature_block_size), prep_start, RI_center_R(3), &
+         threshold, weight
+      REAL(dp), ALLOCATABLE :: cutoffs_lP(:), cyclic_d_lP_R(:, :, :), envelopes(:, :), &
+         local_d_lP_R(:, :, :), q_cart(:, :), receive_fields(:), send_fields(:)
+      REAL(dp) :: field(quadrature_block_size, SIZE(grid_points, 2))
+      TYPE(ao_image_type), ALLOCATABLE                   :: images(:)
+      TYPE(cell_type), POINTER                           :: cell
+      TYPE(l_block_partition_type)                       :: blocks
+      TYPE(mp_comm_type)                                 :: field_comm, integration_comm
+      TYPE(particle_type), POINTER                       :: particles(:)
+      TYPE(radial_interpolation_type), ALLOCATABLE       :: aux_potentials(:)
 
       IF (bs_env%unit_nr > 0) THEN
          WRITE (bs_env%unit_nr, '(T2,A)') 'dLP timing guide (details in final timing table):'
@@ -1144,18 +1148,19 @@ CONTAINS
 !> \param aux_potentials ...
 ! **************************************************************************************************
    SUBROUTINE prepare_auto_ri_potentials(bs_env, settings, aux_potentials)
-      TYPE(post_scf_bandstructure_type), POINTER :: bs_env
-      TYPE(uniform_settings_type), INTENT(IN)    :: settings
+      TYPE(post_scf_bandstructure_type), POINTER         :: bs_env
+      TYPE(uniform_settings_type), INTENT(IN)            :: settings
       TYPE(radial_interpolation_type), ALLOCATABLE, &
          INTENT(OUT)                                     :: aux_potentials(:)
 
-      CHARACTER(LEN=12)                          :: spacing_text
-      INTEGER                                    :: first_U, iatom, ikind, nmesh, np, nref
-      REAL(dp)                                   :: cutoff, mesh_bytes, mesh_displacement(3), mesh_spacing
-      REAL(dp), ALLOCATABLE                      :: U_Pp(:, :)
-      TYPE(cell_type), POINTER                   :: cell
-      TYPE(gto_basis_set_type), POINTER          :: basis
-      TYPE(particle_type), POINTER               :: particles(:)
+      CHARACTER(LEN=12)                                  :: spacing_text
+      INTEGER                                            :: first_U, iatom, ikind, nmesh, np, nref
+      REAL(dp)                                           :: cutoff, mesh_bytes, &
+                                                            mesh_displacement(3), mesh_spacing
+      REAL(dp), ALLOCATABLE                              :: U_Pp(:, :)
+      TYPE(cell_type), POINTER                           :: cell
+      TYPE(gto_basis_set_type), POINTER                  :: basis
+      TYPE(particle_type), POINTER                       :: particles(:)
 
       IF (.NOT. bs_env%auto_ri%enabled) RETURN
       particles => bs_env%ri_rs%particle_set
@@ -1206,16 +1211,16 @@ CONTAINS
 !> \param images ...
 ! **************************************************************************************************
    SUBROUTINE prepare_ao_images(bs_env, grid_points, images)
-      TYPE(post_scf_bandstructure_type), POINTER    :: bs_env
-      REAL(dp), INTENT(IN)                          :: grid_points(:, :)
-      TYPE(ao_image_type), ALLOCATABLE, INTENT(OUT) :: images(:)
+      TYPE(post_scf_bandstructure_type), POINTER         :: bs_env
+      REAL(dp), INTENT(IN)                               :: grid_points(:, :)
+      TYPE(ao_image_type), ALLOCATABLE, INTENT(OUT)      :: images(:)
 
-      INTEGER                                       :: iatom, icell, iimage, ikind, maxao, nao
-      REAL(dp)                                      :: center(3), cutoff2
-      REAL(dp), ALLOCATABLE                         :: primary(:, :)
-      TYPE(cell_type), POINTER                      :: cell
-      TYPE(gto_basis_set_type), POINTER             :: basis
-      TYPE(particle_type), POINTER                  :: particles(:)
+      INTEGER                                            :: iatom, icell, iimage, ikind, maxao, nao
+      REAL(dp)                                           :: center(3), cutoff2
+      REAL(dp), ALLOCATABLE                              :: primary(:, :)
+      TYPE(cell_type), POINTER                           :: cell
+      TYPE(gto_basis_set_type), POINTER                  :: basis
+      TYPE(particle_type), POINTER                       :: particles(:)
 
       cell => bs_env%ri_rs%cell
       particles => bs_env%ri_rs%particle_set
@@ -1253,11 +1258,11 @@ CONTAINS
 !> \param image ...
 ! **************************************************************************************************
    SUBROUTINE pack_nonzero_ao_rows(image)
-      TYPE(ao_image_type), INTENT(INOUT) :: image
+      TYPE(ao_image_type), INTENT(INOUT)                 :: image
 
-      INTEGER                            :: il, ipacked, nkeep, nl
-      LOGICAL, ALLOCATABLE               :: nonzero(:)
-      REAL(dp), ALLOCATABLE              :: primary(:, :)
+      INTEGER                                            :: il, ipacked, nkeep, nl
+      LOGICAL, ALLOCATABLE                               :: nonzero(:)
+      REAL(dp), ALLOCATABLE                              :: primary(:, :)
 
       CPASSERT(ALLOCATED(image%primary))
       CPASSERT(.NOT. ALLOCATED(image%primary_l))
@@ -1286,12 +1291,13 @@ CONTAINS
 !> \param image ...
 ! **************************************************************************************************
    SUBROUTINE bound_ao_image(image)
-      TYPE(ao_image_type), INTENT(INOUT) :: image
+      TYPE(ao_image_type), INTENT(INOUT)                 :: image
 
-      INTEGER                            :: ico, idir, il, ipgf, irow, iset, isgf, ncart, power
-      REAL(dp)                           :: amplitude, exponent, factor
-      REAL(dp), ALLOCATABLE              :: ao_bound(:)
-      TYPE(gto_basis_set_type), POINTER  :: basis
+      INTEGER                                            :: ico, idir, il, ipgf, irow, iset, isgf, &
+                                                            ncart, power
+      REAL(dp)                                           :: amplitude, exponent, factor
+      REAL(dp), ALLOCATABLE                              :: ao_bound(:)
+      TYPE(gto_basis_set_type), POINTER                  :: basis
 
       basis => image%basis
       image%decay = HUGE(0.0_dp)
@@ -1335,12 +1341,13 @@ CONTAINS
 !> \param image ...
 ! **************************************************************************************************
    SUBROUTINE prepare_ao_radial_envelope(image)
-      TYPE(ao_image_type), INTENT(INOUT) :: image
+      TYPE(ao_image_type), INTENT(INOUT)                 :: image
 
-      INTEGER                            :: ico, idegree, idir, iexponent, il, ipgf, irow, iset, isgf, ncart, power
-      REAL(dp)                           :: amplitude, angular_factor
-      REAL(dp), ALLOCATABLE              :: ao_weight(:)
-      TYPE(gto_basis_set_type), POINTER  :: basis
+      INTEGER                                            :: ico, idegree, idir, iexponent, il, ipgf, &
+                                                            irow, iset, isgf, ncart, power
+      REAL(dp)                                           :: amplitude, angular_factor
+      REAL(dp), ALLOCATABLE                              :: ao_weight(:)
+      TYPE(gto_basis_set_type), POINTER                  :: basis
 
       CPASSERT(ASSOCIATED(image%basis))
       CPASSERT(ALLOCATED(image%primary))
@@ -1394,12 +1401,13 @@ CONTAINS
 !> \return ...
 ! **************************************************************************************************
    PURE FUNCTION bound_ao_image_distance(image, distance_squared) RESULT(bound)
-      TYPE(ao_image_type), INTENT(IN) :: image
-      REAL(dp), INTENT(IN)            :: distance_squared
-      REAL(dp)                        :: bound
+      TYPE(ao_image_type), INTENT(IN)                    :: image
+      REAL(dp), INTENT(IN)                               :: distance_squared
+      REAL(dp)                                           :: bound
 
-      INTEGER                         :: idegree, iexponent, lmax
-      REAL(dp)                        :: exponent, polynomial, radius, radius_squared
+      INTEGER                                            :: idegree, iexponent, lmax
+      REAL(dp)                                           :: exponent, polynomial, radius, &
+                                                            radius_squared
 
       IF (.NOT. ALLOCATED(image%radial_envelope)) THEN
          bound = image%bound*EXP(-image%decay*distance_squared)
@@ -1434,11 +1442,11 @@ CONTAINS
 !> \param tolerance ...
 ! **************************************************************************************************
    SUBROUTINE screen_ao_images(images, tolerance)
-      TYPE(ao_image_type), INTENT(INOUT) :: images(:)
-      REAL(dp), INTENT(IN)               :: tolerance
+      TYPE(ao_image_type), INTENT(INOUT)                 :: images(:)
+      REAL(dp), INTENT(IN)                               :: tolerance
 
-      INTEGER                            :: iimage, nimages
-      REAL(dp)                           :: amplitude, delta
+      INTEGER                                            :: iimage, nimages
+      REAL(dp)                                           :: amplitude, delta
 
       nimages = 0
       amplitude = 0.0_dp
@@ -1468,13 +1476,13 @@ CONTAINS
 !> \param field_accuracy ...
 ! **************************************************************************************************
    SUBROUTINE evaluate_rho_l_squared(images, points, field_squared, field_accuracy)
-      TYPE(ao_image_type), INTENT(IN) :: images(:)
-      REAL(dp), INTENT(IN)            :: points(:, :)
-      REAL(dp), INTENT(OUT)           :: field_squared(:, :)
-      REAL(dp), INTENT(IN), OPTIONAL  :: field_accuracy
+      TYPE(ao_image_type), INTENT(IN)                    :: images(:)
+      REAL(dp), INTENT(IN)                               :: points(:, :)
+      REAL(dp), INTENT(OUT)                              :: field_squared(:, :)
+      REAL(dp), INTENT(IN), OPTIONAL                     :: field_accuracy
 
-      INTEGER                         :: first, last, nblock, ng, nthreads
-      REAL(dp)                        :: tolerance
+      INTEGER                                            :: first, last, nblock, ng, nthreads
+      REAL(dp)                                           :: tolerance
 
       tolerance = 0.0_dp
       IF (PRESENT(field_accuracy)) tolerance = field_accuracy
@@ -1503,15 +1511,18 @@ CONTAINS
 !> \param field_accuracy ...
 ! **************************************************************************************************
    SUBROUTINE evaluate_rho_l_squared_block(images, points, field_squared, field_accuracy)
-      TYPE(ao_image_type), INTENT(IN) :: images(:)
-      REAL(dp), INTENT(IN)            :: points(:, :)
-      REAL(dp), INTENT(OUT)           :: field_squared(:, :)
-      REAL(dp), INTENT(IN), OPTIONAL  :: field_accuracy
+      TYPE(ao_image_type), INTENT(IN)                    :: images(:)
+      REAL(dp), INTENT(IN)                               :: points(:, :)
+      REAL(dp), INTENT(OUT)                              :: field_squared(:, :)
+      REAL(dp), INTENT(IN), OPTIONAL                     :: field_accuracy
 
-      INTEGER                         :: handle, iimage, il, nao, ng, nimages, nl, nprimary
-      REAL(dp)                        :: amplitude, delta, lower(3), root_tolerance, tolerance, upper(3)
-      REAL(dp), ALLOCATABLE           :: field(:, :), image_field(:, :), values(:, :)
-      REAL(dp)                        :: image_bounds(SIZE(images))
+      INTEGER                                            :: handle, iimage, il, nao, ng, nimages, &
+                                                            nl, nprimary
+      REAL(dp)                                           :: amplitude, delta, lower(3), &
+                                                            root_tolerance, tolerance, upper(3)
+      REAL(dp), ALLOCATABLE                              :: field(:, :), image_field(:, :), &
+                                                            values(:, :)
+      REAL(dp)                                           :: image_bounds(SIZE(images))
 
       tolerance = 0.0_dp
       IF (PRESENT(field_accuracy)) tolerance = field_accuracy
@@ -1586,16 +1597,19 @@ CONTAINS
 !> \param center ...
 ! **************************************************************************************************
    SUBROUTINE evaluate_mu_r_values(values, points, basis, center)
-      REAL(dp), INTENT(OUT)             :: values(:, :)
-      REAL(dp), INTENT(IN)              :: points(:, :)
-      TYPE(gto_basis_set_type), POINTER :: basis
-      REAL(dp), INTENT(IN)              :: center(3)
+      REAL(dp), INTENT(OUT)                              :: values(:, :)
+      REAL(dp), INTENT(IN)                               :: points(:, :)
+      TYPE(gto_basis_set_type), POINTER                  :: basis
+      REAL(dp), INTENT(IN)                               :: center(3)
 
-      INTEGER                           :: first_sgf, ico, ig, ipgf, ipower, iset, last_sgf, ncart, ng, nprimitive
-      INTEGER, ALLOCATABLE              :: offsets(:)
-      LOGICAL                           :: parallel_points
-      REAL(dp)                          :: relative(3)
-      REAL(dp), ALLOCATABLE             :: coordinate_power(:, :), exponential(:), monomial(:, :), primitive(:, :), radius2(:)
+      INTEGER                                            :: first_sgf, ico, ig, ipgf, ipower, iset, &
+                                                            last_sgf, ncart, ng, nprimitive
+      INTEGER, ALLOCATABLE                               :: offsets(:)
+      LOGICAL                                            :: parallel_points
+      REAL(dp)                                           :: relative(3)
+      REAL(dp), ALLOCATABLE                              :: coordinate_power(:, :), exponential(:), &
+                                                            monomial(:, :), primitive(:, :), &
+                                                            radius2(:)
 
       CPASSERT(ASSOCIATED(basis))
       ng = SIZE(points, 2)
@@ -1671,18 +1685,19 @@ CONTAINS
 !> \param envelopes ...
 ! **************************************************************************************************
    SUBROUTINE auxiliary_potential_bound(bs_env, aux_potentials, envelopes)
-      TYPE(post_scf_bandstructure_type), POINTER :: bs_env
+      TYPE(post_scf_bandstructure_type), POINTER         :: bs_env
       TYPE(radial_interpolation_type), ALLOCATABLE, &
          INTENT(IN)                                      :: aux_potentials(:)
-      REAL(dp), ALLOCATABLE, INTENT(OUT)         :: envelopes(:, :)
+      REAL(dp), ALLOCATABLE, INTENT(OUT)                 :: envelopes(:, :)
 
-      INTEGER                                    :: iatom, ico, idir, ikind, ipgf, irow, irow_packed, iset, isgf, ishell, l, &
-                                                    ncart, power
-      LOGICAL, ALLOCATABLE                       :: angular_used(:)
-      REAL(dp)                                   :: exponent, factor
-      REAL(dp), ALLOCATABLE                      :: bounds(:)
-      TYPE(gto_basis_set_type), POINTER          :: basis
-      TYPE(particle_type), POINTER               :: particles(:)
+      INTEGER                                            :: iatom, ico, idir, ikind, ipgf, irow, &
+                                                            irow_packed, iset, isgf, ishell, l, &
+                                                            ncart, power
+      LOGICAL, ALLOCATABLE                               :: angular_used(:)
+      REAL(dp)                                           :: exponent, factor
+      REAL(dp), ALLOCATABLE                              :: bounds(:)
+      TYPE(gto_basis_set_type), POINTER                  :: basis
+      TYPE(particle_type), POINTER                       :: particles(:)
 
       particles => bs_env%ri_rs%particle_set
       ALLOCATE (envelopes(3, bs_env%n_atom))
@@ -1781,32 +1796,41 @@ CONTAINS
                                    envelopes, blocks, threshold, omitted, potential_points, block_contractions, &
                                    screened_blocks, coalesced_contractions, contraction_products, d_lP_R, &
                                    aux_potentials)
-      TYPE(post_scf_bandstructure_type), POINTER :: bs_env
-      REAL(dp), INTENT(IN)                       :: grid_points(:, :)
-      INTEGER, INTENT(IN)                        :: cells_R_d_lP(:, :)
-      LOGICAL, INTENT(IN)                        :: include_lP_R(:, :, :), include_l_blocks_P_R(:, :, :)
-      REAL(dp), INTENT(IN)                       :: points(:, :), field_squared(:, :), weight, envelopes(:, :)
-      TYPE(l_block_partition_type), INTENT(IN)   :: blocks
-      REAL(dp), INTENT(IN)                       :: threshold
-      REAL(dp), INTENT(INOUT)                    :: omitted
-      INTEGER(int_8), INTENT(INOUT)              :: potential_points, block_contractions, screened_blocks, &
-                                                    coalesced_contractions, contraction_products
-      REAL(dp), INTENT(INOUT)                    :: d_lP_R(:, :, :)
+      TYPE(post_scf_bandstructure_type), POINTER         :: bs_env
+      REAL(dp), INTENT(IN)                               :: grid_points(:, :)
+      INTEGER, INTENT(IN)                                :: cells_R_d_lP(:, :)
+      LOGICAL, INTENT(IN)                                :: include_lP_R(:, :, :), &
+                                                            include_l_blocks_P_R(:, :, :)
+      REAL(dp), INTENT(IN)                               :: points(:, :), field_squared(:, :), &
+                                                            weight, envelopes(:, :)
+      TYPE(l_block_partition_type), INTENT(IN)           :: blocks
+      REAL(dp), INTENT(IN)                               :: threshold
+      REAL(dp), INTENT(INOUT)                            :: omitted
+      INTEGER(int_8), INTENT(INOUT)                      :: potential_points, block_contractions, &
+                                                            screened_blocks, &
+                                                            coalesced_contractions, &
+                                                            contraction_products
+      REAL(dp), INTENT(INOUT)                            :: d_lP_R(:, :, :)
       TYPE(radial_interpolation_type), ALLOCATABLE, &
          INTENT(IN)                                      :: aux_potentials(:)
 
-      INTEGER                                    :: firstp, handle, iatom, iblock, ig, ikind, ilocal, it, lastp, maxnp, &
-                                                    nactive, nkeep, np, nthreads, nunion, row
-      REAL(dp)                                   :: center(3), cutoff, decay, distance, estimate
-      REAL(dp), ALLOCATABLE                      :: block_field_bound(:, :), block_RI(:, :), field_work(:, :), point_bound(:), &
-                                                    potential(:, :)
-      LOGICAL                                    :: point_needed(SIZE(points, 2))
-      INTEGER                                    :: union_indices(SIZE(points, 2)), active_l(SIZE(grid_points, 2))
-      TYPE(cell_type), POINTER                   :: cell
-      TYPE(gto_basis_set_type), POINTER          :: basis
-      LOGICAL                                    :: block_needed(blocks%nblocks)
-      INTEGER                                    :: block_active_last(blocks%nblocks), block_active_first(blocks%nblocks)
-      TYPE(particle_type), POINTER               :: particles(:)
+      INTEGER                                            :: firstp, handle, iatom, iblock, ig, &
+                                                            ikind, ilocal, it, lastp, maxnp, &
+                                                            nactive, nkeep, np, nthreads, nunion, &
+                                                            row
+      REAL(dp)                                           :: center(3), cutoff, decay, distance, &
+                                                            estimate
+      REAL(dp), ALLOCATABLE                              :: block_field_bound(:, :), block_RI(:, :), &
+                                                            field_work(:, :), point_bound(:), &
+                                                            potential(:, :)
+      LOGICAL                                            :: point_needed(SIZE(points, 2))
+      INTEGER                                            :: union_indices(SIZE(points, 2)), &
+                                                            active_l(SIZE(grid_points, 2))
+      TYPE(cell_type), POINTER                           :: cell
+      TYPE(gto_basis_set_type), POINTER                  :: basis
+      LOGICAL                                            :: block_needed(blocks%nblocks)
+      INTEGER :: block_active_last(blocks%nblocks), block_active_first(blocks%nblocks)
+      TYPE(particle_type), POINTER                       :: particles(:)
 
       cell => bs_env%ri_rs%cell
       particles => bs_env%ri_rs%particle_set
@@ -2006,11 +2030,11 @@ CONTAINS
 !> \return ...
 ! **************************************************************************************************
    PURE FUNCTION distance_to_box_squared(point, lower, upper) RESULT(distance_squared)
-      REAL(dp), INTENT(IN) :: point(3), lower(3), upper(3)
-      REAL(dp)             :: distance_squared
+      REAL(dp), INTENT(IN)                               :: point(3), lower(3), upper(3)
+      REAL(dp)                                           :: distance_squared
 
-      INTEGER              :: idir
-      REAL(dp)             :: delta
+      INTEGER                                            :: idir
+      REAL(dp)                                           :: delta
 
       distance_squared = 0.0_dp
       DO idir = 1, 3
@@ -2027,16 +2051,16 @@ CONTAINS
 !> \param d_lP_R Numerical integrals indexed by local point l, RI function P and cell R.
 ! **************************************************************************************************
    SUBROUTINE apply_d_lP_distance_cutoff(bs_env, grid_points, cells_R_d_lP, d_lP_R)
-      TYPE(post_scf_bandstructure_type), POINTER :: bs_env
-      REAL(dp), INTENT(IN)                       :: grid_points(:, :)
-      INTEGER, INTENT(IN)                        :: cells_R_d_lP(:, :)
-      REAL(dp), INTENT(INOUT)                    :: d_lP_R(:, :, :)
+      TYPE(post_scf_bandstructure_type), POINTER         :: bs_env
+      REAL(dp), INTENT(IN)                               :: grid_points(:, :)
+      INTEGER, INTENT(IN)                                :: cells_R_d_lP(:, :)
+      REAL(dp), INTENT(INOUT)                            :: d_lP_R(:, :, :)
 
-      INTEGER                                    :: firstp, iatom, il, it, lastp
-      REAL(dp)                                   :: center(3), cutoff
-      REAL(dp), ALLOCATABLE                      :: cutoffs_lP(:)
-      TYPE(cell_type), POINTER                   :: cell
-      TYPE(particle_type), POINTER               :: particles(:)
+      INTEGER                                            :: firstp, iatom, il, it, lastp
+      REAL(dp)                                           :: center(3), cutoff
+      REAL(dp), ALLOCATABLE                              :: cutoffs_lP(:)
+      TYPE(cell_type), POINTER                           :: cell
+      TYPE(particle_type), POINTER                       :: particles(:)
 
       cell => bs_env%ri_rs%cell
       particles => bs_env%ri_rs%particle_set
@@ -2078,13 +2102,13 @@ CONTAINS
 !> \param attenuation Positive omega (inverse bohr) selects erfc(omega*r)/r.
 ! **************************************************************************************************
    SUBROUTINE evaluate_RI_potential(values, points, basis, center, cutoff, contracted, attenuation)
-      REAL(dp), CONTIGUOUS, INTENT(OUT) :: values(:, :)
-      REAL(dp), INTENT(IN)              :: points(:, :)
-      TYPE(gto_basis_set_type), POINTER :: basis
-      REAL(dp), INTENT(IN)              :: center(3), cutoff
+      REAL(dp), CONTIGUOUS, INTENT(OUT)                  :: values(:, :)
+      REAL(dp), INTENT(IN)                               :: points(:, :)
+      TYPE(gto_basis_set_type), POINTER                  :: basis
+      REAL(dp), INTENT(IN)                               :: center(3), cutoff
       TYPE(radial_interpolation_type), INTENT(IN), &
          OPTIONAL                                        :: contracted
-      REAL(dp), INTENT(IN), OPTIONAL    :: attenuation
+      REAL(dp), INTENT(IN), OPTIONAL                     :: attenuation
 
       CPASSERT(ASSOCIATED(basis))
       CPASSERT(SIZE(points, 1) == 3)
@@ -2110,17 +2134,18 @@ CONTAINS
 ! **************************************************************************************************
    SUBROUTINE prepare_contracted_potential(basis, U_Pp, contracted, cutoff, attenuation, radial_table_bytes, &
                                            mesh_step, mesh_displacement)
-      TYPE(gto_basis_set_type), POINTER            :: basis
-      REAL(dp), INTENT(IN), OPTIONAL               :: U_Pp(:, :)
-      TYPE(radial_interpolation_type), INTENT(OUT) :: contracted
-      REAL(dp), INTENT(IN), OPTIONAL               :: cutoff, attenuation, radial_table_bytes, mesh_step(3, 3), &
-                                                      mesh_displacement(3)
+      TYPE(gto_basis_set_type), POINTER                  :: basis
+      REAL(dp), INTENT(IN), OPTIONAL                     :: U_Pp(:, :)
+      TYPE(radial_interpolation_type), INTENT(OUT)       :: contracted
+      REAL(dp), INTENT(IN), OPTIONAL                     :: cutoff, attenuation, radial_table_bytes, &
+                                                            mesh_step(3, 3), mesh_displacement(3)
 
-      INTEGER                                      :: ico, iopt, ipgf, irow, irow_packed, iset, isgf, ishell, l, ncart, &
-                                                      ninterval, np, nrows
-      LOGICAL, ALLOCATABLE                         :: angular_used(:)
-      REAL(dp)                                     :: bytes_per_node, table_bytes
-      REAL(dp), ALLOCATABLE                        :: full_abscissae(:), moments(:, :)
+      INTEGER                                            :: ico, iopt, ipgf, irow, irow_packed, &
+                                                            iset, isgf, ishell, l, ncart, &
+                                                            ninterval, np, nrows
+      LOGICAL, ALLOCATABLE                               :: angular_used(:)
+      REAL(dp)                                           :: bytes_per_node, table_bytes
+      REAL(dp), ALLOCATABLE                              :: full_abscissae(:), moments(:, :)
 
       CPASSERT(ASSOCIATED(basis))
       ALLOCATE (angular_used(0:MAXVAL(basis%lmax)))
@@ -2232,15 +2257,18 @@ CONTAINS
 !> \param contracted ...
 ! **************************************************************************************************
    SUBROUTINE prepare_spherical_potential_factorization(basis, U_Pp, contracted)
-      TYPE(gto_basis_set_type), POINTER              :: basis
-      REAL(dp), INTENT(IN)                           :: U_Pp(:, :)
-      TYPE(radial_interpolation_type), INTENT(INOUT) :: contracted
+      TYPE(gto_basis_set_type), POINTER                  :: basis
+      REAL(dp), INTENT(IN)                               :: U_Pp(:, :)
+      TYPE(radial_interpolation_type), INTENT(INOUT)     :: contracted
 
-      INTEGER                                        :: c, first, ico, ipgf, iset, ishell, l, lmax, m, ncart, ref_c, ref_m, &
-                                                        ref_p, ref_shell, row
-      LOGICAL, ALLOCATABLE                           :: used(:)
-      REAL(dp)                                       :: actual, expected, ref_abs, ref_value, scale
-      REAL(dp), ALLOCATABLE                          :: angular_coeff(:, :, :, :), primitive_scale(:, :, :)
+      INTEGER                                            :: c, first, ico, ipgf, iset, ishell, l, &
+                                                            lmax, m, ncart, ref_c, ref_m, ref_p, &
+                                                            ref_shell, row
+      LOGICAL, ALLOCATABLE                               :: used(:)
+      REAL(dp)                                           :: actual, expected, ref_abs, ref_value, &
+                                                            scale
+      REAL(dp), ALLOCATABLE                              :: angular_coeff(:, :, :, :), &
+                                                            primitive_scale(:, :, :)
 
       IF (SIZE(U_Pp, 1) /= basis%nsgf) RETURN
       ALLOCATE (used(basis%nsgf), source=.FALSE.)
@@ -2336,12 +2364,12 @@ CONTAINS
 !> \param short_series ...
 ! **************************************************************************************************
    SUBROUTINE prepare_radial_series(basis, cutoff, omega, series, short_series)
-      TYPE(gto_basis_set_type), POINTER  :: basis
-      REAL(dp), INTENT(IN)               :: cutoff, omega
-      REAL(dp), ALLOCATABLE, INTENT(OUT) :: series(:, :, :), short_series(:, :, :)
+      TYPE(gto_basis_set_type), POINTER                  :: basis
+      REAL(dp), INTENT(IN)                               :: cutoff, omega
+      REAL(dp), ALLOCATABLE, INTENT(OUT)                 :: series(:, :, :), short_series(:, :, :)
 
-      INTEGER                            :: in, ipgf, iset, lmax
-      REAL(dp)                           :: beta_ratio, exponent
+      INTEGER                                            :: in, ipgf, iset, lmax
+      REAL(dp)                                           :: beta_ratio, exponent
 
       lmax = MAXVAL(basis%lmax)
       ALLOCATE (series(0:lmax + 24, MAXVAL(basis%npgf), basis%nset), &
@@ -2376,20 +2404,23 @@ CONTAINS
 !> \param attenuation ...
 ! **************************************************************************************************
    SUBROUTINE contract_potentials(values, points, basis, center, cutoff, contracted, attenuation)
-      REAL(dp), CONTIGUOUS, INTENT(OUT) :: values(:, :)
-      REAL(dp), INTENT(IN)              :: points(:, :)
-      TYPE(gto_basis_set_type), POINTER :: basis
-      REAL(dp), INTENT(IN)              :: center(3), cutoff
+      REAL(dp), CONTIGUOUS, INTENT(OUT)                  :: values(:, :)
+      REAL(dp), INTENT(IN)                               :: points(:, :)
+      TYPE(gto_basis_set_type), POINTER                  :: basis
+      REAL(dp), INTENT(IN)                               :: center(3), cutoff
       TYPE(radial_interpolation_type), INTENT(IN), &
          OPTIONAL                                        :: contracted
-      REAL(dp), INTENT(IN), OPTIONAL    :: attenuation
+      REAL(dp), INTENT(IN), OPTIONAL                     :: attenuation
 
-      INTEGER                           :: ico, in, ipgf, ipoint, irow, iset, isgf, ishell, l, lmax, ncart
-      LOGICAL                           :: parallel_points, short
-      REAL(dp)                          :: beta_ratio, exponent, minimum_radius2, omega, polynomial, radius, relative(3), &
-                                           weight
-      REAL(dp), ALLOCATABLE             :: long_radial(:), radial(:), series(:, :, :), short_series(:, :, :)
-      TYPE(radial_work_type)            :: radial_work
+      INTEGER                                            :: ico, in, ipgf, ipoint, irow, iset, isgf, &
+                                                            ishell, l, lmax, ncart
+      LOGICAL                                            :: parallel_points, short
+      REAL(dp)                                           :: beta_ratio, exponent, minimum_radius2, &
+                                                            omega, polynomial, radius, &
+                                                            relative(3), weight
+      REAL(dp), ALLOCATABLE                              :: long_radial(:), radial(:), &
+                                                            series(:, :, :), short_series(:, :, :)
+      TYPE(radial_work_type)                             :: radial_work
 
       lmax = MAXVAL(basis%lmax)
       omega = 0.0_dp
@@ -2481,27 +2512,32 @@ CONTAINS
 !> \param attenuation ...
 ! **************************************************************************************************
    SUBROUTINE contract_selected_potentials(values, points, basis, center, cutoff, contracted, attenuation)
-      REAL(dp), CONTIGUOUS, INTENT(OUT) :: values(:, :)
-      REAL(dp), INTENT(IN)              :: points(:, :)
-      TYPE(gto_basis_set_type), POINTER :: basis
-      REAL(dp), INTENT(IN)              :: center(3), cutoff
+      REAL(dp), CONTIGUOUS, INTENT(OUT)                  :: values(:, :)
+      REAL(dp), INTENT(IN)                               :: points(:, :)
+      TYPE(gto_basis_set_type), POINTER                  :: basis
+      REAL(dp), INTENT(IN)                               :: center(3), cutoff
       TYPE(radial_interpolation_type), INTENT(IN), &
          TARGET                                          :: contracted
-      REAL(dp), INTENT(IN), OPTIONAL    :: attenuation
+      REAL(dp), INTENT(IN), OPTIONAL                     :: attenuation
 
-      INTEGER                           :: handle, iangular, ico, ig, imesh, in, ipgf, irow, iset, isgf, ishell, l, lmax, m, &
-                                           nchannels, ng, np, nrows, nwork
-      INTEGER, ALLOCATABLE              :: angular_count(:, :, :), angular_index(:), angular_term(:, :, :, :), &
-                                           mesh_channel(:), minimum_l(:)
-      LOGICAL                           :: factorized, in_table, parallel_points, prepared, short, tabulated, use_mesh
-      LOGICAL, ALLOCATABLE              :: angular_used(:, :)
-      REAL(dp)                          :: beta_ratio, exponent, mesh_delta, mesh_position, minimum_radius2, omega, &
-                                           radial_sum, radius, radius2, relative(3), spherical_value, x
-      REAL(dp), ALLOCATABLE             :: angular_values(:, :, :), coordinate_power(:, :), long_radial(:), monomial(:), &
-                                           radial(:), radial_channels(:, :, :), radial_mesh(:), work(:, :)
-      REAL(dp), CONTIGUOUS, POINTER     :: coefficient_matrix(:, :)
-      REAL(dp), POINTER                 :: series(:, :, :), short_series(:, :, :)
-      TYPE(radial_work_type)            :: radial_work
+      INTEGER                                            :: handle, iangular, ico, ig, imesh, in, &
+                                                            ipgf, irow, iset, isgf, ishell, l, &
+                                                            lmax, m, nchannels, ng, np, nrows, &
+                                                            nwork
+      INTEGER, ALLOCATABLE                               :: angular_count(:, :, :), &
+                                                            angular_index(:), &
+                                                            angular_term(:, :, :, :), &
+                                                            mesh_channel(:), minimum_l(:)
+      LOGICAL                                            :: factorized, in_table, parallel_points, &
+                                                            prepared, short, tabulated, use_mesh
+      LOGICAL, ALLOCATABLE                               :: angular_used(:, :)
+      REAL(dp) :: beta_ratio, exponent, mesh_delta, mesh_position, minimum_radius2, omega, &
+         radial_sum, radius, radius2, relative(3), spherical_value, x
+      REAL(dp), ALLOCATABLE :: angular_values(:, :, :), coordinate_power(:, :), long_radial(:), &
+         monomial(:), radial(:), radial_channels(:, :, :), radial_mesh(:), work(:, :)
+      REAL(dp), CONTIGUOUS, POINTER                      :: coefficient_matrix(:, :)
+      REAL(dp), POINTER                                  :: series(:, :, :), short_series(:, :, :)
+      TYPE(radial_work_type)                             :: radial_work
 
       CALL timeset('d_lP_potential_prepare', handle)
 
@@ -2773,13 +2809,16 @@ CONTAINS
 !> \param long_radial ...
 ! **************************************************************************************************
    SUBROUTINE radial_potential_short(radius, exponent, omega, coefficients, short_coefficients, radial, radial_work, long_radial)
-      REAL(dp), INTENT(IN)                  :: radius, exponent, omega, coefficients(0:), short_coefficients(0:)
-      REAL(dp), INTENT(OUT)                 :: radial(0:)
-      TYPE(radial_work_type), INTENT(INOUT) :: radial_work
-      REAL(dp), INTENT(INOUT)               :: long_radial(0:)
+      REAL(dp), INTENT(IN)                               :: radius, exponent, omega, &
+                                                            coefficients(0:), &
+                                                            short_coefficients(0:)
+      REAL(dp), INTENT(OUT)                              :: radial(0:)
+      TYPE(radial_work_type), INTENT(INOUT)              :: radial_work
+      REAL(dp), INTENT(INOUT)                            :: long_radial(0:)
 
-      INTEGER                               :: il
-      REAL(dp)                              :: beta, beta_ratio, factor, lower_exp, ratio_power, root_x, upper_exp, x
+      INTEGER                                            :: il
+      REAL(dp)                                           :: beta, beta_ratio, factor, lower_exp, &
+                                                            ratio_power, root_x, upper_exp, x
 
       IF (exponent*radius**2 < 0.5_dp) THEN
          CALL radial_potential(radius, exponent, 0.0_dp, short_coefficients, radial, radial_work)
@@ -2820,11 +2859,11 @@ CONTAINS
 !> \param coefficients ...
 ! **************************************************************************************************
    SUBROUTINE origin_series(exponent, cutoff, coefficients)
-      REAL(dp), INTENT(IN)  :: exponent, cutoff
-      REAL(dp), INTENT(OUT) :: coefficients(0:)
+      REAL(dp), INTENT(IN)                               :: exponent, cutoff
+      REAL(dp), INTENT(OUT)                              :: coefficients(0:)
 
-      INTEGER               :: ij, ik, in
-      REAL(dp)              :: factorial, gamma_p, integral, term, weight, y, terms(0:UBOUND(coefficients, 1))
+      INTEGER                                            :: ij, ik, in
+      REAL(dp) :: factorial, gamma_p, integral, term, weight, y, terms(0:UBOUND(coefficients, 1))
 
       y = exponent*cutoff**2
       weight = 1.0_dp
@@ -2868,12 +2907,14 @@ CONTAINS
 !> \param radial_work ...
 ! **************************************************************************************************
    SUBROUTINE radial_potential(radius, exponent, cutoff, coefficients, radial, radial_work)
-      REAL(dp), INTENT(IN)                  :: radius, exponent, cutoff, coefficients(0:)
-      REAL(dp), INTENT(OUT)                 :: radial(0:)
-      TYPE(radial_work_type), INTENT(INOUT) :: radial_work
+      REAL(dp), INTENT(IN)                               :: radius, exponent, cutoff, &
+                                                            coefficients(0:)
+      REAL(dp), INTENT(OUT)                              :: radial(0:)
+      TYPE(radial_work_type), INTENT(INOUT)              :: radial_work
 
-      INTEGER                               :: ij, il, in, lmax
-      REAL(dp)                              :: displacement, factor, power, prefactor, value, x
+      INTEGER                                            :: ij, il, in, lmax
+      REAL(dp)                                           :: displacement, factor, power, prefactor, &
+                                                            value, x
 
       lmax = UBOUND(radial, 1)
       x = exponent*radius**2
@@ -2951,10 +2992,10 @@ CONTAINS
 !> \param abscissae ...
 ! **************************************************************************************************
    SUBROUTINE prepare_short_radial_grid(xmax, abscissae)
-      REAL(dp), INTENT(IN)               :: xmax
-      REAL(dp), ALLOCATABLE, INTENT(OUT) :: abscissae(:)
+      REAL(dp), INTENT(IN)                               :: xmax
+      REAL(dp), ALLOCATABLE, INTENT(OUT)                 :: abscissae(:)
 
-      INTEGER                            :: ix, last
+      INTEGER                                            :: ix, last
 
       CPASSERT(xmax > 0.0_dp)
       IF (xmax <= 2.0_dp) THEN
@@ -2992,17 +3033,20 @@ CONTAINS
 ! **************************************************************************************************
    SUBROUTINE prepare_short_radial_table(a, omega, lmax, table, ninterval, point_spacing, point_offset, &
                                          last_moment, abscissae)
-      REAL(dp), INTENT(IN)               :: a, omega
-      INTEGER, INTENT(IN)                :: lmax
-      REAL(dp), ALLOCATABLE, INTENT(OUT) :: table(:, :)
-      INTEGER, INTENT(IN), OPTIONAL      :: ninterval
-      REAL(dp), INTENT(IN), OPTIONAL     :: point_spacing, point_offset
-      INTEGER, INTENT(IN), OPTIONAL      :: last_moment
-      REAL(dp), INTENT(IN), OPTIONAL     :: abscissae(0:)
+      REAL(dp), INTENT(IN)                               :: a, omega
+      INTEGER, INTENT(IN)                                :: lmax
+      REAL(dp), ALLOCATABLE, INTENT(OUT)                 :: table(:, :)
+      INTEGER, INTENT(IN), OPTIONAL                      :: ninterval
+      REAL(dp), INTENT(IN), OPTIONAL                     :: point_spacing, point_offset
+      INTEGER, INTENT(IN), OPTIONAL                      :: last_moment
+      REAL(dp), INTENT(IN), OPTIONAL                     :: abscissae(0:)
 
-      INTEGER                            :: ig, ij, il, iter, ix, last, order, quadrature_last
-      REAL(dp)                           :: b, derivative, dz, factor, lower, lower_exp, offset, p0, p1, p2, ratio_power, &
-                                            root_x, spacing, t, t2, term, upper_exp, w, width, x, z
+      INTEGER                                            :: ig, ij, il, iter, ix, last, order, &
+                                                            quadrature_last
+      REAL(dp)                                           :: b, derivative, dz, factor, lower, &
+                                                            lower_exp, offset, p0, p1, p2, &
+                                                            ratio_power, root_x, spacing, t, t2, &
+                                                            term, upper_exp, w, width, x, z
 
       CPASSERT(a > 0.0_dp .AND. omega > 0.0_dp .AND. lmax >= 0)
       last = 25600
@@ -3089,12 +3133,15 @@ CONTAINS
 !> \param radial ...
 ! **************************************************************************************************
    SUBROUTINE evaluate_short_radial_table(x, abscissae, table, radial)
-      REAL(dp), INTENT(IN)  :: x, abscissae(0:), table(0:, 0:)
-      REAL(dp), INTENT(OUT) :: radial(0:)
+      REAL(dp), INTENT(IN)                               :: x, abscissae(0:), table(0:, 0:)
+      REAL(dp), INTENT(OUT)                              :: radial(0:)
 
-      INTEGER               :: ix, il, ik, ileft, iright, imiddle
-      REAL(dp)              :: delta, value
-      REAL(dp), PARAMETER   :: inverse(6) = [1.0_dp, 0.5_dp, 1.0_dp/3.0_dp, 0.25_dp, 0.2_dp, 1.0_dp/6.0_dp]
+      REAL(dp), PARAMETER :: &
+         inverse(6) = [1.0_dp, 0.5_dp, 1.0_dp/3.0_dp, 0.25_dp, 0.2_dp, 1.0_dp/6.0_dp]
+
+      INTEGER                                            :: ik, il, ileft, imiddle, iright, ix
+      REAL(dp)                                           :: delta, value
+
       ileft = 0
       iright = UBOUND(abscissae, 1)
       DO WHILE (iright - ileft > 1)
@@ -3132,18 +3179,18 @@ CONTAINS
 !> \param table_bytes ...
 ! **************************************************************************************************
    SUBROUTINE prepare_mesh_radial_moments(basis, contracted, step, displacement, table_bytes)
-      TYPE(gto_basis_set_type), POINTER              :: basis
-      TYPE(radial_interpolation_type), INTENT(INOUT) :: contracted
-      REAL(dp), INTENT(IN)                           :: step(3, 3), displacement(3)
-      REAL(dp), INTENT(INOUT)                        :: table_bytes
+      TYPE(gto_basis_set_type), POINTER                  :: basis
+      TYPE(radial_interpolation_type), INTENT(INOUT)     :: contracted
+      REAL(dp), INTENT(IN)                               :: step(3, 3), displacement(3)
+      REAL(dp), INTENT(INOUT)                            :: table_bytes
 
-      INTEGER                                        :: idir, ifirst, il, ipgf, iset, ishell, jdir, last, max_l, &
-                                                        max_primitive, minimum_l, nchannels, nshell_total, nstored, &
-                                                        shell_index
-      LOGICAL                                        :: direct_shells
-      REAL(dp)                                       :: bytes_per_node, index_bytes, linear(3), metric(3, 3), offset, ratio, &
-                                                        required_bytes, spacing
-      REAL(dp), ALLOCATABLE                          :: moments(:, :)
+      INTEGER :: idir, ifirst, il, ipgf, iset, ishell, jdir, last, max_l, max_primitive, &
+         minimum_l, nchannels, nshell_total, nstored, shell_index
+      LOGICAL                                            :: direct_shells
+      REAL(dp)                                           :: bytes_per_node, index_bytes, linear(3), &
+                                                            metric(3, 3), offset, ratio, &
+                                                            required_bytes, spacing
+      REAL(dp), ALLOCATABLE                              :: moments(:, :)
 
       IF (basis%nset < 1) RETURN
       IF (ANY(basis%nshell(1:basis%nset) < 1)) RETURN

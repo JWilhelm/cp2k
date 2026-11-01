@@ -59,19 +59,21 @@ CONTAINS
 ! **************************************************************************************************
    SUBROUTINE compute_Z_lP_q(bs_env, grid_points, ao_values, &
                              Z_lP_q, Z_lP_zero)
-      TYPE(post_scf_bandstructure_type), POINTER   :: bs_env
-      REAL(KIND=dp), DIMENSION(:, :), INTENT(IN)   :: grid_points
-      REAL(dp), ALLOCATABLE, INTENT(INOUT), TARGET :: ao_values(:, :, :)
-      COMPLEX(KIND=dp), ALLOCATABLE, INTENT(OUT)   :: Z_lP_q(:, :, :), Z_lP_zero(:, :, :)
+      TYPE(post_scf_bandstructure_type), POINTER         :: bs_env
+      REAL(KIND=dp), DIMENSION(:, :), INTENT(IN)         :: grid_points
+      REAL(dp), ALLOCATABLE, INTENT(INOUT), TARGET       :: ao_values(:, :, :)
+      COMPLEX(KIND=dp), ALLOCATABLE, INTENT(OUT)         :: Z_lP_q(:, :, :), Z_lP_zero(:, :, :)
 
-      CHARACTER(LEN=*), PARAMETER                  :: routineN = 'compute_Z_lP_q'
+      CHARACTER(LEN=*), PARAMETER                        :: routineN = 'compute_Z_lP_q'
 
-      COMPLEX(KIND=dp), ALLOCATABLE                :: charge_lq(:, :)
-      INTEGER                                      :: first_l, handle, last_l, n_D_cells, n_d_lP_cells, n_grid
-      INTEGER, ALLOCATABLE                         :: cells_R_D_llp(:, :), cells_R_d_lP(:, :)
-      REAL(KIND=dp)                                :: elapsed, start_time
-      REAL(KIND=dp), ALLOCATABLE                   :: D_llp_R(:, :, :), d_lP_R(:, :, :), qpoints_head(:, :), qpoints_scf(:, :)
-      REAL(KIND=dp), POINTER                       :: phi_lmu_R(:, :, :)
+      COMPLEX(KIND=dp), ALLOCATABLE                      :: charge_lq(:, :)
+      INTEGER                                            :: first_l, handle, last_l, n_D_cells, &
+                                                            n_d_lP_cells, n_grid
+      INTEGER, ALLOCATABLE                               :: cells_R_D_llp(:, :), cells_R_d_lP(:, :)
+      REAL(KIND=dp)                                      :: elapsed, start_time
+      REAL(KIND=dp), ALLOCATABLE                         :: D_llp_R(:, :, :), d_lP_R(:, :, :), &
+                                                            qpoints_head(:, :), qpoints_scf(:, :)
+      REAL(KIND=dp), POINTER                             :: phi_lmu_R(:, :, :)
 
       CALL timeset(routineN, handle)
 
@@ -141,19 +143,20 @@ CONTAINS
 !> \param ao_values AO values mu(r_l - R), indexed (l,mu,R).
 ! **************************************************************************************************
    SUBROUTINE evaluate_mu_rl_R_values(bs_env, grid_points, ao_values)
-      TYPE(post_scf_bandstructure_type), POINTER   :: bs_env
-      REAL(KIND=dp), INTENT(IN)                    :: grid_points(:, :)
-      REAL(dp), ALLOCATABLE, INTENT(INOUT), TARGET :: ao_values(:, :, :)
+      TYPE(post_scf_bandstructure_type), POINTER         :: bs_env
+      REAL(KIND=dp), INTENT(IN)                          :: grid_points(:, :)
+      REAL(dp), ALLOCATABLE, INTENT(INOUT), TARGET       :: ao_values(:, :, :)
 
-      CHARACTER(LEN=*), PARAMETER                  :: routineN = 'evaluate_mu_rl_R_values'
+      CHARACTER(LEN=*), PARAMETER :: routineN = 'evaluate_mu_rl_R_values'
 
-      INTEGER                                      :: first_ao, handle, i_atom, i_cell, i_kind, last_ao, ready
-      REAL(dp)                                     :: available_GB, required_bytes
-      REAL(KIND=dp)                                :: cutoff_squared, source_position(3)
-      TYPE(cell_type), POINTER                     :: cell
-      TYPE(gto_basis_set_type), POINTER            :: basis
-      TYPE(mp_comm_type)                           :: node_comm
-      TYPE(particle_type), DIMENSION(:), POINTER   :: particle_set
+      INTEGER                                            :: first_ao, handle, i_atom, i_cell, &
+                                                            i_kind, last_ao, ready
+      REAL(dp)                                           :: available_GB, required_bytes
+      REAL(KIND=dp)                                      :: cutoff_squared, source_position(3)
+      TYPE(cell_type), POINTER                           :: cell
+      TYPE(gto_basis_set_type), POINTER                  :: basis
+      TYPE(mp_comm_type)                                 :: node_comm
+      TYPE(particle_type), DIMENSION(:), POINTER         :: particle_set
 
       CALL timeset(routineN, handle)
 
@@ -205,11 +208,11 @@ CONTAINS
 !> \return ...
 ! **************************************************************************************************
    PURE FUNCTION lattice_phase(kpoint, cell) RESULT(phase)
-      REAL(KIND=dp), DIMENSION(3), INTENT(IN) :: kpoint
-      INTEGER, DIMENSION(3), INTENT(IN)       :: cell
-      COMPLEX(KIND=dp)                        :: phase
+      REAL(KIND=dp), DIMENSION(3), INTENT(IN)            :: kpoint
+      INTEGER, DIMENSION(3), INTENT(IN)                  :: cell
+      COMPLEX(KIND=dp)                                   :: phase
 
-      REAL(KIND=dp)                           :: angle
+      REAL(KIND=dp)                                      :: angle
 
       angle = twopi*SUM(kpoint*REAL(cell, dp))
       phase = CMPLX(COS(angle), SIN(angle), KIND=dp)
@@ -234,30 +237,33 @@ CONTAINS
 ! **************************************************************************************************
    SUBROUTINE solve_for_Z_lP_q(bs_env, cells_R_D_llp, cells_R_d_lP, D_llp_R, d_lP_R, first_l, last_l, qpoints, &
                                Z_lP_q, distributed, charge_lq)
-      TYPE(post_scf_bandstructure_type), POINTER    :: bs_env
-      INTEGER, DIMENSION(:, :), INTENT(IN)          :: cells_R_D_llp, cells_R_d_lP
-      REAL(KIND=dp), DIMENSION(:, :, :), INTENT(IN) :: D_llp_R
-      REAL(KIND=dp), CONTIGUOUS, INTENT(IN)         :: d_lP_R(:, :, :)
-      INTEGER, INTENT(IN)                           :: first_l, last_l
-      REAL(KIND=dp), DIMENSION(:, :), INTENT(IN)    :: qpoints
-      COMPLEX(KIND=dp), ALLOCATABLE, INTENT(OUT)    :: Z_lP_q(:, :, :)
-      LOGICAL, INTENT(IN)                           :: distributed
-      COMPLEX(KIND=dp), INTENT(IN), OPTIONAL        :: charge_lq(:, :)
+      TYPE(post_scf_bandstructure_type), POINTER         :: bs_env
+      INTEGER, DIMENSION(:, :), INTENT(IN)               :: cells_R_D_llp, cells_R_d_lP
+      REAL(KIND=dp), DIMENSION(:, :, :), INTENT(IN)      :: D_llp_R
+      REAL(KIND=dp), CONTIGUOUS, INTENT(IN)              :: d_lP_R(:, :, :)
+      INTEGER, INTENT(IN)                                :: first_l, last_l
+      REAL(KIND=dp), DIMENSION(:, :), INTENT(IN)         :: qpoints
+      COMPLEX(KIND=dp), ALLOCATABLE, INTENT(OUT)         :: Z_lP_q(:, :, :)
+      LOGICAL, INTENT(IN)                                :: distributed
+      COMPLEX(KIND=dp), INTENT(IN), OPTIONAL             :: charge_lq(:, :)
 
-      CHARACTER(LEN=*), PARAMETER                   :: routineN = 'solve_for_Z_lP_q'
+      CHARACTER(LEN=*), PARAMETER                        :: routineN = 'solve_for_Z_lP_q'
 
-      COMPLEX(KIND=dp)                              :: phase
-      COMPLEX(KIND=dp), ALLOCATABLE                 :: D_llp_q(:, :), D_llp_q_local(:, :), D_llp_q_packed(:), d_lP_q(:, :), &
-                                                       d_lP_q_reference(:, :), rhs(:, :)
-      INTEGER                                       :: first_l_rank, handle, i_A, i_batch, i_rank, info, iq, iq_batch, &
-                                                       iq_local, iq_store, l, last_l_rank, lp, n_grid, n_q, n_q_local, n_RI, &
-                                                       n_RI_reference, n_RI_solve, next_progress
-      INTEGER(KIND=int_8)                           :: n_done, n_local
-      INTEGER, ALLOCATABLE                          :: displs(:), recvcounts(:)
-      LOGICAL, ALLOCATABLE                          :: active_grid_point(:), required_q(:)
-      REAL(KIND=dp)                                 :: antihermitian_error, diagonal_imag_error, max_scale, metric_head, &
-                                                       progress_start, qpoint(3), volume
-      REAL(KIND=dp), ALLOCATABLE                    :: scale(:)
+      COMPLEX(KIND=dp)                                   :: phase
+      COMPLEX(KIND=dp), ALLOCATABLE                      :: D_llp_q(:, :), D_llp_q_local(:, :), &
+                                                            D_llp_q_packed(:), d_lP_q(:, :), &
+                                                            d_lP_q_reference(:, :), rhs(:, :)
+      INTEGER :: first_l_rank, handle, i_A, i_batch, i_rank, info, iq, iq_batch, iq_local, &
+         iq_store, l, last_l_rank, lp, n_grid, n_q, n_q_local, n_RI, n_RI_reference, n_RI_solve, &
+         next_progress
+      INTEGER(KIND=int_8)                                :: n_done, n_local
+      INTEGER, ALLOCATABLE                               :: displs(:), recvcounts(:)
+      LOGICAL, ALLOCATABLE                               :: active_grid_point(:), required_q(:)
+      REAL(KIND=dp)                                      :: antihermitian_error, &
+                                                            diagonal_imag_error, max_scale, &
+                                                            metric_head, progress_start, &
+                                                            qpoint(3), volume
+      REAL(KIND=dp), ALLOCATABLE                         :: scale(:)
 
       CALL timeset(routineN, handle)
 
@@ -459,12 +465,12 @@ CONTAINS
 !> \param rhs ...
 ! **************************************************************************************************
    SUBROUTINE solve_unregularized_D_llp(D_llp_q, rhs)
-      COMPLEX(KIND=dp), DIMENSION(:, :), INTENT(INOUT) :: D_llp_q, rhs
+      COMPLEX(KIND=dp), DIMENSION(:, :), INTENT(INOUT)   :: D_llp_q, rhs
 
-      COMPLEX(KIND=dp), ALLOCATABLE                    :: projected_rhs(:, :), work(:)
-      INTEGER                                          :: ieigenvalue, info, ngrid
-      REAL(KIND=dp)                                    :: rank_tolerance
-      REAL(KIND=dp), ALLOCATABLE                       :: eigenvalues(:), rwork(:)
+      COMPLEX(KIND=dp), ALLOCATABLE                      :: projected_rhs(:, :), work(:)
+      INTEGER                                            :: ieigenvalue, info, ngrid
+      REAL(KIND=dp)                                      :: rank_tolerance
+      REAL(KIND=dp), ALLOCATABLE                         :: eigenvalues(:), rwork(:)
 
       ngrid = SIZE(D_llp_q, 1)
       CPASSERT(ngrid > 0)
@@ -502,16 +508,17 @@ CONTAINS
 !> \param cells_R_d_lP ...
 ! **************************************************************************************************
    SUBROUTINE build_cells_R_for_d_lP_R(bs_env, grid_points, cells_R_d_lP)
-      TYPE(post_scf_bandstructure_type), POINTER :: bs_env
-      REAL(KIND=dp), DIMENSION(:, :), INTENT(IN) :: grid_points
-      INTEGER, ALLOCATABLE, INTENT(OUT)          :: cells_R_d_lP(:, :)
+      TYPE(post_scf_bandstructure_type), POINTER         :: bs_env
+      REAL(KIND=dp), DIMENSION(:, :), INTENT(IN)         :: grid_points
+      INTEGER, ALLOCATABLE, INTENT(OUT)                  :: cells_R_d_lP(:, :)
 
-      INTEGER                                    :: cell_index(3), i_atom, i_l, ix, iy, iz, n_max(3), n_RI, n_work
-      INTEGER, ALLOCATABLE                       :: cells_work(:, :)
-      LOGICAL                                    :: keep
-      REAL(KIND=dp)                              :: center(3), cutoff, max_cutoff
-      REAL(KIND=dp), ALLOCATABLE                 :: automatic_cutoffs(:)
-      TYPE(particle_type), DIMENSION(:), POINTER :: particle_set
+      INTEGER                                            :: cell_index(3), i_atom, i_l, ix, iy, iz, &
+                                                            n_max(3), n_RI, n_work
+      INTEGER, ALLOCATABLE                               :: cells_work(:, :)
+      LOGICAL                                            :: keep
+      REAL(KIND=dp)                                      :: center(3), cutoff, max_cutoff
+      REAL(KIND=dp), ALLOCATABLE                         :: automatic_cutoffs(:)
+      TYPE(particle_type), DIMENSION(:), POINTER         :: particle_set
 
       particle_set => bs_env%ri_rs%particle_set
       CALL compute_d_lP_cutoffs(bs_env, automatic_cutoffs)
@@ -579,13 +586,14 @@ CONTAINS
 !> \param cells_R_D_llp ...
 ! **************************************************************************************************
    SUBROUTINE build_cells_R_for_D_llp(bs_env, phi_lmu_R, cells_R_D_llp)
-      TYPE(post_scf_bandstructure_type), POINTER    :: bs_env
-      REAL(KIND=dp), DIMENSION(:, :, :), INTENT(IN) :: phi_lmu_R
-      INTEGER, ALLOCATABLE, INTENT(OUT)             :: cells_R_D_llp(:, :)
+      TYPE(post_scf_bandstructure_type), POINTER         :: bs_env
+      REAL(KIND=dp), DIMENSION(:, :, :), INTENT(IN)      :: phi_lmu_R
+      INTEGER, ALLOCATABLE, INTENT(OUT)                  :: cells_R_D_llp(:, :)
 
-      INTEGER                                       :: cell_index(3), i, i_R, i_R_prime, n_active, n_D_cells
-      INTEGER, ALLOCATABLE                          :: active_cells(:), cells_work(:, :)
-      LOGICAL                                       :: found
+      INTEGER                                            :: cell_index(3), i, i_R, i_R_prime, &
+                                                            n_active, n_D_cells
+      INTEGER, ALLOCATABLE                               :: active_cells(:), cells_work(:, :)
+      LOGICAL                                            :: found
 
       ALLOCATE (active_cells(SIZE(phi_lmu_R, 3)))
       n_active = 0
@@ -633,18 +641,19 @@ CONTAINS
 !> \param D_llp_R ...
 ! **************************************************************************************************
    SUBROUTINE compute_D_llp(bs_env, cells_R_D_llp, phi_lmu_R, first_l, last_l, D_llp_R)
-      TYPE(post_scf_bandstructure_type), POINTER :: bs_env
-      INTEGER, DIMENSION(:, :), INTENT(IN)       :: cells_R_D_llp
-      REAL(KIND=dp), INTENT(IN)                  :: phi_lmu_R(:, :, :)
-      INTEGER, INTENT(IN)                        :: first_l, last_l
-      REAL(KIND=dp), CONTIGUOUS, INTENT(OUT)     :: D_llp_R(:, :, :)
+      TYPE(post_scf_bandstructure_type), POINTER         :: bs_env
+      INTEGER, DIMENSION(:, :), INTENT(IN)               :: cells_R_D_llp
+      REAL(KIND=dp), INTENT(IN)                          :: phi_lmu_R(:, :, :)
+      INTEGER, INTENT(IN)                                :: first_l, last_l
+      REAL(KIND=dp), CONTIGUOUS, INTENT(OUT)             :: D_llp_R(:, :, :)
 
-      INTEGER                                    :: cell_A(3), handle, i_A, i_R, i_R_prime, next_progress, nrows
-      INTEGER(KIND=int_8)                        :: n_done, n_total
-      LOGICAL                                    :: found
-      LOGICAL, ALLOCATABLE                       :: active_cell(:)
-      REAL(KIND=dp)                              :: progress_start
-      REAL(KIND=dp), ALLOCATABLE                 :: phi_local(:, :)
+      INTEGER                                            :: cell_A(3), handle, i_A, i_R, i_R_prime, &
+                                                            next_progress, nrows
+      INTEGER(KIND=int_8)                                :: n_done, n_total
+      LOGICAL                                            :: found
+      LOGICAL, ALLOCATABLE                               :: active_cell(:)
+      REAL(KIND=dp)                                      :: progress_start
+      REAL(KIND=dp), ALLOCATABLE                         :: phi_local(:, :)
       INTERFACE
          SUBROUTINE dgemm(transa, transb, m, n, k, alpha, a, lda, b, ldb, beta, c, ldc)
             IMPORT dp
@@ -709,12 +718,12 @@ CONTAINS
 !> \param index ...
 ! **************************************************************************************************
    SUBROUTINE find_cell(cell, index_to_cell, found, index)
-      INTEGER, DIMENSION(3), INTENT(IN)    :: cell
-      INTEGER, DIMENSION(:, :), INTENT(IN) :: index_to_cell
-      LOGICAL, INTENT(OUT)                 :: found
-      INTEGER, INTENT(OUT)                 :: index
+      INTEGER, DIMENSION(3), INTENT(IN)                  :: cell
+      INTEGER, DIMENSION(:, :), INTENT(IN)               :: index_to_cell
+      LOGICAL, INTENT(OUT)                               :: found
+      INTEGER, INTENT(OUT)                               :: index
 
-      INTEGER                              :: i
+      INTEGER                                            :: i
 
       found = .FALSE.
       index = 0
@@ -755,16 +764,15 @@ CONTAINS
 
       COMPLEX(dp)                                        :: phase
       COMPLEX(dp), ALLOCATABLE, ASYNCHRONOUS             :: receive_q(:), send_q(:, :, :)
-      INTEGER                                            :: cell_index(3), first_l, handle, i_dest, i_grid, i_l, i_P, i_q, &
-                                                            i_rank, i_slot, i_T, last_l, local_first_l, local_last_l, &
-                                                            n_active_q, n_grid_P, n_l, n_P, n_ranks, n_recv, position, &
-                                                            q_column, q_offset
+      INTEGER :: cell_index(3), first_l, handle, i_dest, i_grid, i_l, i_P, i_q, i_rank, i_slot, &
+         i_T, last_l, local_first_l, local_last_l, n_active_q, n_grid_P, n_l, n_P, n_ranks, &
+         n_recv, position, q_column, q_offset
       INTEGER(KIND=int_8)                                :: work_bytes
       INTEGER, ALLOCATABLE                               :: q_indices(:)
       LOGICAL                                            :: receiving, sending(2), use_blas
       REAL(dp)                                           :: qpoint(3)
-      REAL(dp), ALLOCATABLE                              :: phase_imag(:, :), phase_real(:, :), result_imag(:, :), &
-                                                            result_real(:, :)
+      REAL(dp), ALLOCATABLE                              :: phase_imag(:, :), phase_real(:, :), &
+                                                            result_imag(:, :), result_real(:, :)
       REAL(dp), CONTIGUOUS, POINTER                      :: RI_matrix(:, :)
       TYPE(mp_request_type)                              :: send_requests(2)
       TYPE(mp_request_type), ALLOCATABLE                 :: recv_requests(:)
