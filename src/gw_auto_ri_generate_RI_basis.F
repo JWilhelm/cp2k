@@ -2056,6 +2056,7 @@ CONTAINS
          INTENT(OUT)                                     :: eigenval
 
       CHARACTER(LEN=*), PARAMETER :: routineN = 'solve_AA_eigenproblem_periodic'
+      REAL(KIND=dp), PARAMETER                           :: eps_metric_defect = 1.0E-7_dp
 
       CHARACTER(LEN=256)                                 :: diagnostic
       INTEGER                                            :: handle, i, iortho, j, M_PQ_rank, n, nret
@@ -2136,7 +2137,7 @@ CONTAINS
                M_pp_check(i, i) = M_pp_check(i, i) - 1.0_dp
             END DO
             metric_defect = MAXVAL(ABS(M_pp_check))
-            IF (metric_defect < 1.0E-7_dp) EXIT
+            IF (metric_defect < eps_metric_defect) EXIT
             IF (iortho == 5) EXIT
             DO i = 1, nret
                M_pp_check(i, i) = M_pp_check(i, i) + 1.0_dp
@@ -2151,7 +2152,7 @@ CONTAINS
             END DO
             U_Pp_A(:, :) = MATMUL(U_Pp_A_rotated, TRANSPOSE(M_pp_check))
          END DO
-         IF (metric_defect >= 1.0E-7_dp) THEN
+         IF (metric_defect >= eps_metric_defect) THEN
             WRITE (diagnostic, '(A,ES13.5,A,I0)') &
                'AUTO_RI selected atom metric defect=', metric_defect, ' refinements=', iortho
             CPABORT(TRIM(diagnostic))

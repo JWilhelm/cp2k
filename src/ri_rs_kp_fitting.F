@@ -329,12 +329,12 @@ CONTAINS
             IF (ALL(bs_env%periodic == [1, 1, 0])) THEN
                ! The separated 2D charge channel is normalized by layer area,
                ! independent of the vacuum-cell height.
-               volume = SQRT(SUM([bs_env%hmat(2, 1)*bs_env%hmat(3, 2) - &
-                                  bs_env%hmat(3, 1)*bs_env%hmat(2, 2), &
-                                  bs_env%hmat(3, 1)*bs_env%hmat(1, 2) - &
-                                  bs_env%hmat(1, 1)*bs_env%hmat(3, 2), &
-                                  bs_env%hmat(1, 1)*bs_env%hmat(2, 2) - &
-                                  bs_env%hmat(2, 1)*bs_env%hmat(1, 2)]**2))
+               volume = NORM2([bs_env%hmat(2, 1)*bs_env%hmat(3, 2) - &
+                               bs_env%hmat(3, 1)*bs_env%hmat(2, 2), &
+                               bs_env%hmat(3, 1)*bs_env%hmat(1, 2) - &
+                               bs_env%hmat(1, 1)*bs_env%hmat(3, 2), &
+                               bs_env%hmat(1, 1)*bs_env%hmat(2, 2) - &
+                               bs_env%hmat(2, 1)*bs_env%hmat(1, 2)])
             END IF
             CPASSERT(volume > 0.0_dp)
             IF (bs_env%ri_metric%potential_type == do_potential_short) THEN
@@ -633,16 +633,6 @@ CONTAINS
       LOGICAL                                            :: found
       REAL(KIND=dp)                                      :: progress_start
       REAL(KIND=dp), ALLOCATABLE                         :: phi_full(:, :), phi_local(:, :)
-      INTERFACE
-         SUBROUTINE dgemm(transa, transb, m, n, k, alpha, a, lda, b, ldb, beta, c, ldc)
-            IMPORT dp
-            CHARACTER(LEN=1), INTENT(IN) :: transa, transb
-            INTEGER, INTENT(IN)          :: m, n, k, lda, ldb, ldc
-            REAL(dp), INTENT(IN)         :: alpha, beta, a(lda, *), b(ldb, *)
-            REAL(dp), INTENT(INOUT)      :: c(ldc, *)
-
-         END SUBROUTINE dgemm
-      END INTERFACE
 
       CALL timeset('compute_D_llp', handle)
 
@@ -751,16 +741,6 @@ CONTAINS
       REAL(dp), CONTIGUOUS, POINTER                      :: RI_matrix(:, :)
       TYPE(mp_request_type)                              :: send_requests(2)
       TYPE(mp_request_type), ALLOCATABLE                 :: recv_requests(:)
-      INTERFACE
-         SUBROUTINE dgemm(transa, transb, m, n, k, alpha, a, lda, b, ldb, beta, c, ldc)
-            IMPORT dp
-            CHARACTER(LEN=1), INTENT(IN) :: transa, transb
-            INTEGER, INTENT(IN)          :: m, n, k, lda, ldb, ldc
-            REAL(dp), INTENT(IN)         :: alpha, beta, a(lda, *), b(ldb, *)
-            REAL(dp), INTENT(INOUT)      :: c(ldc, *)
-
-         END SUBROUTINE dgemm
-      END INTERFACE
 
       CALL timeset('d_lP_T_to_q', handle)
 

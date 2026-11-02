@@ -1101,6 +1101,7 @@ CONTAINS
       TYPE(kpoint_type), POINTER                         :: kpoints_chi_eps_W
 
       CHARACTER(LEN=*), PARAMETER :: routineN = 'setup_kpoints_chi_eps_W'
+      REAL(KIND=dp), PARAMETER                           :: eps_kpoint_mesh = 1.0E-8_dp
 
       INTEGER                                            :: handle, i_dim, ikp, n_dim, nkp, &
                                                             nkp_extra, nkp_orig, u
@@ -1191,7 +1192,7 @@ CONTAINS
             DO i_dim = 1, 3
                scaled_q = bs_env%kpoints_scf_desymm%xkp(i_dim, ikp)*REAL(nkp_grid(i_dim), dp)
                IF (periodic(i_dim) == 1) scaled_q = scaled_q - 0.5_dp
-               IF (ABS(scaled_q - REAL(NINT(scaled_q), dp)) > 1.0E-8_dp) THEN
+               IF (ABS(scaled_q - REAL(NINT(scaled_q), dp)) > eps_kpoint_mesh) THEN
                   CPABORT("Periodic RI-RS G=0 separation requires half-shifted periodic SCF k points")
                END IF
                ikp_grid(i_dim) = MODULO(NINT(scaled_q), nkp_grid(i_dim)) + 1

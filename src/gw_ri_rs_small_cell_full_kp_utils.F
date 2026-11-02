@@ -135,6 +135,11 @@ MODULE gw_ri_rs_small_cell_full_kp_utils
              prepare_ri_rs, prepare_ri_rs_gamma_correction, &
              get_gw_work, release_gw_work
 
+   REAL(KIND=dp), EXTERNAL :: zlange
+
+   ! Relative cutoff shared by the serial and grouped AUTO_RI metric inverses.
+   REAL(KIND=dp), PARAMETER :: eps_auto_ri_metric = 1.0E-12_dp
+
    ! Blocking limits and named slots in the six existing CP2K matrix workspaces.
    INTEGER, PARAMETER :: column_block_cols = 32
    INTEGER, PARAMETER :: kpoint_batch_size = 8, pair_batch_size = 256
@@ -368,8 +373,8 @@ CONTAINS
          n_required_q, n_RI, nkp_local, own_q, phase_handle, q_ordinal, q_owner, q_root
       INTEGER, ALLOCATABLE                               :: q_roots(:)
       LOGICAL                                            :: grouped_q
-      REAL(KIND=dp) :: available_GB, max_tmp, metric_norm_max, metric_tmp, min_tmp, phase_elapsed, &
-         phase_start, qnorm, required_bytes, step_start, W_aux_time_norm, Wnorm_tmp
+      REAL(KIND=dp) :: available_GB, max_tmp, metric_norm_max, metric_tmp, min_tmp, norm_work(1), &
+         phase_elapsed, phase_start, qnorm, required_bytes, step_start, W_aux_time_norm, Wnorm_tmp
       REAL(KIND=dp), ALLOCATABLE :: dielectric_condition(:, :), dielectric_max_eigenvalue(:, :), &
          dielectric_min_eigenvalue(:, :), frequency_elapsed(:), M_inv_norm(:), &
          metric_chi_norm(:, :), time_weights(:), V_sqrt_norm(:), W_aux_norm(:)
@@ -486,8 +491,8 @@ CONTAINS
                   IF (my_qgroup == q_ordinal) CALL grouped_w_set_factor(w_matrices, w_group_env, n_RI, i_t, chi_k_w)
                END DO
                IF (bs_env%para_env%mepos == q_owner) THEN
-                  M_inv_norm(ikp) = SQRT(SUM(ABS(M_inv(:, :, ikp_local))**2))
-                  V_sqrt_norm(ikp) = SQRT(SUM(ABS(V_sqrt(:, :, ikp_local))**2))
+                  M_inv_norm(ikp) = zlange('F', n_RI, n_RI, M_inv(:, :, ikp_local), n_RI, norm_work)
+                  V_sqrt_norm(ikp) = zlange('F', n_RI, n_RI, V_sqrt(:, :, ikp_local), n_RI, norm_work)
                   ALLOCATE (gwkp_env%W_PQ_tau(ikp_local)%values( &
                             n_RI, n_RI, bs_env%num_time_freq_points), SOURCE=z_zero)
                END IF
@@ -557,8 +562,8 @@ CONTAINS
             ikp_local = ikp_local + 1
             CALL grouped_w_set_factor(w_matrices, w_group_env, n_RI, 1, gwkp_env%metric_coulomb_factor(:, :, ikp_local))
             CALL grouped_w_set_factor(w_matrices, w_group_env, n_RI, 2, V_sqrt(:, :, ikp_local))
-            M_inv_norm(ikp) = SQRT(SUM(ABS(M_inv(:, :, ikp_local))**2))
-            V_sqrt_norm(ikp) = SQRT(SUM(ABS(V_sqrt(:, :, ikp_local))**2))
+            M_inv_norm(ikp) = zlange('F', n_RI, n_RI, M_inv(:, :, ikp_local), n_RI, norm_work)
+            V_sqrt_norm(ikp) = zlange('F', n_RI, n_RI, V_sqrt(:, :, ikp_local), n_RI, norm_work)
             ALLOCATE (gwkp_env%W_PQ_tau(ikp_local)%values(n_RI, n_RI, bs_env%num_time_freq_points), SOURCE=z_zero)
             DO j_w = 1, bs_env%num_time_freq_points
                step_start = m_walltime()
@@ -607,7 +612,7 @@ CONTAINS
                CALL power(chi_k_w, 1.0_dp, bs_env%eps_eigval_mat_RI)
                CALL gemm_square(gwkp_env%metric_coulomb_factor(:, :, ikp_local), 'C', chi_k_w, 'N', &
                                 gwkp_env%metric_coulomb_factor(:, :, ikp_local), 'N', eps_k_w)
-               metric_chi_norm(ikp, j_w) = SQRT(SUM(ABS(eps_k_w)**2))
+               metric_chi_norm(ikp, j_w) = zlange('F', n_RI, n_RI, eps_k_w, n_RI, norm_work)
                CALL shift_diagonal(eps_k_w, 1.0_dp)
                CALL power(eps_k_w, -1.0_dp, 0.0_dp, &
                           min_ev=dielectric_min_eigenvalue(ikp, j_w), &
@@ -617,9 +622,9 @@ CONTAINS
                                 V_sqrt(:, :, ikp_local), 'C', W_k_w)
                W_aux_local_q(:, :, ikp_local) = W_k_w
                IF (j_w == 1) THEN
-                  M_inv_norm(ikp) = SQRT(SUM(ABS(M_inv(:, :, ikp_local))**2))
-                  V_sqrt_norm(ikp) = SQRT(SUM(ABS(V_sqrt(:, :, ikp_local))**2))
-                  W_aux_norm(ikp) = SQRT(SUM(ABS(W_k_w)**2))
+                  M_inv_norm(ikp) = zlange('F', n_RI, n_RI, M_inv(:, :, ikp_local), n_RI, norm_work)
+                  V_sqrt_norm(ikp) = zlange('F', n_RI, n_RI, V_sqrt(:, :, ikp_local), n_RI, norm_work)
+                  W_aux_norm(ikp) = zlange('F', n_RI, n_RI, W_k_w, n_RI, norm_work)
                END IF
             END DO
             CPASSERT(ikp_local == nkp_local)
@@ -671,8 +676,8 @@ CONTAINS
       CALL bs_env%para_env%sum(W_aux_norm)
       IF (ALL(bs_env%periodic == [1, 1, 0]) .AND. bs_env%unit_nr > 0) THEN
          DO ikp = 1, bs_env%nkp_scf_desymm
-            qnorm = SQRT(SUM(MATMUL(twopi*TRANSPOSE(inv_3x3(bs_env%hmat)), &
-                                    bs_env%kpoints_chi_eps_W%xkp(:, ikp))**2))
+            qnorm = NORM2(MATMUL(twopi*TRANSPOSE(inv_3x3(bs_env%hmat)), &
+                                 bs_env%kpoints_chi_eps_W%xkp(:, ikp)))
             WRITE (bs_env%unit_nr, '(T2,A,I5,3ES16.7)') &
                'GW2D_DIAG_Q_WC ', ikp, qnorm, W_aux_norm(ikp), V_sqrt_norm(ikp)
          END DO
@@ -833,7 +838,7 @@ CONTAINS
       best(:, :) = coefficients
       best_worst = worst
       DO istep = 1, 30
-         grad_norm = SQRT(SUM(gradient*gradient))
+         grad_norm = NORM2(gradient)
          IF (grad_norm < 1.0E-8_dp) EXIT
          step = 1.0_dp/MAX(1.0_dp, MAXVAL(ABS(gradient)))
          slope = SUM(gradient*gradient)
@@ -975,7 +980,7 @@ CONTAINS
             CALL auto_ri_metric_inverse(projected, eigval, inverse)
             largest = MAXVAL(eigval)
             smallest = MINVAL(eigval)
-            singular = smallest <= 1.0E-12_dp*largest .OR. largest <= 0.0_dp
+            singular = smallest <= eps_auto_ri_metric*largest .OR. largest <= 0.0_dp
             IF (.NOT. singular) THEN
                trace_h = SUM(eigval)
                trace_inverse = SUM(1.0_dp/eigval)
@@ -1117,7 +1122,7 @@ CONTAINS
       IF (group_env%mepos /= 0) RETURN
       largest = MAXVAL(eigenvalues)
       smallest = MINVAL(eigenvalues)
-      IF (smallest <= 1.0E-12_dp*largest .OR. largest <= 0.0_dp) THEN
+      IF (smallest <= eps_auto_ri_metric*largest .OR. largest <= 0.0_dp) THEN
          n_singular = 1
          RETURN
       END IF
@@ -1232,7 +1237,7 @@ CONTAINS
 
       inverse = z_zero
       IF (MAXVAL(eigenvalues) <= 0.0_dp) RETURN
-      IF (MINVAL(eigenvalues) <= 1.0E-12_dp*MAXVAL(eigenvalues)) RETURN
+      IF (MINVAL(eigenvalues) <= eps_auto_ri_metric*MAXVAL(eigenvalues)) RETURN
       inverse = matrix
 
       CALL timeset('auto_ri_metric_cholesky', handle)
@@ -1834,7 +1839,7 @@ CONTAINS
       DEALLOCATE (angular_directions, angular_weights, angular_radii)
       DO i_direction = 1, n_near
          q_cart = MATMUL(reciprocal, near_q(:, i_direction))
-         qnorm = SQRT(SUM(q_cart*q_cart))
+         qnorm = NORM2(q_cart)
          gwkp_env%gamma_correction%directions(:, n_angular + i_direction) = q_cart/qnorm
          gwkp_env%gamma_correction%weights(n_angular + i_direction) = 0.0_dp
          gwkp_env%gamma_correction%radii(n_angular + i_direction) = qnorm
@@ -2179,6 +2184,7 @@ CONTAINS
       INTEGER                                            :: handle, ikp, ilocal, n_ref, n_RI, nkp, &
                                                             nkp_local
       INTEGER, ALLOCATABLE                               :: metric_cells(:, :)
+      REAL(KIND=dp)                                      :: norm_work(1)
       TYPE(cp_fm_type), ALLOCATABLE                      :: fm_metric(:)
 
       CALL timeset(routineN, handle)
@@ -2224,7 +2230,7 @@ CONTAINS
             M_inv(:, :, ilocal) = M_ref(:, :, ilocal)
             V_sqrt(:, :, ilocal) = V_ref(:, :, ilocal)
          END IF
-         metric_norm_max = MAX(metric_norm_max, SQRT(SUM(ABS(M_inv(:, :, ilocal))**2)))
+         metric_norm_max = MAX(metric_norm_max, zlange('F', n_RI, n_RI, M_inv(:, :, ilocal), n_RI, norm_work))
          CALL power(M_inv(:, :, ilocal), -1.0_dp, 0.0_dp, &
                     relative_eps=bs_env%regularization_RI)
          CALL power(V_sqrt(:, :, ilocal), 0.5_dp, 0.0_dp)
@@ -2337,7 +2343,7 @@ CONTAINS
                   qfrac(j) = nodes(ia)/REAL(MAX(2, bs_env%nkp_grid_chi_eps_W_orig(j)), dp)
                   qfrac(k) = nodes(ib)/REAL(MAX(2, bs_env%nkp_grid_chi_eps_W_orig(k)), dp)
                   q = MATMUL(bmat, qfrac)
-                  radii(face) = SQRT(SUM(q*q))
+                  radii(face) = NORM2(q)
                   directions(:, face) = q/radii(face)
                   weights(face) = (twopi**3/volume)/(fourpi*REAL(nk, dp)*radii(face)**3)* &
                                   rule_weights(ia)*rule_weights(ib)*jacobian_scale
@@ -2413,7 +2419,7 @@ CONTAINS
             scaled = ABS(q)*REAL(bs_env%nkp_grid_chi_eps_W_orig, dp)
             IF (MAXVAL(ABS(scaled - 0.5_dp)) >= 1.0E-9_dp) CYCLE
             qcart = MATMUL(twopi*TRANSPOSE(inv_3x3(bs_env%hmat)), q)
-            qnorm = SQRT(SUM(qcart*qcart))
+            qnorm = NORM2(qcart)
             phase = EXP(-gaussi*DOT_PRODUCT(qcart, rcart))
             factors(icell) = factors(icell) - phase/(REAL(nk, dp)*qnorm*qnorm)
          END DO
@@ -2452,7 +2458,7 @@ CONTAINS
       normal = [a1(2)*a2(3) - a1(3)*a2(2), &
                 a1(3)*a2(1) - a1(1)*a2(3), &
                 a1(1)*a2(2) - a1(2)*a2(1)]
-      area = SQRT(SUM(normal**2))
+      area = NORM2(normal)
       CPASSERT(area > 0.0_dp)
       normal = normal/area
       b(:, 1) = twopi*[a2(2)*normal(3) - a2(3)*normal(2), &
@@ -2488,7 +2494,7 @@ CONTAINS
                                 REAL(MAX(2, bs_env%nkp_grid_chi_eps_W_orig(axis)), dp)
                   qfrac(j) = t/REAL(MAX(2, bs_env%nkp_grid_chi_eps_W_orig(j)), dp)
                   qcart = b(:, 1)*qfrac(1) + b(:, 2)*qfrac(2)
-                  length = SQRT(SUM(qcart*qcart))
+                  length = NORM2(qcart)
                   cross_product = [qcart(2)*dq(3) - qcart(3)*dq(2), &
                                    qcart(3)*dq(1) - qcart(1)*dq(3), &
                                    qcart(1)*dq(2) - qcart(2)*dq(1)]
@@ -2511,7 +2517,7 @@ CONTAINS
             scaled = ABS(qfrac(1:2))*REAL(bs_env%nkp_grid_chi_eps_W_orig(1:2), dp)
             IF (MAXVAL(ABS(scaled - 0.5_dp)) >= 1.0E-9_dp) CYCLE
             qcart = b(:, 1)*qfrac(1) + b(:, 2)*qfrac(2)
-            length = SQRT(SUM(qcart*qcart))
+            length = NORM2(qcart)
             phase = EXP(-gaussi*DOT_PRODUCT(qcart, rcart))
             factors(icell) = factors(icell) - phase/(REAL(nk, dp)*length)
          END DO
@@ -2617,7 +2623,7 @@ CONTAINS
       a2 = bs_env%hmat(:, 2)
       normal = [a1(2)*a2(3) - a1(3)*a2(2), a1(3)*a2(1) - a1(1)*a2(3), &
                 a1(1)*a2(2) - a1(2)*a2(1)]
-      area = SQRT(SUM(normal**2))
+      area = NORM2(normal)
       CPASSERT(area > 0.0_dp)
       normal = normal/area
       b(:, 1) = twopi*[a2(2)*normal(3) - a2(3)*normal(2), &
@@ -2660,11 +2666,11 @@ CONTAINS
                i_direction = i_direction + 1
                q = REAL(i_sign, dp)*b(:, i_axis)/REAL(bs_env%nkp_grid_chi_eps_W_orig(i_axis), dp) &
                    + nodes(i_node)*dq
-               radii(i_direction) = SQRT(SUM(q*q))
+               radii(i_direction) = NORM2(q)
                directions(:, i_direction) = q/radii(i_direction)
                cross = [q(2)*dq(3) - q(3)*dq(2), q(3)*dq(1) - q(1)*dq(3), &
                         q(1)*dq(2) - q(2)*dq(1)]
-               weights(i_direction) = rule(i_node)*SQRT(SUM(cross**2))/SUM(q*q)
+               weights(i_direction) = rule(i_node)*NORM2(cross)/SUM(q*q)
             END DO
          END DO
       END DO
@@ -2880,7 +2886,7 @@ CONTAINS
             ELSE
                qcart = MATMUL(twopi*TRANSPOSE(inv_3x3(bs_env%hmat)), &
                               model%near_q(:, idir - model%n_angular))
-               qnorm = SQRT(SUM(qcart*qcart))
+               qnorm = NORM2(qcart)
                phase = EXP(-gaussi*DOT_PRODUCT(qcart, rcart))
                kernel_h = -phase/(REAL(nk, dp)*qnorm*qnorm)
                kernel_w = -phase/(REAL(nk, dp)*qnorm)
@@ -4244,7 +4250,7 @@ CONTAINS
       CALL cp_cfm_heevd(distributed, scratch, eigenvalues)
       CALL timestop(phase_handle)
       IF (MAXVAL(eigenvalues) > 0.0_dp .AND. &
-          MINVAL(eigenvalues) > 1.0E-12_dp*MAXVAL(eigenvalues)) THEN
+          MINVAL(eigenvalues) > eps_auto_ri_metric*MAXVAL(eigenvalues)) THEN
          CALL set_owner_matrix(distributed, matrix, group_env, 0, n)
          CALL timeset('auto_ri_grouped_cholesky', phase_handle)
          CALL cp_cfm_cholesky_decompose(distributed, info_out=info)

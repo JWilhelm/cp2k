@@ -61,6 +61,10 @@ MODULE kpoint_coulomb_2c
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :)  :: block
    END TYPE two_d_util_type
 
+   ! Numerical Ewald splitting and conservative Gaussian-tail cutoff heuristics.
+   REAL(KIND=dp), PARAMETER :: ewald_omega_default = 0.3_dp, &
+                               ewald_tail_exponent = 50.0_dp, ewald_lmax_margin = 4.0_dp
+
 CONTAINS
 
 ! **************************************************************************************************
@@ -1021,13 +1025,13 @@ CONTAINS
          lmax = MAX(lmax, MAXVAL(basis%lmax))
       END DO
       CPASSERT(alpha_min > 0.0_dp)
-      omega = 0.3_dp
+      omega = ewald_omega_default
       beta = 1.0_dp/(2.0_dp/alpha_min + 1.0_dp/omega**2)
-      radius = SQRT((50.0_dp + 4.0_dp*lmax)/beta)
+      radius = SQRT((ewald_tail_exponent + ewald_lmax_margin*lmax)/beta)
       DO idim = 1, 3
          bounds(idim) = 0
          IF (cell%perd(idim) /= 0) THEN
-            bounds(idim) = CEILING(radius*SQRT(SUM(cell%h_inv(idim, :)**2))) + 1
+            bounds(idim) = CEILING(radius*NORM2(cell%h_inv(idim, :))) + 1
          END IF
       END DO
       x_min = -bounds(1)
@@ -1060,6 +1064,8 @@ CONTAINS
       INTEGER, INTENT(IN)                                :: bf_start(:), bf_end(:), ikp_start, &
                                                             ikp_end
 
+      REAL(KIND=dp), PARAMETER :: eps_reciprocal_norm_squared = 1.0E-24_dp
+
       COMPLEX(KIND=dp), ALLOCATABLE                      :: fourier_basis(:)
       INTEGER                                            :: bounds(3), idim, ikind, ikp, ikp_local, &
                                                             ix, iy, iz, lmax, n_bf
@@ -1085,14 +1091,14 @@ CONTAINS
             CALL get_qs_kind(qs_kinds(ikind), basis_set=basis, basis_type=basis_type)
             lmax = MAX(lmax, MAXVAL(basis%lmax))
          END DO
-         cutoff = 2.0_dp*omega*SQRT(50.0_dp + 4.0_dp*lmax)
+         cutoff = 2.0_dp*omega*SQRT(ewald_tail_exponent + ewald_lmax_margin*lmax)
          DO ikp = ikp_start, ikp_end
             IF (MODULO(ikp, para_env%num_pe) /= para_env%mepos) CYCLE
             ikp_local = (ikp - para_env%mepos)/para_env%num_pe + 1
             IF (para_env%mepos == 0) ikp_local = ikp/para_env%num_pe
             q = kpoints%xkp(:, ikp)
             DO idim = 1, 3
-               bounds(idim) = CEILING(cutoff*SQRT(SUM(cell%hmat(:, idim)**2))/twopi + ABS(q(idim)))
+               bounds(idim) = CEILING(cutoff*NORM2(cell%hmat(:, idim))/twopi + ABS(q(idim)))
             END DO
             DO ix = -bounds(1), bounds(1)
                DO iy = -bounds(2), bounds(2)
@@ -1102,7 +1108,7 @@ CONTAINS
                      IF (p2 > cutoff**2) CYCLE
                      CALL gaussian_basis_fourier(p, particles, qs_kinds, cell, basis_type, &
                                                  bf_start, bf_end, fourier_basis)
-                     IF (p2 < 1.0E-24_dp) THEN
+                     IF (p2 < eps_reciprocal_norm_squared) THEN
                         prefactor = -pi/(cell%deth*omega**2)
                      ELSE
                         prefactor = fourpi*EXP(-p2/(4.0_dp*omega**2))/(cell%deth*p2)
@@ -1168,7 +1174,7 @@ CONTAINS
       normal = [a1(2)*a2(3) - a1(3)*a2(2), &
                 a1(3)*a2(1) - a1(1)*a2(3), &
                 a1(1)*a2(2) - a1(2)*a2(1)]
-      area = SQRT(SUM(normal**2))
+      area = NORM2(normal)
       CPASSERT(area > 0.0_dp)
       normal = normal/area
       b1 = twopi*[a2(2)*normal(3) - a2(3)*normal(2), &
@@ -1185,7 +1191,7 @@ CONTAINS
          CALL get_qs_kind(qs_kinds(ikind), basis_set=basis, basis_type=basis_type)
          lmax = MAX(lmax, MAXVAL(basis%lmax))
       END DO
-      cutoff = 2.0_dp*omega*SQRT(50.0_dp + 4.0_dp*lmax)
+      cutoff = 2.0_dp*omega*SQRT(ewald_tail_exponent + ewald_lmax_margin*lmax)
       CALL gauss_legendre_2d_kz(n_kz, cutoff, nodes, weights)
       DO ikp = ikp_start, ikp_end
          IF (MODULO(ikp, para_env%num_pe) /= para_env%mepos) CYCLE
@@ -1195,13 +1201,13 @@ CONTAINS
          IF (ABS(q(free_axis)) > 1.0E-10_dp) THEN
             CPABORT('2D reciprocal transfer has a nonzero nonperiodic component')
          END IF
-         nx = CEILING(cutoff*SQRT(SUM(a1*a1))/twopi + ABS(q(periodic_axis(1))))
-         ny = CEILING(cutoff*SQRT(SUM(a2*a2))/twopi + ABS(q(periodic_axis(2))))
+         nx = CEILING(cutoff*NORM2(a1)/twopi + ABS(q(periodic_axis(1))))
+         ny = CEILING(cutoff*NORM2(a2)/twopi + ABS(q(periodic_axis(2))))
          DO ix = -nx, nx
             DO iy = -ny, ny
                p = b1*(q(periodic_axis(1)) + REAL(ix, dp)) + &
                    b2*(q(periodic_axis(2)) + REAL(iy, dp))
-               pnorm = SQRT(SUM(p*p))
+               pnorm = NORM2(p)
                IF (pnorm > cutoff) CYCLE
                IF (pnorm < 1.0E-12_dp) THEN
                   CPABORT('2D Coulomb at Gamma requires charge-channel separation')

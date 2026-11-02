@@ -582,10 +582,12 @@ CONTAINS
       TYPE(uniform_settings_type), INTENT(OUT)           :: settings
       LOGICAL, INTENT(IN), OPTIONAL                      :: report
 
+      REAL(dp), PARAMETER :: padding_safety = 1.1_dp, &
+         spacing_prefactor = 0.4_dp*SQRT(2.693604_dp*LOG(1.0E8_dp))
+
       INTEGER(int_8)                                     :: npoints
       LOGICAL                                            :: report_settings
-      REAL(dp)                                           :: exponent_max, exponent_min, &
-                                                            padding_safety, spacing_prefactor
+      REAL(dp)                                           :: exponent_max, exponent_min
 
       settings%accuracy = d_lP_integration_accuracy(bs_env)
       IF (bs_env%ri_metric%potential_type /= do_potential_coulomb .AND. &
@@ -594,9 +596,6 @@ CONTAINS
          CPABORT('Uniform DLP requires a Coulomb, truncated or short-range RI metric')
       END IF
       CALL ao_exponent_range(bs_env, exponent_min, exponent_max)
-      ! The AO exponent calibration includes the matched reference RI basis.
-      spacing_prefactor = 0.4_dp*SQRT(2.693604_dp*LOG(1.0E8_dp))
-      padding_safety = 1.1_dp
       settings%l_block_edge = 1.0_dp/angstrom
       settings%spacing = spacing_prefactor/ &
                          SQRT(exponent_max*LOG(1.0_dp/settings%accuracy))
