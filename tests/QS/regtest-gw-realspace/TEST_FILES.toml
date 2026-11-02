@@ -74,5 +74,15 @@
   {matcher = "Auto_RI_Size", tol = 1e-12, ref = 10},
   {matcher = "E_G0W0_indirect_gap", tol = 1e-4, ref = 32.541}
 ]
-"11_RIRS_G0W0_PBE_2D_AUTO_RI_hBN.inp"       = [{matcher = "E_G0W0_indirect_gap", tol = 1e-3, ref = 5.838}]
+# These two hBN cases exercise 2D Ewald with both GAPW and GPW.
+"11_RIRS_G0W0_PBE_2D_AUTO_RI_hBN.inp"       = [
+  {matcher = "Auto_RI_Size", tol = 1e-12, ref = 78},
+  {matcher = "E_G0W0_indirect_gap", tol = 1e-3, ref = 5.838},
+  {matcher = "E_G0W0_direct_gap", tol = 1e-3, ref = 5.838}
+]
+"12_RIRS_G0W0_PBE_2D_AUTO_RI_hBN_GPW.inp"   = [
+  {matcher = "Auto_RI_Size", tol = 1e-12, ref = 78},
+  {matcher = "E_G0W0_indirect_gap", tol = 1e-3, ref = 5.839},
+  {matcher = "E_G0W0_direct_gap", tol = 1e-3, ref = 5.839}
+]
 #EOF
