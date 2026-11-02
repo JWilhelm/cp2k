@@ -74,4 +74,5 @@
   {matcher = "Auto_RI_Size", tol = 1e-12, ref = 10},
   {matcher = "E_G0W0_indirect_gap", tol = 1e-4, ref = 32.541}
 ]
+"11_RIRS_G0W0_PBE_2D_AUTO_RI_hBN.inp"       = [{matcher = "E_G0W0_indirect_gap", tol = 1e-3, ref = 5.838}]
 #EOF

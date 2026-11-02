@@ -1027,6 +1027,7 @@ CONTAINS
       DO idim = 1, 3
          bounds(idim) = CEILING(radius*SQRT(SUM(cell%h_inv(idim, :)**2))) + 1
       END DO
+      WHERE (cell%perd == 0) bounds = 0
       x_min = -bounds(1)
       x_max = bounds(1)
       y_min = -bounds(2)
@@ -1069,6 +1070,11 @@ CONTAINS
       TYPE(qs_kind_type), POINTER                        :: qs_kinds(:)
 
       CALL get_qs_env(qs_env, cell=cell, para_env=para_env, particle_set=particles, qs_kind_set=qs_kinds)
+      IF (ALL(cell%perd == [1, 1, 0])) THEN
+         CALL add_ewald_reciprocal_2d(V_k, qs_env, kpoints, basis_type, omega, &
+                                      bf_start, bf_end, ikp_start, ikp_end, .FALSE.)
+         RETURN
+      END IF
       n_bf = SIZE(V_k, 1)
       ALLOCATE (fourier_basis(n_bf))
       reciprocal = twopi*TRANSPOSE(cell%h_inv)
@@ -1107,6 +1113,188 @@ CONTAINS
       END DO
       DEALLOCATE (fourier_basis)
    END SUBROUTINE add_ewald_reciprocal
+
+! **************************************************************************************************
+!> \brief Reciprocal 2D Ewald Coulomb matrix with continuous momentum normal to the layer.
+!> \param V_k ...
+!> \param qs_env ...
+!> \param kpoints ...
+!> \param basis_type ...
+!> \param omega ...
+!> \param bf_start ...
+!> \param bf_end ...
+!> \param ikp_start ...
+!> \param ikp_end ...
+!> \param separate_g0 ...
+!> \param g0_basis ...
+!> \param g0_prefactor ...
+! **************************************************************************************************
+   SUBROUTINE add_ewald_reciprocal_2d(V_k, qs_env, kpoints, basis_type, omega, &
+                                      bf_start, bf_end, ikp_start, ikp_end, separate_g0, &
+                                      g0_basis, g0_prefactor)
+      COMPLEX(KIND=dp), INTENT(INOUT)                    :: V_k(:, :, :)
+      TYPE(qs_environment_type), POINTER                 :: qs_env
+      TYPE(kpoint_type), POINTER                         :: kpoints
+      CHARACTER(LEN=*), INTENT(IN)                       :: basis_type
+      REAL(KIND=dp), INTENT(IN)                          :: omega
+      INTEGER, INTENT(IN)                                :: bf_start(:), bf_end(:), ikp_start, &
+                                                            ikp_end
+      LOGICAL, INTENT(IN)                                :: separate_g0
+      COMPLEX(KIND=dp), INTENT(INOUT), OPTIONAL          :: g0_basis(:, :)
+      REAL(KIND=dp), INTENT(INOUT), OPTIONAL             :: g0_prefactor(:)
+
+      INTEGER, PARAMETER                                 :: n_kz = 192
+
+      COMPLEX(KIND=dp), ALLOCATABLE                      :: delta_minus(:), delta_plus(:), &
+                                                            delta_sum(:), f_minus(:), f_plus(:), &
+                                                            f_zero(:)
+      INTEGER                                            :: ikind, ikp, ikp_local, inode, ix, iy, &
+                                                            lmax, n_bf, nx, ny
+      REAL(KIND=dp)                                      :: a1(3), a2(3), area, b1(3), b2(3), &
+                                                            cutoff, factor, kz, nodes(n_kz), &
+                                                            normal(3), p(3), pnorm, q(3), qzero, &
+                                                            weight, weights(n_kz)
+      TYPE(cell_type), POINTER                           :: cell
+      TYPE(gto_basis_set_type), POINTER                  :: basis
+      TYPE(mp_para_env_type), POINTER                    :: para_env
+      TYPE(particle_type), POINTER                       :: particles(:)
+      TYPE(qs_kind_type), POINTER                        :: qs_kinds(:)
+
+      CALL get_qs_env(qs_env, cell=cell, para_env=para_env, &
+                      particle_set=particles, qs_kind_set=qs_kinds)
+      IF (.NOT. ALL(cell%perd == [1, 1, 0])) THEN
+         CPABORT('2D Ewald reciprocal Coulomb requires PERIODIC XY')
+      END IF
+      a1 = cell%hmat(:, 1)
+      a2 = cell%hmat(:, 2)
+      normal = [a1(2)*a2(3) - a1(3)*a2(2), &
+                a1(3)*a2(1) - a1(1)*a2(3), &
+                a1(1)*a2(2) - a1(2)*a2(1)]
+      area = SQRT(SUM(normal**2))
+      CPASSERT(area > 0.0_dp)
+      normal = normal/area
+      b1 = twopi*[a2(2)*normal(3) - a2(3)*normal(2), &
+                  a2(3)*normal(1) - a2(1)*normal(3), &
+                  a2(1)*normal(2) - a2(2)*normal(1)]/area
+      b2 = twopi*[normal(2)*a1(3) - normal(3)*a1(2), &
+                  normal(3)*a1(1) - normal(1)*a1(3), &
+                  normal(1)*a1(2) - normal(2)*a1(1)]/area
+      n_bf = SIZE(V_k, 1)
+      ALLOCATE (f_zero(n_bf), f_plus(n_bf), f_minus(n_bf), &
+                delta_plus(n_bf), delta_minus(n_bf), delta_sum(n_bf))
+      lmax = 0
+      DO ikind = 1, SIZE(qs_kinds)
+         CALL get_qs_kind(qs_kinds(ikind), basis_set=basis, basis_type=basis_type)
+         lmax = MAX(lmax, MAXVAL(basis%lmax))
+      END DO
+      cutoff = 2.0_dp*omega*SQRT(50.0_dp + 4.0_dp*lmax)
+      CALL gauss_legendre_2d_kz(n_kz, cutoff, nodes, weights)
+      DO ikp = ikp_start, ikp_end
+         IF (MODULO(ikp, para_env%num_pe) /= para_env%mepos) CYCLE
+         ikp_local = (ikp - para_env%mepos)/para_env%num_pe + 1
+         IF (para_env%mepos == 0) ikp_local = ikp/para_env%num_pe
+         q = kpoints%xkp(:, ikp)
+         IF (ABS(q(3)) > 1.0E-10_dp) CPABORT('2D reciprocal transfer has nonzero qz')
+         nx = CEILING(cutoff*SQRT(SUM(a1*a1))/twopi + ABS(q(1)))
+         ny = CEILING(cutoff*SQRT(SUM(a2*a2))/twopi + ABS(q(2)))
+         DO ix = -nx, nx
+            DO iy = -ny, ny
+               p = b1*(q(1) + REAL(ix, dp)) + b2*(q(2) + REAL(iy, dp))
+               pnorm = SQRT(SUM(p*p))
+               IF (pnorm > cutoff .AND. &
+                   .NOT. (separate_g0 .AND. ix == 0 .AND. iy == 0)) CYCLE
+               IF (pnorm < 1.0E-12_dp .AND. &
+                   .NOT. (separate_g0 .AND. ix == 0 .AND. iy == 0)) THEN
+                  CPABORT('2D Coulomb at Gamma requires charge-channel separation')
+               END IF
+               CALL gaussian_basis_fourier(p, particles, qs_kinds, cell, basis_type, &
+                                           bf_start, bf_end, f_zero)
+               IF (separate_g0 .AND. ix == 0 .AND. iy == 0) THEN
+                  IF (PRESENT(g0_basis)) THEN
+                     g0_basis(:, ikp_local) = f_zero
+                     g0_prefactor(ikp_local) = 0.0_dp
+                     IF (pnorm > 1.0E-12_dp) THEN
+                        g0_prefactor(ikp_local) = twopi/(area*pnorm)
+                     END IF
+                  END IF
+                  IF (pnorm < 1.0E-8_dp) THEN
+                     ! -2*pi*erf(q/2omega)/(A*q) at q -> 0.
+                     qzero = -2.0_dp*SQRT(pi)/(area*omega)
+                  ELSE
+                     qzero = -twopi*ERF(pnorm/(2.0_dp*omega))/(area*pnorm)
+                  END IF
+               ELSE
+                  qzero = twopi*ERFC(pnorm/(2.0_dp*omega))/(area*pnorm)
+               END IF
+               CALL zgerc(n_bf, n_bf, CMPLX(qzero, 0.0_dp, dp), f_zero, 1, &
+                          f_zero, 1, V_k(:, :, ikp_local), n_bf)
+               IF (pnorm > cutoff) CYCLE
+               DO inode = 1, n_kz
+                  kz = nodes(inode)
+                  CALL gaussian_basis_fourier(p + kz*normal, particles, qs_kinds, cell, &
+                                              basis_type, bf_start, bf_end, f_plus)
+                  CALL gaussian_basis_fourier(p - kz*normal, particles, qs_kinds, cell, &
+                                              basis_type, bf_start, bf_end, f_minus)
+                  weight = 2.0_dp*weights(inode)* &
+                           EXP(-(pnorm**2 + kz**2)/(4.0_dp*omega**2))/ &
+                           (area*(pnorm**2 + kz**2))
+                  ! Expand the even-in-kz residual before the outer products.
+                  ! Direct subtraction of three large matrices loses precision
+                  ! near q=0, where their common denominator is small.
+                  delta_plus = f_plus - f_zero
+                  delta_minus = f_minus - f_zero
+                  delta_sum = delta_plus + delta_minus
+                  factor = weight
+                  CALL zgerc(n_bf, n_bf, CMPLX(factor, 0.0_dp, dp), f_zero, 1, &
+                             delta_sum, 1, V_k(:, :, ikp_local), n_bf)
+                  CALL zgerc(n_bf, n_bf, CMPLX(factor, 0.0_dp, dp), delta_sum, 1, &
+                             f_zero, 1, V_k(:, :, ikp_local), n_bf)
+                  CALL zgerc(n_bf, n_bf, CMPLX(factor, 0.0_dp, dp), delta_plus, 1, &
+                             delta_plus, 1, V_k(:, :, ikp_local), n_bf)
+                  CALL zgerc(n_bf, n_bf, CMPLX(factor, 0.0_dp, dp), delta_minus, 1, &
+                             delta_minus, 1, V_k(:, :, ikp_local), n_bf)
+               END DO
+            END DO
+         END DO
+      END DO
+      DEALLOCATE (f_zero, f_plus, f_minus, delta_plus, delta_minus, delta_sum)
+   END SUBROUTINE add_ewald_reciprocal_2d
+
+! **************************************************************************************************
+!> \brief Legendre nodes and weights on [0, upper] for the free momentum.
+!> \param n ...
+!> \param upper ...
+!> \param nodes ...
+!> \param weights ...
+! **************************************************************************************************
+   SUBROUTINE gauss_legendre_2d_kz(n, upper, nodes, weights)
+      INTEGER, INTENT(IN)                                :: n
+      REAL(KIND=dp), INTENT(IN)                          :: upper
+      REAL(KIND=dp), INTENT(OUT)                         :: nodes(n), weights(n)
+
+      INTEGER                                            :: i, iter, j
+      REAL(KIND=dp)                                      :: delta, derivative, p, previous, root, &
+                                                            value
+
+      DO i = 1, n
+         root = COS(pi*(REAL(i, dp) - 0.25_dp)/(REAL(n, dp) + 0.5_dp))
+         DO iter = 1, 30
+            previous = 1.0_dp
+            p = root
+            DO j = 2, n
+               value = ((2*j - 1)*root*p - (j - 1)*previous)/REAL(j, dp)
+               previous = p
+               p = value
+            END DO
+            derivative = n*(root*p - previous)/(root*root - 1.0_dp)
+            delta = p/derivative
+            root = root - delta
+            IF (ABS(delta) < 1.0E-15_dp) EXIT
+         END DO
+         nodes(i) = 0.5_dp*upper*(root + 1.0_dp)
+         weights(i) = upper/((1.0_dp - root*root)*derivative**2)
+      END DO
+   END SUBROUTINE gauss_legendre_2d_kz
 
 ! **************************************************************************************************
 !> \brief ...

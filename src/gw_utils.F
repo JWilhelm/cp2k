@@ -15,8 +15,11 @@
 MODULE gw_utils
    USE atomic_kind_types,               ONLY: atomic_kind_type,&
                                               get_atomic_kind_set
+   USE auto_basis,                      ONLY: create_ri_aux_basis_set
+   USE basis_set_container_types,       ONLY: add_basis_set_to_container
    USE basis_set_types,                 ONLY: get_gto_basis_set,&
-                                              gto_basis_set_type
+                                              gto_basis_set_type,&
+                                              init_orb_basis_set
    USE bibliography,                    ONLY: Graml2024,&
                                               cite_reference
    USE cell_types,                      ONLY: cell_type,&
@@ -121,6 +124,8 @@ MODULE gw_utils
                                               kpoint_slot_ks
    USE qs_ks_methods,                   ONLY: qs_ks_build_kohn_sham_matrix
    USE qs_neighbor_list_types,          ONLY: neighbor_list_set_p_type
+   USE qs_rho_methods,                  ONLY: qs_rho_update_rho
+   USE qs_rho_types,                    ONLY: qs_rho_type
    USE qs_tensors,                      ONLY: build_3c_integrals,&
                                               build_3c_neighbor_lists,&
                                               get_tensor_occupancy,&
@@ -799,7 +804,9 @@ CONTAINS
 
       CHARACTER(LEN=*), PARAMETER :: routineN = 'setup_AO_and_RI_basis_set'
 
-      INTEGER                                            :: handle, natom, nkind
+      INTEGER                                            :: handle, ikind, natom, nkind, sort_basis
+      TYPE(dft_control_type), POINTER                    :: dft_control
+      TYPE(gto_basis_set_type), POINTER                  :: reference_basis
       TYPE(particle_type), DIMENSION(:), POINTER         :: particle_set
       TYPE(qs_kind_type), DIMENSION(:), POINTER          :: qs_kind_set
 
@@ -808,7 +815,23 @@ CONTAINS
       CALL get_qs_env(qs_env, &
                       qs_kind_set=qs_kind_set, &
                       particle_set=particle_set, &
-                      natom=natom, nkind=nkind)
+                      natom=natom, nkind=nkind, dft_control=dft_control)
+
+      ! AUTO_RI needs a reference pool before its atom-local contraction.
+      IF (bs_env%auto_ri%enabled) THEN
+         CALL section_vals_val_get(qs_env%input, "DFT%SORT_BASIS", i_val=sort_basis)
+         DO ikind = 1, nkind
+            NULLIFY (reference_basis)
+            CALL get_qs_kind(qs_kind_set(ikind), basis_set=reference_basis, basis_type="RI_AUX")
+            IF (.NOT. ASSOCIATED(reference_basis)) THEN
+               CALL create_ri_aux_basis_set(reference_basis, qs_kind_set(ikind), &
+                                            dft_control%auto_basis_ri_aux, basis_sort=sort_basis)
+               IF (reference_basis%norm_type < 0) reference_basis%norm_type = 2
+               CALL init_orb_basis_set(reference_basis)
+               CALL add_basis_set_to_container(qs_kind_set(ikind)%basis_sets, reference_basis, "RI_AUX")
+            END IF
+         END DO
+      END IF
 
       ! set up basis
       ALLOCATE (bs_env%sizes_RI(natom), bs_env%sizes_AO(natom))
@@ -1991,6 +2014,7 @@ CONTAINS
       TYPE(dbcsr_p_type), DIMENSION(:, :), POINTER       :: matrix_ks_kp
       TYPE(dft_control_type), POINTER                    :: dft_control
       TYPE(qs_energy_type), POINTER                      :: energy
+      TYPE(qs_rho_type), POINTER                         :: rho
       TYPE(section_vals_type), POINTER                   :: hf_section, input, xc_section
 
       CALL timeset(routineN, handle)
@@ -2055,6 +2079,9 @@ CONTAINS
 
       CASE (tensor_small_cell_full_kp, ri_rs_small_cell_full_kp)
 
+         ! Refresh atom-local density fields after changing the XC functional.
+         CALL get_qs_env(qs_env, rho=rho)
+         CALL qs_rho_update_rho(rho, qs_env)
          ! calculate KS-matrix without XC
          CALL qs_ks_build_kohn_sham_matrix(qs_env, calculate_forces=.FALSE., just_energy=.FALSE.)
          CALL get_qs_env(qs_env=qs_env, matrix_ks_kp=matrix_ks_kp)
@@ -2092,6 +2119,7 @@ CONTAINS
 
       IF (bs_env%gw_implementation == tensor_small_cell_full_kp .OR. &
           bs_env%gw_implementation == ri_rs_small_cell_full_kp) THEN
+         CALL qs_rho_update_rho(rho, qs_env)
          ! calculate KS-matrix again with XC
          CALL qs_ks_build_kohn_sham_matrix(qs_env, calculate_forces=.FALSE., just_energy=.FALSE.)
          DO ispin = 1, bs_env%n_spin
@@ -3268,6 +3296,7 @@ CONTAINS
       TYPE(kpoint_type), POINTER                         :: kpoints_scf
       TYPE(neighbor_list_set_p_type), DIMENSION(:), &
          POINTER                                         :: sab_nl
+      TYPE(qs_rho_type), POINTER                         :: rho
 
       CALL timeset(routineN, handle)
 
@@ -3324,6 +3353,9 @@ CONTAINS
 
       CALL kpoint_operator_context_release(operators)
 
+      ! Refresh atom-local density fields before restoring the KS matrix.
+      CALL get_qs_env(qs_env, rho=rho)
+      CALL qs_rho_update_rho(rho, qs_env)
       ! just rebuild the overwritten KS matrix again
       CALL qs_ks_build_kohn_sham_matrix(qs_env, calculate_forces=.FALSE., just_energy=.FALSE.)
 

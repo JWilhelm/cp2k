@@ -2371,12 +2371,13 @@ CONTAINS
                 V_sqrt(n_RI, n_RI, nkp_local))
       M_ref = z_zero
       V_ref = z_zero
-      ! The full Ewald Coulomb matrix is finite on the shifted 3D q mesh. No
+      ! The full Ewald Coulomb matrix is finite on the shifted 2D/3D q mesh. No
       ! G=0 auxiliary channel is removed at each transfer point.
       bs_env%kpoints_chi_eps_W%nkp_grid = bs_env%nkp_grid_chi_eps_W_orig
       CALL build_2c_coulomb_matrix_kp_small_cell(V_ref, qs_env, bs_env%kpoints_chi_eps_W, &
                                                  bs_env%size_lattice_sum_V, basis_type='RI_AUX', &
-                                                 ikp_start=1, ikp_end=nkp, use_ewald=ALL(bs_env%periodic == [1, 1, 1]))
+                                                 ikp_start=1, ikp_end=nkp, use_ewald=ALL(bs_env%periodic == [1, 1, 1]) .OR. &
+                                                 ALL(bs_env%periodic == [1, 1, 0]))
       CALL build_ri_2c_lattice(fm_metric, metric_cells, bs_env%ri_metric, &
                                0.0_dp, bs_env, qs_env, reference_basis=bs_env%auto_ri%enabled)
       CALL ri_2c_lattice_to_owned_q(fm_metric, metric_cells, &
@@ -4612,7 +4613,7 @@ CONTAINS
       IF (bs_env%para_env%mepos == 0) THEN
          DO spin = 1, bs_env%n_spin
             no = bs_env%n_occ(spin)
-            nv = bs_env%n_vir(spin)
+            nv = MAX(0, MIN(bs_env%n_vir(spin), bs_env%n_mo_retained - no))
             IF (no == 0 .OR. nv == 0) CYCLE
             DO k = 1, bs_env%nkp_scf_desymm
                lo = gwkp_env%eigenvalues_G(no + 1, k, spin) - gwkp_env%eigenvalues_G(no, k, spin)
@@ -4671,7 +4672,7 @@ CONTAINS
       CPASSERT(volume > 0.0_dp)
       DO spin = 1, bs_env%n_spin
          no = bs_env%n_occ(spin)
-         nv = bs_env%n_vir(spin)
+         nv = MAX(0, MIN(bs_env%n_vir(spin), bs_env%n_mo_retained - no))
          IF (no == 0 .OR. nv == 0) CYCLE
          ALLOCATE (orbitals(SIZE(psi, 1), no + nv), gamma_corr(no, nv, 3))
          DO k = 1, bs_env%nkp_scf_desymm
@@ -4723,7 +4724,7 @@ CONTAINS
       CALL get_gw_work(bs_env, gwkp_env)
 
       no = bs_env%n_occ(spin)
-      nv = bs_env%n_vir(spin)
+      nv = MAX(0, MIN(bs_env%n_vir(spin), bs_env%n_mo_retained - no))
       ng = SIZE(orbitals, 1)
       nr = SIZE(state%chi_tau, 1)
       first = state%first_row
