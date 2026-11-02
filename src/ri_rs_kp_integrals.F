@@ -130,7 +130,7 @@ CONTAINS
       IF (bs_env%unit_nr > 0) THEN
          WRITE (bs_env%unit_nr, '(T2,A,T72,A9)') 'd_lP method', 'NUMERICAL'
       END IF
-      CALL get_local_l_range(SIZE(grid_points, 2), bs_env%para_env%num_pe, &
+      CALL get_local_l_range(bs_env%ri_rs%n_grid_points, bs_env%para_env%num_pe, &
                              bs_env%para_env%mepos, first_l, last_l)
       n_P = bs_env%n_RI
       IF (bs_env%auto_ri%enabled) n_P = SUM(bs_env%auto_ri%sizes_opt_RI)
@@ -141,7 +141,7 @@ CONTAINS
       CALL prepare_d_lP_integration_grid(bs_env, grid_points, settings)
       IF (PRESENT(charge_lq)) THEN
          CPASSERT(PRESENT(qpoints))
-         ALLOCATE (charge_lq(SIZE(grid_points, 2), SIZE(qpoints, 2)))
+         ALLOCATE (charge_lq(bs_env%ri_rs%n_grid_points, SIZE(qpoints, 2)))
          CALL integrate_d_lP_R(bs_env, grid_points, cells_R_d_lP, settings, d_lP_R, first_l, &
                                qpoints, charge_lq)
       ELSE
@@ -837,8 +837,8 @@ CONTAINS
 !> contraction. A triangle-inequality product bound controls discarded discrete terms, not
 !> quadrature error. For a truncated kernel, it decays outside the Coulomb cutoff.
 !> The usual l/P/T cutoff removes individual l rows before contraction.
-!> Unlike the analytic screened reference,
-!> Eq. (1) does not omit individual AO pairs; cell-domain and screening differences must converge.
+!> Eq. (1) retains all AO pairs in the explicit cell domain; cell-domain and screening errors
+!> must be converged together with the numerical quadrature.
 !> Integration-point blocks are MPI distributed and each AO field is evaluated once. Bounded batches
 !> share these fields within memory groups whose ranks divide T; independent groups divide g.
 !> Group sums assemble disjoint cyclic T cells. A final all-to-all
@@ -886,12 +886,12 @@ CONTAINS
          threshold, weight
       REAL(dp), ALLOCATABLE :: cutoffs_lP(:), cyclic_d_lP_R(:, :, :), envelopes(:, :), &
          local_d_lP_R(:, :, :), q_cart(:, :), receive_fields(:), send_fields(:)
-      REAL(dp) :: field(quadrature_block_size, SIZE(grid_points, 2))
       TYPE(ao_image_type), ALLOCATABLE                   :: images(:)
       TYPE(cell_type), POINTER                           :: cell
       TYPE(l_block_partition_type)                       :: blocks
       TYPE(mp_comm_type)                                 :: field_comm, integration_comm
       TYPE(particle_type), POINTER                       :: particles(:)
+      REAL(dp) :: field(quadrature_block_size, bs_env%ri_rs%n_grid_points)
       TYPE(radial_interpolation_type), ALLOCATABLE       :: aux_potentials(:)
 
       IF (bs_env%unit_nr > 0) THEN
@@ -904,7 +904,7 @@ CONTAINS
          WRITE (bs_env%unit_nr, '(T2,A)') 'd_lP_prepare_field_bounds: Bound fields for screening'
          WRITE (bs_env%unit_nr, '(T2,A)') 'd_lP_sum_g_f2_v: Contract potential with squared AO fields'
       END IF
-      nl = SIZE(grid_points, 2)
+      nl = bs_env%ri_rs%n_grid_points
       IF (PRESENT(qpoints) .NEQV. PRESENT(charge_lq)) THEN
          CPABORT('Request DLP q points and Fourier charges together')
       END IF
@@ -1225,7 +1225,7 @@ CONTAINS
       cell => bs_env%ri_rs%cell
       particles => bs_env%ri_rs%particle_set
       maxao = MAXVAL(bs_env%i_ao_end_from_atom - bs_env%i_ao_start_from_atom + 1)
-      ALLOCATE (primary(SIZE(grid_points, 2), maxao))
+      ALLOCATE (primary(bs_env%ri_rs%n_grid_points, maxao))
       ALLOCATE (images(bs_env%n_atom*SIZE(bs_env%index_to_cell_3c, 2)))
       iimage = 0
       DO icell = 1, SIZE(bs_env%index_to_cell_3c, 2)
@@ -1243,7 +1243,7 @@ CONTAINS
             iimage = iimage + 1
             images(iimage)%basis => basis
             images(iimage)%center = center
-            ALLOCATE (images(iimage)%primary(SIZE(grid_points, 2), nao))
+            ALLOCATE (images(iimage)%primary(bs_env%ri_rs%n_grid_points, nao))
             images(iimage)%primary(:, :) = primary(:, 1:nao)
             CALL pack_nonzero_ao_rows(images(iimage))
             CALL bound_ao_image(images(iimage))
@@ -1824,13 +1824,13 @@ CONTAINS
                                                             field_work(:, :), point_bound(:), &
                                                             potential(:, :)
       LOGICAL                                            :: point_needed(SIZE(points, 2))
-      INTEGER                                            :: union_indices(SIZE(points, 2)), &
-                                                            active_l(SIZE(grid_points, 2))
+      INTEGER                                            :: union_indices(SIZE(points, 2))
       TYPE(cell_type), POINTER                           :: cell
       TYPE(gto_basis_set_type), POINTER                  :: basis
       LOGICAL                                            :: block_needed(blocks%nblocks)
       INTEGER :: block_active_last(blocks%nblocks), block_active_first(blocks%nblocks)
       TYPE(particle_type), POINTER                       :: particles(:)
+      INTEGER :: active_l(bs_env%ri_rs%n_grid_points)
 
       cell => bs_env%ri_rs%cell
       particles => bs_env%ri_rs%particle_set
@@ -1864,7 +1864,7 @@ CONTAINS
       nthreads = 1
 !$    nthreads = omp_get_max_threads()
       nthreads = MIN(nthreads, MAX(1, INT(128.0_dp*1024.0_dp**2/ &
-                                          (8.0_dp*(REAL(SIZE(grid_points, 2), dp)*(maxnp + SIZE(points, 2)) + &
+                                          (8.0_dp*(REAL(bs_env%ri_rs%n_grid_points, dp)*(maxnp + SIZE(points, 2)) + &
                                                    REAL(SIZE(points, 2), dp)*maxnp)))))
       ! Each atom/image owns disjoint P/T columns of Eq. (2).
 
@@ -1881,8 +1881,8 @@ CONTAINS
 
       CALL timeset('d_lP_allocate_thread_buffers', handle)
 
-      ALLOCATE (block_RI(SIZE(grid_points, 2), maxnp), &
-                field_work(SIZE(points, 2), SIZE(grid_points, 2)), point_bound(SIZE(points, 2)), &
+      ALLOCATE (block_RI(bs_env%ri_rs%n_grid_points, maxnp), &
+                field_work(SIZE(points, 2), bs_env%ri_rs%n_grid_points), point_bound(SIZE(points, 2)), &
                 potential(SIZE(points, 2), maxnp))
 
       CALL timestop(handle)
@@ -2075,7 +2075,7 @@ CONTAINS
                lastp = firstp + bs_env%auto_ri%sizes_opt_RI(iatom) - 1
             END IF
             cutoff = cutoffs_lP(iatom)
-            DO il = 1, SIZE(grid_points, 2)
+            DO il = 1, bs_env%ri_rs%n_grid_points
                IF (NORM2(grid_points(:, il) - center) > cutoff) d_lP_R(il, firstp:lastp, it) = 0.0_dp
             END DO
          END DO

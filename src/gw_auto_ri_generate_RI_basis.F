@@ -1884,8 +1884,8 @@ CONTAINS
       CPASSERT(SIZE(bs_env%eigenval_scf, 2) >= bs_env%nkp_scf_desymm)
 
       NULLIFY (rows, cols)
-      nAO = SIZE(Int_3c, 1)
-      nRI = SIZE(Int_3c, 3)
+      nAO = bs_env%sizes_AO(iatom)
+      nRI = bs_env%auto_ri%sizes_ref_RI(iatom)
       nstates = bs_env%n_mo_retained
       CPASSERT(nstates > 0 .AND. nstates <= SIZE(bs_env%eigenval_scf, 1))
       CPASSERT(ALL(bs_env%n_occ(1:bs_env%n_spin) > 0))

@@ -22,10 +22,7 @@ MODULE ri_rs_kp_fitting
                                               twopi,&
                                               z_one,&
                                               z_zero
-   USE message_passing,                 ONLY: mp_comm_split_type_shared,&
-                                              mp_comm_type,&
-                                              mp_mem_avail_per_rank_GB,&
-                                              mp_print_mem_per_rank,&
+   USE message_passing,                 ONLY: mp_print_mem_per_rank,&
                                               mp_request_type,&
                                               mp_waitall
    USE particle_types,                  ONLY: particle_type
@@ -53,15 +50,13 @@ CONTAINS
 !> \brief Build explicit-cell AO values and periodic RI-RS coefficients Z_lP(q).
 !> \param bs_env Band-structure environment.
 !> \param grid_points Reference-cell RI-RS points r_l.
-!> \param ao_values AO values mu(r_l - R), indexed (l,mu,R).
 !> \param Z_lP_q Gaussian RI-RS coefficients on the shifted SCF mesh.
 !> \param Z_lP_zero ...
 ! **************************************************************************************************
-   SUBROUTINE compute_Z_lP_q(bs_env, grid_points, ao_values, &
+   SUBROUTINE compute_Z_lP_q(bs_env, grid_points, &
                              Z_lP_q, Z_lP_zero)
       TYPE(post_scf_bandstructure_type), POINTER         :: bs_env
       REAL(KIND=dp), DIMENSION(:, :), INTENT(IN)         :: grid_points
-      REAL(dp), ALLOCATABLE, INTENT(INOUT), TARGET       :: ao_values(:, :, :)
       COMPLEX(KIND=dp), ALLOCATABLE, INTENT(OUT)         :: Z_lP_q(:, :, :), Z_lP_zero(:, :, :)
 
       CHARACTER(LEN=*), PARAMETER                        :: routineN = 'compute_Z_lP_q'
@@ -69,11 +64,11 @@ CONTAINS
       COMPLEX(KIND=dp), ALLOCATABLE                      :: charge_lq(:, :)
       INTEGER                                            :: first_l, handle, last_l, n_D_cells, &
                                                             n_d_lP_cells, n_grid
-      INTEGER, ALLOCATABLE                               :: cells_R_D_llp(:, :), cells_R_d_lP(:, :)
+      INTEGER, ALLOCATABLE                               :: active_cells(:), cells_R_D_llp(:, :), &
+                                                            cells_R_d_lP(:, :)
       REAL(KIND=dp)                                      :: elapsed, start_time
       REAL(KIND=dp), ALLOCATABLE                         :: D_llp_R(:, :, :), d_lP_R(:, :, :), &
                                                             qpoints_head(:, :), qpoints_scf(:, :)
-      REAL(KIND=dp), POINTER                             :: phi_lmu_R(:, :, :)
 
       CALL timeset(routineN, handle)
 
@@ -84,14 +79,13 @@ CONTAINS
          CPABORT("RI_RS%TIKHONOV must not be negative")
       END IF
 
-      n_grid = SIZE(grid_points, 2)
+      n_grid = bs_env%ri_rs%n_grid_points
       CPASSERT(n_grid > 0)
+      CPASSERT(SIZE(grid_points, 2) == n_grid)
       CPASSERT(bs_env%nkp_scf_desymm > 0)
 
-      CALL evaluate_mu_rl_R_values(bs_env, grid_points, ao_values)
-      phi_lmu_R => ao_values
       CALL build_cells_R_for_d_lP_R(bs_env, grid_points, cells_R_d_lP)
-      CALL build_cells_R_for_D_llp(bs_env, phi_lmu_R, cells_R_D_llp)
+      CALL build_cells_R_for_D_llp(bs_env, grid_points, cells_R_D_llp, active_cells)
       n_d_lP_cells = SIZE(cells_R_d_lP, 2)
       n_D_cells = SIZE(cells_R_D_llp, 2)
       CPASSERT(n_d_lP_cells > 0)
@@ -106,7 +100,7 @@ CONTAINS
       first_l = (n_grid*bs_env%para_env%mepos)/bs_env%para_env%num_pe + 1
       last_l = (n_grid*(bs_env%para_env%mepos + 1))/bs_env%para_env%num_pe
       ALLOCATE (D_llp_R(last_l - first_l + 1, n_grid, n_D_cells))
-      CALL compute_D_llp(bs_env, cells_R_D_llp, phi_lmu_R, first_l, last_l, D_llp_R)
+      CALL compute_D_llp(bs_env, grid_points, cells_R_D_llp, active_cells, first_l, last_l, D_llp_R)
       CALL mp_print_mem_per_rank(bs_env%para_env, bs_env%unit_nr, "After distribution of D_ll'^R:")
       IF (bs_env%unit_nr > 0) THEN
          WRITE (bs_env%unit_nr, '(T2,A)') 'RI-RS three-center projection d_lP^R: starting'
@@ -137,65 +131,46 @@ CONTAINS
    END SUBROUTINE compute_Z_lP_q
 
 ! **************************************************************************************************
-!> \brief Evaluate mu(r_l - R) for every AO mu, RI-RS point r_l and retained cell R.
+!> \brief Evaluate ϕ_μ(r_l-R) locally for one cell R and the supplied points r_l.
 !> \param bs_env ...
 !> \param grid_points ...
-!> \param ao_values AO values mu(r_l - R), indexed (l,mu,R).
+!> \param i_cell Index of R in index_to_cell_3c.
+!> \param ao_values AO values indexed (l,μ), without MPI communication.
 ! **************************************************************************************************
-   SUBROUTINE evaluate_mu_rl_R_values(bs_env, grid_points, ao_values)
+   SUBROUTINE evaluate_mu_rl_R_values(bs_env, grid_points, i_cell, ao_values)
       TYPE(post_scf_bandstructure_type), POINTER         :: bs_env
-      REAL(KIND=dp), INTENT(IN)                          :: grid_points(:, :)
-      REAL(dp), ALLOCATABLE, INTENT(INOUT), TARGET       :: ao_values(:, :, :)
+      REAL(dp), INTENT(IN)                               :: grid_points(:, :)
+      INTEGER, INTENT(IN)                                :: i_cell
+      REAL(dp), INTENT(OUT)                              :: ao_values(:, :)
 
-      CHARACTER(LEN=*), PARAMETER :: routineN = 'evaluate_mu_rl_R_values'
-
-      INTEGER                                            :: first_ao, handle, i_atom, i_cell, &
-                                                            i_kind, last_ao, ready
-      REAL(dp)                                           :: available_GB, required_bytes
-      REAL(KIND=dp)                                      :: cutoff_squared, source_position(3)
+      INTEGER                                            :: first_ao, handle, i_atom, i_kind, last_ao
+      REAL(dp)                                           :: cutoff_squared, source_position(3)
       TYPE(cell_type), POINTER                           :: cell
       TYPE(gto_basis_set_type), POINTER                  :: basis
-      TYPE(mp_comm_type)                                 :: node_comm
-      TYPE(particle_type), DIMENSION(:), POINTER         :: particle_set
+      TYPE(particle_type), POINTER                       :: particle_set(:)
 
-      CALL timeset(routineN, handle)
+      CALL timeset('evaluate_mu_rl_R_values', handle)
 
-      CPASSERT(.NOT. ALLOCATED(ao_values))
-      required_bytes = 8.0_dp*REAL(SIZE(grid_points, 2), dp)*REAL(bs_env%n_ao, dp)* &
-                       REAL(SIZE(bs_env%index_to_cell_3c, 2), dp)
-      CALL mp_mem_avail_per_rank_GB(bs_env%para_env, available_GB)
-      ready = MERGE(1, 0, required_bytes <= 0.5_dp*MAX(0.0_dp, available_GB)*1.0E9_dp)
-      CALL bs_env%para_env%min(ready)
-      IF (ready == 0) CPABORT('Insufficient memory for per-rank periodic AO grid')
-      ALLOCATE (ao_values(SIZE(grid_points, 2), bs_env%n_ao, SIZE(bs_env%index_to_cell_3c, 2)))
-      CALL node_comm%from_split_type(bs_env%para_env, mp_comm_split_type_shared, key=bs_env%para_env%mepos)
-      IF (node_comm%mepos == 0) THEN
-         cell => bs_env%ri_rs%cell
-         particle_set => bs_env%ri_rs%particle_set
-         ao_values = 0.0_dp
-
-         DO i_cell = 1, SIZE(bs_env%index_to_cell_3c, 2)
-            DO i_atom = 1, bs_env%n_atom
-               i_kind = particle_set(i_atom)%atomic_kind%kind_number
-               basis => bs_env%basis_set_AO(i_kind)%gto_basis_set
-               first_ao = bs_env%i_ao_start_from_atom(i_atom)
-               last_ao = bs_env%i_ao_end_from_atom(i_atom)
-               source_position = pbc(particle_set(i_atom)%r, cell) + &
-                                 MATMUL(bs_env%hmat, REAL(bs_env%index_to_cell_3c(:, i_cell), dp))
-               cutoff_squared = bs_env%ri_rs%radius_ao_per_atom(i_atom)**2
-               IF (bs_env%ri_rs%cutoff_radius_ri_ao > 0.0_dp) THEN
-                  cutoff_squared = bs_env%ri_rs%cutoff_radius_ri_ao**2
-               END IF
-               CALL evaluate_ao_basis_on_points(ao_values(:, first_ao:last_ao, i_cell), &
-                                                grid_points, basis, source_position, cell, &
-                                                cutoff_squared=cutoff_squared, minimum_image=.FALSE.)
-            END DO
-         END DO
-      END IF
-      DO i_cell = 1, SIZE(ao_values, 3)
-         CALL node_comm%bcast(ao_values(:, :, i_cell))
+      cell => bs_env%ri_rs%cell
+      particle_set => bs_env%ri_rs%particle_set
+      CPASSERT(SIZE(ao_values, 1) == SIZE(grid_points, 2))
+      CPASSERT(SIZE(ao_values, 2) == bs_env%n_ao)
+      ao_values = 0.0_dp
+      DO i_atom = 1, bs_env%n_atom
+         i_kind = particle_set(i_atom)%atomic_kind%kind_number
+         basis => bs_env%basis_set_AO(i_kind)%gto_basis_set
+         first_ao = bs_env%i_ao_start_from_atom(i_atom)
+         last_ao = bs_env%i_ao_end_from_atom(i_atom)
+         source_position = pbc(particle_set(i_atom)%r, cell) + &
+                           MATMUL(bs_env%hmat, REAL(bs_env%index_to_cell_3c(1:3, i_cell), dp))
+         cutoff_squared = bs_env%ri_rs%radius_ao_per_atom(i_atom)**2
+         IF (bs_env%ri_rs%cutoff_radius_ri_ao > 0.0_dp) THEN
+            cutoff_squared = bs_env%ri_rs%cutoff_radius_ri_ao**2
+         END IF
+         CALL evaluate_ao_basis_on_points(ao_values(:, first_ao:last_ao), &
+                                          grid_points, basis, source_position, cell, &
+                                          cutoff_squared=cutoff_squared, minimum_image=.FALSE.)
       END DO
-      CALL node_comm%free()
 
       CALL timestop(handle)
 
@@ -249,25 +224,22 @@ CONTAINS
 
       CHARACTER(LEN=*), PARAMETER                        :: routineN = 'solve_for_Z_lP_q'
 
-      COMPLEX(KIND=dp)                                   :: phase
+      COMPLEX(KIND=dp)                                   :: empty_matrix(0, 0), phase
       COMPLEX(KIND=dp), ALLOCATABLE                      :: D_llp_q(:, :), D_llp_q_local(:, :), &
-                                                            D_llp_q_packed(:), d_lP_q(:, :), &
-                                                            d_lP_q_reference(:, :), rhs(:, :)
+                                                            d_lP_q(:, :)
       INTEGER :: first_l_rank, handle, i_A, i_batch, i_rank, info, iq, iq_batch, iq_local, &
-         iq_store, l, last_l_rank, lp, n_grid, n_q, n_q_local, n_RI, n_RI_reference, n_RI_solve, &
-         next_progress
+         iq_store, l, last_l_rank, lp, n_grid, n_q, n_q_local, n_RI, n_RI_solve, next_progress
       INTEGER(KIND=int_8)                                :: n_done, n_local
       INTEGER, ALLOCATABLE                               :: displs(:), recvcounts(:)
-      LOGICAL, ALLOCATABLE                               :: active_grid_point(:), required_q(:)
+      LOGICAL, ALLOCATABLE                               :: active_grid_point(:)
       REAL(KIND=dp)                                      :: antihermitian_error, &
                                                             diagonal_imag_error, max_scale, &
-                                                            metric_head, progress_start, &
-                                                            qpoint(3), volume
+                                                            metric_head, progress_start, volume
       REAL(KIND=dp), ALLOCATABLE                         :: scale(:)
 
       CALL timeset(routineN, handle)
 
-      n_grid = SIZE(D_llp_R, 2)
+      n_grid = bs_env%ri_rs%n_grid_points
       n_RI = bs_env%n_RI
       n_RI_solve = n_RI
       IF (PRESENT(charge_lq)) THEN
@@ -278,32 +250,26 @@ CONTAINS
          END IF
          n_RI_solve = n_RI + 1
       END IF
-      n_RI_reference = n_RI
       CPASSERT(SIZE(qpoints, 1) >= 3)
       n_q = SIZE(qpoints, 2)
       IF (PRESENT(charge_lq)) THEN
          CPASSERT(SIZE(charge_lq, 1) == n_grid)
          CPASSERT(SIZE(charge_lq, 2) == n_q)
       END IF
-      ! Fit every Gaussian transfer point; the Gamma-correction scalar head is fitted at Gamma.
-      ALLOCATE (required_q(n_q), SOURCE=.TRUE.)
-      IF (distributed) THEN
-         IF (bs_env%para_env%mepos == 0) THEN
-            n_q_local = n_q/bs_env%para_env%num_pe
-         ELSE IF (bs_env%para_env%mepos <= n_q) THEN
-            n_q_local = (n_q - bs_env%para_env%mepos)/bs_env%para_env%num_pe + 1
-         ELSE
-            n_q_local = 0
-         END IF
-      ELSE
-         n_q_local = n_q
-      END IF
+      ! q points are cyclic: rank MOD(q,P) for the SCF mesh, MOD(q-1,P) otherwise.
+      iq = MODULO(bs_env%para_env%mepos - MERGE(1, 0, distributed), bs_env%para_env%num_pe) + 1
+      n_q_local = n_q
+      IF (distributed) n_q_local = (n_q + bs_env%para_env%num_pe - iq)/bs_env%para_env%num_pe
       ALLOCATE (Z_lP_q(n_grid, n_RI_solve, n_q_local))
-      ALLOCATE (D_llp_q(n_grid, n_grid), D_llp_q_local(last_l - first_l + 1, n_grid), &
-                D_llp_q_packed(n_grid*n_grid), recvcounts(bs_env%para_env%num_pe), &
-                displs(bs_env%para_env%num_pe), &
-                d_lP_q(n_grid, n_RI_solve), d_lP_q_reference(n_grid, n_RI_reference), &
-                rhs(n_grid, n_RI_solve))
+      ! Only ranks solving a q point need a complete D(q).
+      IF (iq <= n_q) THEN
+         ALLOCATE (D_llp_q(n_grid, n_grid))
+      ELSE
+         ALLOCATE (D_llp_q(0, 0))
+      END IF
+      ALLOCATE (D_llp_q_local(n_grid, last_l - first_l + 1), &
+                recvcounts(bs_env%para_env%num_pe), displs(bs_env%para_env%num_pe), &
+                d_lP_q(n_grid, n_RI_solve))
       DO i_rank = 0, bs_env%para_env%num_pe - 1
          first_l_rank = (n_grid*i_rank)/bs_env%para_env%num_pe + 1
          last_l_rank = (n_grid*(i_rank + 1))/bs_env%para_env%num_pe
@@ -319,7 +285,7 @@ CONTAINS
       n_local = 0_int_8
       IF (bs_env%para_env%mepos == 0) THEN
          DO iq = MERGE(bs_env%para_env%num_pe, 1, distributed), n_q, bs_env%para_env%num_pe
-            IF (required_q(iq)) n_local = n_local + 1_int_8
+            n_local = n_local + 1_int_8
          END DO
       END IF
       iq_local = 0
@@ -327,41 +293,38 @@ CONTAINS
          ! D_ll'(q) = sum_A exp(i q.A) D_ll'^A; gather only on the q rank.
          DO iq_batch = i_batch*bs_env%para_env%num_pe + 1, &
             MIN(n_q, (i_batch + 1)*bs_env%para_env%num_pe)
-            IF (.NOT. required_q(iq_batch)) CYCLE
             D_llp_q_local = z_zero
             DO i_A = 1, SIZE(cells_R_D_llp, 2)
                phase = lattice_phase(qpoints(:, iq_batch), cells_R_D_llp(1:3, i_A))
-               D_llp_q_local(:, :) = D_llp_q_local(:, :) + phase*D_llp_R(:, :, i_A)
+               DO l = 1, last_l - first_l + 1
+                  D_llp_q_local(:, l) = D_llp_q_local(:, l) + CONJG(phase)*D_llp_R(l, :, i_A)
+               END DO
             END DO
             i_rank = MODULO(iq_batch - 1, bs_env%para_env%num_pe)
             IF (distributed) i_rank = MODULO(iq_batch, bs_env%para_env%num_pe)
-            CALL bs_env%para_env%gatherv(RESHAPE(D_llp_q_local, [SIZE(D_llp_q_local)]), &
-                                         D_llp_q_packed, recvcounts, displs, i_rank)
+            ! Gather conjugate-transposed row blocks directly into contiguous columns.
             IF (bs_env%para_env%mepos == i_rank) THEN
-               DO l = 0, bs_env%para_env%num_pe - 1
-                  first_l_rank = (n_grid*l)/bs_env%para_env%num_pe + 1
-                  last_l_rank = (n_grid*(l + 1))/bs_env%para_env%num_pe
-                  D_llp_q(first_l_rank:last_l_rank, :) = RESHAPE( &
-                                                         D_llp_q_packed(displs(l + 1) + 1:displs(l + 1) + recvcounts(l + 1)), &
-                                                         [last_l_rank - first_l_rank + 1, n_grid])
-               END DO
+               CALL bs_env%para_env%gatherv(D_llp_q_local, D_llp_q, recvcounts, displs, i_rank)
+            ELSE
+               CALL bs_env%para_env%gatherv(D_llp_q_local, empty_matrix, recvcounts, displs, i_rank)
             END IF
          END DO
-         CALL fourier_transform_d_lP_R_to_q(bs_env, cells_R_d_lP, d_lP_R, qpoints, i_batch, &
-                                            distributed, required_q, d_lP_q_reference, iq)
+         IF (PRESENT(charge_lq)) THEN
+            CALL fourier_transform_d_lP_R_to_q(bs_env, cells_R_d_lP, d_lP_R, qpoints, i_batch, &
+                                               distributed, d_lP_q(:, 2:), iq)
+         ELSE
+            CALL fourier_transform_d_lP_R_to_q(bs_env, cells_R_d_lP, d_lP_R, qpoints, i_batch, &
+                                               distributed, d_lP_q, iq)
+         END IF
          IF (iq > n_q) CYCLE
          iq_local = iq_local + 1
-         IF (.NOT. required_q(iq)) CYCLE
          IF (distributed) THEN
             iq_store = iq_local
          ELSE
             iq_store = iq
          END IF
-         qpoint = qpoints(:, iq)
          IF (PRESENT(charge_lq)) THEN
             ! The Gamma-correction scalar head is separate. Keep the full Gaussian RI.
-            CPASSERT(n_RI_reference == n_RI)
-            d_lP_q(:, 2:) = d_lP_q_reference
             volume = bs_env%ri_rs%cell%deth
             IF (ALL(bs_env%periodic == [1, 1, 0])) THEN
                ! The separated 2D charge channel is normalized by layer area,
@@ -380,12 +343,14 @@ CONTAINS
                metric_head = 2.0_dp*pi*bs_env%ri_metric%cutoff_radius**2
             END IF
             d_lP_q(:, 1) = metric_head/SQRT(volume)*charge_lq(:, iq)
-         ELSE
-            CPASSERT(n_RI_reference == n_RI)
-            d_lP_q(:, :) = d_lP_q_reference
          END IF
 
-         antihermitian_error = MAXVAL(ABS(D_llp_q - CONJG(TRANSPOSE(D_llp_q))))
+         antihermitian_error = 0.0_dp
+         DO lp = 1, n_grid
+            DO l = 1, lp
+               antihermitian_error = MAX(antihermitian_error, ABS(D_llp_q(l, lp) - CONJG(D_llp_q(lp, l))))
+            END DO
+         END DO
          diagonal_imag_error = 0.0_dp
          DO l = 1, n_grid
             diagonal_imag_error = MAX(diagonal_imag_error, ABS(AIMAG(D_llp_q(l, l))))
@@ -394,7 +359,13 @@ CONTAINS
              diagonal_imag_error > 100.0_dp*bs_env%eps_filter) THEN
             CPABORT("Non-Hermitian periodic RI-RS D(q)")
          END IF
-         D_llp_q(:, :) = 0.5_dp*(D_llp_q(:, :) + CONJG(TRANSPOSE(D_llp_q(:, :))))
+         DO lp = 1, n_grid
+            DO l = 1, lp
+               phase = 0.5_dp*(D_llp_q(l, lp) + CONJG(D_llp_q(lp, l)))
+               D_llp_q(l, lp) = phase
+               D_llp_q(lp, l) = CONJG(phase)
+            END DO
+         END DO
 
          DO l = 1, n_grid
             IF (REAL(D_llp_q(l, l), KIND=dp) < -100.0_dp*bs_env%eps_filter) THEN
@@ -422,23 +393,23 @@ CONTAINS
          DO l = 1, n_grid
             D_llp_q(l, l) = D_llp_q(l, l) + bs_env%ri_rs%tikhonov*z_one
             IF (active_grid_point(l)) THEN
-               rhs(l, :) = d_lP_q(l, :)/SCALE(l)
+               d_lP_q(l, :) = d_lP_q(l, :)/SCALE(l)
             ELSE
-               rhs(l, :) = z_zero
+               d_lP_q(l, :) = z_zero
                SCALE(l) = 1.0_dp
             END IF
          END DO
 
          IF (bs_env%ri_rs%tikhonov <= 0.0_dp) THEN
-            CALL solve_unregularized_D_llp(D_llp_q, rhs)
+            CALL solve_unregularized_D_llp(D_llp_q, d_lP_q)
          ELSE
             CALL zpotrf('L', n_grid, D_llp_q, n_grid, info)
-            IF (info == 0) CALL zpotrs('L', n_grid, n_RI_solve, D_llp_q, n_grid, rhs, n_grid, info)
+            IF (info == 0) CALL zpotrs('L', n_grid, n_RI_solve, D_llp_q, n_grid, d_lP_q, n_grid, info)
             IF (info /= 0) CPABORT("Periodic RI-RS regularized solve failed")
          END IF
 
          DO l = 1, n_grid
-            Z_lP_q(l, :, iq_store) = rhs(l, :)/SCALE(l)
+            Z_lP_q(l, :, iq_store) = d_lP_q(l, :)/SCALE(l)
          END DO
          IF (bs_env%para_env%mepos == 0 .AND. n_local > 1) THEN
             n_done = n_done + 1_int_8
@@ -450,8 +421,7 @@ CONTAINS
          CPASSERT(iq_local == n_q_local)
       END IF
       IF (.NOT. distributed) CALL bs_env%para_env%sum(Z_lP_q)
-      DEALLOCATE (D_llp_q, D_llp_q_local, D_llp_q_packed, recvcounts, displs, &
-                  d_lP_q, d_lP_q_reference, rhs, scale, active_grid_point, required_q)
+      DEALLOCATE (D_llp_q, D_llp_q_local, recvcounts, displs, d_lP_q, scale, active_grid_point)
 
       CALL timestop(handle)
 
@@ -488,7 +458,8 @@ CONTAINS
          CPABORT('Unregularized RI-RS D matrix has zero numerical rank')
       END IF
 
-      projected_rhs(:, :) = MATMUL(CONJG(TRANSPOSE(D_llp_q)), rhs)
+      CALL zgemm('C', 'N', ngrid, SIZE(rhs, 2), ngrid, z_one, D_llp_q, ngrid, &
+                 rhs, ngrid, z_zero, projected_rhs, ngrid)
       DO ieigenvalue = 1, ngrid
          IF (eigenvalues(ieigenvalue) > rank_tolerance) THEN
             projected_rhs(ieigenvalue, :) = &
@@ -497,7 +468,8 @@ CONTAINS
             projected_rhs(ieigenvalue, :) = z_zero
          END IF
       END DO
-      rhs(:, :) = MATMUL(D_llp_q, projected_rhs)
+      CALL zgemm('N', 'N', ngrid, SIZE(rhs, 2), ngrid, z_one, D_llp_q, ngrid, &
+                 projected_rhs, ngrid, z_zero, rhs, ngrid)
 
    END SUBROUTINE solve_unregularized_D_llp
 
@@ -548,7 +520,7 @@ CONTAINS
                   cutoff = automatic_cutoffs(i_atom)
                   center = pbc(particle_set(i_atom)%r, bs_env%ri_rs%cell) + &
                            MATMUL(bs_env%hmat, REAL(cell_index, dp))
-                  DO i_l = 1, SIZE(grid_points, 2)
+                  DO i_l = 1, bs_env%ri_rs%n_grid_points
                      IF (NORM2(center - grid_points(:, i_l)) <= cutoff) THEN
                         keep = .TRUE.
                         EXIT
@@ -582,27 +554,33 @@ CONTAINS
 !> reference-cell grid. Keeping a separate cell set prevents Eq. (10) screening from truncating
 !> the least-squares metric and avoids enumerating empty three-center image cells.
 !> \param bs_env ...
-!> \param phi_lmu_R ...
+!> \param grid_points Reference-cell RI-RS points.
 !> \param cells_R_D_llp ...
+!> \param active_cells Indices of cells with nonzero AO values.
 ! **************************************************************************************************
-   SUBROUTINE build_cells_R_for_D_llp(bs_env, phi_lmu_R, cells_R_D_llp)
+   SUBROUTINE build_cells_R_for_D_llp(bs_env, grid_points, cells_R_D_llp, active_cells)
       TYPE(post_scf_bandstructure_type), POINTER         :: bs_env
-      REAL(KIND=dp), DIMENSION(:, :, :), INTENT(IN)      :: phi_lmu_R
-      INTEGER, ALLOCATABLE, INTENT(OUT)                  :: cells_R_D_llp(:, :)
+      REAL(dp), INTENT(IN)                               :: grid_points(:, :)
+      INTEGER, ALLOCATABLE, INTENT(OUT)                  :: cells_R_D_llp(:, :), active_cells(:)
 
       INTEGER                                            :: cell_index(3), i, i_R, i_R_prime, &
                                                             n_active, n_D_cells
-      INTEGER, ALLOCATABLE                               :: active_cells(:), cells_work(:, :)
+      INTEGER, ALLOCATABLE                               :: cells_work(:, :), nonzero_cells(:)
       LOGICAL                                            :: found
+      REAL(dp), ALLOCATABLE                              :: phi(:, :)
 
-      ALLOCATE (active_cells(SIZE(phi_lmu_R, 3)))
+      ALLOCATE (nonzero_cells(SIZE(bs_env%index_to_cell_3c, 2)))
+      ALLOCATE (phi(bs_env%ri_rs%n_grid_points, bs_env%n_ao))
       n_active = 0
-      DO i_R = 1, SIZE(phi_lmu_R, 3)
-         IF (.NOT. ANY(phi_lmu_R(:, :, i_R) /= 0.0_dp)) CYCLE
+      DO i_R = 1, SIZE(bs_env%index_to_cell_3c, 2)
+         CALL evaluate_mu_rl_R_values(bs_env, grid_points, i_R, phi)
+         IF (.NOT. ANY(ABS(phi) > 0.0_dp)) CYCLE
          n_active = n_active + 1
-         active_cells(n_active) = i_R
+         nonzero_cells(n_active) = i_R
       END DO
       CPASSERT(n_active > 0)
+      ALLOCATE (active_cells(n_active))
+      active_cells(:) = nonzero_cells(:n_active)
 
       ALLOCATE (cells_work(3, n_active*n_active))
       n_D_cells = 0
@@ -626,7 +604,7 @@ CONTAINS
 
       ALLOCATE (cells_R_D_llp(3, n_D_cells))
       cells_R_D_llp(:, :) = cells_work(:, 1:n_D_cells)
-      DEALLOCATE (active_cells, cells_work)
+      DEALLOCATE (cells_work, phi)
 
    END SUBROUTINE build_cells_R_for_D_llp
 
@@ -634,26 +612,27 @@ CONTAINS
 !> \brief Construct D_ll'^R = [Σ_{S-S'=R,μ} ϕ_μ^S(r_L) ϕ_μ^S'(r_L')]².
 !> The progress count enumerates pairs of active cell images (S,S'), not Gaussian pairs.
 !> \param bs_env ...
+!> \param grid_points Reference-cell RI-RS points.
 !> \param cells_R_D_llp ...
-!> \param phi_lmu_R ...
+!> \param active_cells Indices of cells with nonzero AO values.
 !> \param first_l ...
 !> \param last_l ...
 !> \param D_llp_R ...
 ! **************************************************************************************************
-   SUBROUTINE compute_D_llp(bs_env, cells_R_D_llp, phi_lmu_R, first_l, last_l, D_llp_R)
+   SUBROUTINE compute_D_llp(bs_env, grid_points, cells_R_D_llp, active_cells, first_l, last_l, D_llp_R)
       TYPE(post_scf_bandstructure_type), POINTER         :: bs_env
+      REAL(dp), INTENT(IN)                               :: grid_points(:, :)
       INTEGER, DIMENSION(:, :), INTENT(IN)               :: cells_R_D_llp
-      REAL(KIND=dp), INTENT(IN)                          :: phi_lmu_R(:, :, :)
-      INTEGER, INTENT(IN)                                :: first_l, last_l
+      INTEGER, INTENT(IN)                                :: active_cells(:), first_l, last_l
       REAL(KIND=dp), CONTIGUOUS, INTENT(OUT)             :: D_llp_R(:, :, :)
 
-      INTEGER                                            :: cell_A(3), handle, i_A, i_R, i_R_prime, &
+      INTEGER                                            :: cell_A(3), handle, i_A, i_active, &
+                                                            i_active_prime, i_R, i_R_prime, &
                                                             next_progress, nrows
       INTEGER(KIND=int_8)                                :: n_done, n_total
       LOGICAL                                            :: found
-      LOGICAL, ALLOCATABLE                               :: active_cell(:)
       REAL(KIND=dp)                                      :: progress_start
-      REAL(KIND=dp), ALLOCATABLE                         :: phi_local(:, :)
+      REAL(KIND=dp), ALLOCATABLE                         :: phi_full(:, :), phi_local(:, :)
       INTERFACE
          SUBROUTINE dgemm(transa, transb, m, n, k, alpha, a, lda, b, ldb, beta, c, ldc)
             IMPORT dp
@@ -667,24 +646,21 @@ CONTAINS
 
       CALL timeset('compute_D_llp', handle)
 
-      ALLOCATE (active_cell(SIZE(phi_lmu_R, 3)), SOURCE=.FALSE.)
-      DO i_R = 1, SIZE(phi_lmu_R, 3)
-         active_cell(i_R) = ANY(phi_lmu_R(:, :, i_R) /= 0.0_dp)
-      END DO
       progress_start = m_walltime()
       next_progress = 1
       n_done = 0_int_8
-      n_total = INT(COUNT(active_cell), int_8)**2
+      n_total = INT(SIZE(active_cells), int_8)**2
       ! Sum the AO images for each owned (l,l') rectangle before squaring.
       D_llp_R = 0.0_dp
       nrows = MAX(0, last_l - first_l + 1)
-      ALLOCATE (phi_local(nrows, SIZE(phi_lmu_R, 2)))
       IF (first_l <= last_l) THEN
-         DO i_R = 1, SIZE(phi_lmu_R, 3)
-            IF (.NOT. active_cell(i_R)) CYCLE
-            phi_local(:, :) = phi_lmu_R(first_l:last_l, :, i_R)
-            DO i_R_prime = 1, SIZE(phi_lmu_R, 3)
-               IF (.NOT. active_cell(i_R_prime)) CYCLE
+         ALLOCATE (phi_local(nrows, bs_env%n_ao), phi_full(bs_env%ri_rs%n_grid_points, bs_env%n_ao))
+         DO i_active_prime = 1, SIZE(active_cells)
+            i_R_prime = active_cells(i_active_prime)
+            CALL evaluate_mu_rl_R_values(bs_env, grid_points, i_R_prime, phi_full)
+            DO i_active = 1, SIZE(active_cells)
+               i_R = active_cells(i_active)
+               CALL evaluate_mu_rl_R_values(bs_env, grid_points(:, first_l:last_l), i_R, phi_local)
                IF (n_done > 0) CALL write_ri_rs_progress(bs_env%unit_nr, "D_ll'^R Cell-image pairs", &
                                                          n_done, n_total, next_progress, progress_start)
                n_done = n_done + 1
@@ -692,9 +668,9 @@ CONTAINS
                         bs_env%index_to_cell_3c(:, i_R_prime)
                CALL find_cell(cell_A, cells_R_D_llp, found, i_A)
                IF (.NOT. found) CYCLE
-               CALL dgemm('N', 'T', nrows, SIZE(phi_lmu_R, 1), SIZE(phi_lmu_R, 2), &
-                          1.0_dp, phi_local, MAX(1, nrows), phi_lmu_R(:, :, i_R_prime), &
-                          MAX(1, SIZE(phi_lmu_R, 1)), 1.0_dp, D_llp_R(:, :, i_A), &
+               CALL dgemm('N', 'T', nrows, bs_env%ri_rs%n_grid_points, bs_env%n_ao, &
+                          1.0_dp, phi_local, MAX(1, nrows), phi_full, &
+                          MAX(1, bs_env%ri_rs%n_grid_points), 1.0_dp, D_llp_R(:, :, i_A), &
                           MAX(1, nrows))
             END DO
          END DO
@@ -704,7 +680,7 @@ CONTAINS
       DO i_A = 1, SIZE(D_llp_R, 3)
          D_llp_R(:, :, i_A) = D_llp_R(:, :, i_A)*D_llp_R(:, :, i_A)
       END DO
-      DEALLOCATE (active_cell, phi_local)
+      IF (ALLOCATED(phi_local)) DEALLOCATE (phi_local, phi_full)
 
       CALL timestop(handle)
 
@@ -747,18 +723,17 @@ CONTAINS
 !> \param qpoints ...
 !> \param i_batch ...
 !> \param distributed ...
-!> \param required_q ...
 !> \param d_lP_q ...
 !> \param iq ...
 ! **************************************************************************************************
    SUBROUTINE fourier_transform_d_lP_R_to_q(bs_env, cells_R_d_lP, d_lP_R, qpoints, i_batch, distributed, &
-                                            required_q, d_lP_q, iq)
+                                            d_lP_q, iq)
       TYPE(post_scf_bandstructure_type), POINTER         :: bs_env
       INTEGER, INTENT(IN)                                :: cells_R_d_lP(:, :)
       REAL(dp), CONTIGUOUS, INTENT(IN), TARGET           :: d_lP_R(:, :, :)
       REAL(dp), INTENT(IN)                               :: qpoints(:, :)
       INTEGER, INTENT(IN)                                :: i_batch
-      LOGICAL, INTENT(IN)                                :: distributed, required_q(:)
+      LOGICAL, INTENT(IN)                                :: distributed
       COMPLEX(dp), ASYNCHRONOUS, CONTIGUOUS, INTENT(OUT) :: d_lP_q(:, :)
       INTEGER, INTENT(OUT)                               :: iq
 
@@ -791,27 +766,25 @@ CONTAINS
 
       n_ranks = bs_env%para_env%num_pe
       i_rank = bs_env%para_env%mepos
-      CPASSERT(SIZE(required_q) == SIZE(qpoints, 2))
       q_offset = 0
       IF (distributed) q_offset = 1
       iq = i_batch*n_ranks + MODULO(i_rank - q_offset, n_ranks) + 1
-      CALL get_local_l_range(SIZE(d_lP_q, 1), n_ranks, i_rank, local_first_l, local_last_l)
+      CALL get_local_l_range(bs_env%ri_rs%n_grid_points, n_ranks, i_rank, local_first_l, local_last_l)
       CPASSERT(SIZE(d_lP_R, 1) == local_last_l - local_first_l + 1)
       CPASSERT(SIZE(d_lP_R, 2) == SIZE(d_lP_q, 2))
       CPASSERT(SIZE(d_lP_q, KIND=int_8) <= INT(HUGE(0), int_8))
-      n_P = SIZE(d_lP_q, 2)
-      ALLOCATE (recv_requests(n_ranks), send_q(SIZE(d_lP_R, 1), SIZE(d_lP_R, 2), 2))
+      n_P = bs_env%n_RI
+      ALLOCATE (recv_requests(n_ranks), send_q(SIZE(d_lP_R, 1), n_P, 2))
       d_lP_q = z_zero
       n_recv = 0
-      receiving = .FALSE.
-      IF (iq <= SIZE(qpoints, 2)) receiving = required_q(iq)
+      receiving = iq <= SIZE(qpoints, 2)
       IF (receiving) THEN
          ! Packed rank blocks: offset=(first_l-1)*n_P, followed by local (l,P) order.
          ! Receive into contiguous storage before assigning the noncontiguous output rows.
          ALLOCATE (receive_q(SIZE(d_lP_q)))
          DO i_dest = 0, n_ranks - 1
             IF (i_dest == i_rank) CYCLE
-            CALL get_local_l_range(SIZE(d_lP_q, 1), n_ranks, i_dest, first_l, last_l)
+            CALL get_local_l_range(bs_env%ri_rs%n_grid_points, n_ranks, i_dest, first_l, last_l)
             IF (last_l < first_l .OR. n_P == 0) CYCLE
             n_recv = n_recv + 1
             CALL bs_env%para_env%irecv(receive_q((first_l - 1)*n_P + 1:last_l*n_P), &
@@ -825,11 +798,10 @@ CONTAINS
       DO i_dest = 0, n_ranks - 1
          i_q = i_batch*n_ranks + MODULO(i_dest - q_offset, n_ranks) + 1
          IF (i_q > SIZE(qpoints, 2)) CYCLE
-         IF (.NOT. required_q(i_q)) CYCLE
          n_active_q = n_active_q + 1
          q_indices(n_active_q) = i_q
       END DO
-      work_bytes = INT(SIZE(d_lP_R, 1), int_8)*INT(SIZE(d_lP_R, 2), int_8)
+      work_bytes = INT(SIZE(d_lP_R, 1), int_8)*INT(n_P, int_8)
       use_blas = work_bytes > 0_int_8 .AND. work_bytes <= INT(HUGE(n_grid_P), int_8)
       IF (use_blas) THEN
          n_grid_P = INT(work_bytes)
@@ -861,17 +833,16 @@ CONTAINS
       END IF
       sending = .FALSE.
       q_column = 0
-      IF (SIZE(d_lP_R, 1) > 0 .AND. SIZE(d_lP_R, 2) > 0) THEN
+      IF (SIZE(d_lP_R, 1) > 0 .AND. n_P > 0) THEN
          DO i_dest = 0, n_ranks - 1
             i_q = i_batch*n_ranks + MODULO(i_dest - q_offset, n_ranks) + 1
             IF (i_q > SIZE(qpoints, 2)) CYCLE
-            IF (.NOT. required_q(i_q)) CYCLE
             q_column = q_column + 1
             i_slot = MODULO(i_dest, 2) + 1
             IF (sending(i_slot)) CALL mp_waitall(send_requests(i_slot:i_slot))
             sending(i_slot) = .FALSE.
             IF (use_blas) THEN
-               DO i_P = 1, SIZE(d_lP_R, 2)
+               DO i_P = 1, n_P
                   DO i_grid = 1, SIZE(d_lP_R, 1)
                      i_T = (i_P - 1)*SIZE(d_lP_R, 1) + i_grid
                      send_q(i_grid, i_P, i_slot) = &
@@ -900,7 +871,7 @@ CONTAINS
       IF (receiving) THEN
          DO i_dest = 0, n_ranks - 1
             IF (i_dest == i_rank) CYCLE
-            CALL get_local_l_range(SIZE(d_lP_q, 1), n_ranks, i_dest, first_l, last_l)
+            CALL get_local_l_range(bs_env%ri_rs%n_grid_points, n_ranks, i_dest, first_l, last_l)
             n_l = last_l - first_l + 1
             DO i_P = 1, n_P
                position = (first_l - 1)*n_P + (i_P - 1)*n_l

@@ -77,7 +77,6 @@ MODULE gw_ri_rs_small_cell_full_kp_utils
                                               kpoint_type
    USE libint_2c_3c,                    ONLY: libint_potential_type
    USE machine,                         ONLY: m_flush,&
-                                              m_memory,&
                                               m_walltime
    USE mathconstants,                   ONLY: fourpi,&
                                               gaussi,&
@@ -88,8 +87,7 @@ MODULE gw_ri_rs_small_cell_full_kp_utils
    USE mathlib,                         ONLY: diag_complex,&
                                               gemm_square,&
                                               inv_3x3
-   USE message_passing,                 ONLY: mp_comm_split_type_shared,&
-                                              mp_comm_type,&
+   USE message_passing,                 ONLY: mp_comm_type,&
                                               mp_mem_avail_per_rank_GB,&
                                               mp_para_env_release,&
                                               mp_para_env_type
@@ -198,7 +196,6 @@ MODULE gw_ri_rs_small_cell_full_kp_utils
       COMPLEX(dp), ALLOCATABLE                  :: metric_coulomb_factor(:, :, :), psi_lm_k(:, :, :, :), &
                                                    Z_lP_q(:, :, :), Z_lP_zero(:, :, :)
       REAL(dp), ALLOCATABLE                     :: sigma_c_bands(:, :, :, :, :), sigma_x_bands(:, :, :)
-      REAL(dp), ALLOCATABLE                     :: ao_values(:, :, :)
       COMPLEX(dp), ALLOCATABLE                  :: band_orbitals(:, :, :, :)
       TYPE(mp_para_env_type), POINTER           :: group_env => NULL()
       INTEGER                                   :: ngroups = 1, my_group = 0
@@ -309,8 +306,8 @@ CONTAINS
       END IF
       CALL setup_ri_rs_grid(bs_env, bs_env%ri_rs%grid_points)
       CALL compute_Z_lP_q(bs_env, bs_env%ri_rs%grid_points, &
-                          gwkp_env%ao_values, Z_lP_q=gwkp_env%Z_lP_q, Z_lP_zero=gwkp_env%Z_lP_zero)
-      CALL build_all_phi_k(bs_env, gwkp_env%ao_values, phi_lmu_k)
+                          Z_lP_q=gwkp_env%Z_lP_q, Z_lP_zero=gwkp_env%Z_lP_zero)
+      CALL build_all_phi_k(bs_env, phi_lmu_k)
       CALL build_all_psi_k(bs_env, phi_lmu_k, gwkp_env%psi_lm_k)
       DEALLOCATE (phi_lmu_k)
       IF (bs_env%gw_flavour == evGW0) THEN
@@ -337,13 +334,11 @@ CONTAINS
 
       CHARACTER(LEN=*), PARAMETER                        :: routineN = 'compute_G_and_chi'
 
-      INTEGER                                            :: group_size, handle
+      INTEGER                                            :: handle
 
       CALL timeset(routineN, handle)
 
-      CALL create_ri_rs_grid_groups(bs_env, SIZE(gwkp_env%ao_values, 1), gwkp_env%group_env, group_size, &
-                                    gwkp_env%ngroups, gwkp_env%my_group)
-      DEALLOCATE (gwkp_env%ao_values)
+      CALL prepare_gw_mpi(bs_env, gwkp_env)
 
       CALL gamma_point_correction(bs_env, qs_env, gwkp_env)
       CPASSERT(.NOT. ALLOCATED(gwkp_env%band_orbitals))
@@ -747,21 +742,13 @@ CONTAINS
 
       CHARACTER(LEN=*), PARAMETER                        :: routineN = 'compute_Sigma_x'
 
-      COMPLEX(dp), ALLOCATABLE                           :: phi_lmu_k(:, :, :)
       INTEGER                                            :: handle
-
-! AO images are reconstructed only after W has released its large workspace.
 
       CALL timeset(routineN, handle)
 
-      CALL evaluate_mu_rl_R_values(bs_env, bs_env%ri_rs%grid_points, gwkp_env%ao_values)
-      CALL build_all_phi_k(bs_env, gwkp_env%ao_values, phi_lmu_k)
       CALL build_projection_interpolation(bs_env, gwkp_env%interpolation)
-      CALL collect_band_bloch_orbitals(bs_env, gwkp_env%ao_values, &
-                                       gwkp_env%band_orbitals, phi_lmu_k)
-      DEALLOCATE (phi_lmu_k)
+      CALL collect_band_bloch_orbitals(bs_env, gwkp_env%band_orbitals)
       CALL compute_Sigma_x_from_V(bs_env, gwkp_env)
-      DEALLOCATE (gwkp_env%ao_values)
       CALL prepare_self_energy_groups(bs_env, gwkp_env)
 
       CALL timestop(handle)
@@ -1314,178 +1301,21 @@ CONTAINS
    END SUBROUTINE auto_ri_block_gradient
 
 ! **************************************************************************************************
-!> \brief Use all MPI ranks as one memory-minimal RI-RS grid group.
-!>
-!> The routine estimates the larger of the chi, W, exchange, and correlation-self-energy peaks.
-!> Chi and W initially use the full global communicator.  After W is built,
-!> prepare_self_energy_groups chooses smaller time groups from the live memory budget.
-!> W(i omega) is transformed to W_PQ(q,i tau) while q remains distributed over all ranks:
-!>
-!>   H_chi(g) = H_distributed/g + H_replicated + n_owned H_time,
-!>   H_W(P)   = H_auxiliary-time/P + H_auxiliary-work/P + H_stream,
-!>   H_Sigma(g) = H_grid/g + H_auxiliary-time/g + H_replicated + n_owned H_time.
-!>
-!> where H_stream is a bounded auxiliary-basis image batch.  Only the current imaginary-time
-!> W_ll'(R,i tau) is materialized; it is consumed immediately by Sigma_c.
-!>
-!> All ranks form one group and exactly one distributed copy of every k/q-dependent input is
-!> retained.  This is the minimum-total-memory layout and also maximizes the ranks over which grid
-!> rows are distributed.  The reserve covers MPI and library workspaces; allocations already live
-!> when this routine is called are included in the measured unavailable memory.
+!> \brief Start GW with the SCF communicator; time and q groups are chosen at their use sites.
 !> \param bs_env ...
-!> \param n_grid ...
-!> \param group_env ...
-!> \param group_size ...
-!> \param ngroups ...
-!> \param my_group ...
+!> \param gwkp_env ...
 ! **************************************************************************************************
-   SUBROUTINE create_ri_rs_grid_groups(bs_env, n_grid, group_env, group_size, ngroups, my_group)
+   SUBROUTINE prepare_gw_mpi(bs_env, gwkp_env)
       TYPE(post_scf_bandstructure_type), POINTER         :: bs_env
-      INTEGER, INTENT(IN)                                :: n_grid
-      TYPE(mp_para_env_type), POINTER                    :: group_env
-      INTEGER, INTENT(OUT)                               :: group_size, ngroups, my_group
+      TYPE(gwkp_type), INTENT(INOUT)                     :: gwkp_env
 
-      CHARACTER(len=*), PARAMETER :: memory_error = &
-         'Periodic RI-RS memory estimate exceeds available memory after the workspace reserve', &
-         routineN = 'create_ri_rs_grid_groups'
-      REAL(KIND=dp), PARAMETER                           :: max_memory_reserve_GB = 2.0_dp, &
-                                                            min_memory_reserve_GB = 0.5_dp
+      CPASSERT(.NOT. ASSOCIATED(gwkp_env%group_env))
+      gwkp_env%group_env => bs_env%para_env
+      CALL gwkp_env%group_env%retain()
+      gwkp_env%ngroups = 1
+      gwkp_env%my_group = 0
 
-      INTEGER                                            :: handle, nowned, nthreads
-      INTEGER(int_8)                                     :: used_bytes
-      REAL(KIND=dp) :: bytes_per_rank, chi_distributed_bytes, chi_stream_bytes, chi_time_bytes, &
-         estimated_peak_bytes, estimated_total_bytes, mem_avail_GB, mem_used_GB, &
-         memory_reserve_GB, n_aux, n_full, sigma_c_distributed_bytes, sigma_c_owned_bytes, &
-         sigma_c_replicated_bytes, sigma_x_replicated_bytes, W_aux_group_bytes, W_aux_total_bytes, &
-         W_aux_world_bytes, W_owned_bytes, W_replicated_bytes
-
-! Account separately for arrays distributed by grid row, arrays replicated on every
-! rank, and results retained for each imaginary-time point owned by a rank.
-
-      CALL timeset(routineN, handle)
-
-      n_aux = REAL(bs_env%n_RI + 1, dp)
-      n_full = REAL(PRODUCT(bs_env%kpoints_scf_desymm%nkp_grid), dp)
-      chi_time_bytes = 16.0_dp*n_aux**2* &
-                       REAL(bs_env%nkp_scf_desymm*bs_env%num_time_freq_points, dp)
-      chi_distributed_bytes = REAL(n_grid, dp)**2* &
-                              (32.0_dp*REAL(bs_env%nkp_scf_desymm, dp) + &
-                               16.0_dp*n_full + &
-                               48.0_dp*REAL(bs_env%nkp_scf_desymm, dp)) + &
-                              16.0_dp*REAL(n_grid, dp)*n_aux + &
-                              48.0_dp*n_aux**2* &
-                              REAL(bs_env%nkp_scf_desymm, dp) + chi_time_bytes
-      ! Temporary RI projection matrices or thread-private weighted shared orbitals.
-      nthreads = 1
-!$    nthreads = omp_get_max_threads()
-      chi_stream_bytes = MAX(16.0_dp*n_aux**2, &
-                             16.0_dp*REAL(n_grid, dp)*REAL(bs_env%n_ao*nthreads, dp))
-      ! Exchange grid rows use the world communicator, not a tau group.  The three reciprocal
-      ! complex grids and two complete-cell complex grids are therefore divided over all ranks.
-      sigma_x_replicated_bytes = REAL(n_grid, dp)**2/REAL(bs_env%para_env%num_pe, dp)* &
-                                 (48.0_dp*REAL(bs_env%nkp_scf_desymm, dp) + &
-                                  32.0_dp*n_full) + &
-                                 16.0_dp*REAL(n_grid, dp)*REAL(bs_env%n_ao, dp) + &
-                                 16.0_dp*REAL(bs_env%n_ao, dp)**2 + &
-                                 8.0_dp*REAL(bs_env%n_ao, dp)**2* &
-                                 REAL(bs_env%nimages_scf_desymm, dp) + &
-                                 16.0_dp*REAL(n_grid, dp)* &
-                                 (n_aux + REAL(bs_env%n_ao, dp))/ &
-                                 REAL(bs_env%para_env%num_pe, dp) + &
-                                 48.0_dp*n_aux**2
-      sigma_c_distributed_bytes = REAL(n_grid, dp)**2* &
-                                  (16.0_dp*(3.0_dp*REAL(bs_env%nkp_scf_desymm, dp) + &
-                                            n_full + 1.0_dp) + &
-                                   40.0_dp*n_full + &
-                                   48.0_dp*REAL(bs_env%nkp_scf_desymm, dp)) + &
-                                  16.0_dp*REAL(n_grid, dp)*n_aux
-      sigma_c_replicated_bytes = 8.0_dp*REAL(bs_env%n_ao, dp)**2* &
-                                 REAL(bs_env%nimages_scf_desymm, dp)
-      sigma_c_owned_bytes = 16.0_dp*REAL(bs_env%n_ao, dp)**2* &
-                            REAL(bs_env%nimages_scf_desymm*bs_env%n_spin, dp)
-      ! W_PQ(q,i tau) uses the global q distribution until the bounded transpose to tau groups.
-      ! Projection to W_ll'(q/R,i tau) occurs inside Sigma_c for one time point at a time.
-      W_aux_world_bytes = 16.0_dp*n_aux**2* &
-                          REAL(bs_env%nkp_scf_desymm*bs_env%num_time_freq_points, dp)/ &
-                          REAL(bs_env%para_env%num_pe, dp)
-      W_owned_bytes = W_aux_world_bytes + n_aux**2* &
-                      (64.0_dp*REAL((bs_env%nkp_chi_eps_W_orig_plus_extra + &
-                                     bs_env%para_env%num_pe - 1)/bs_env%para_env%num_pe, dp) + &
-                       32.0_dp*REAL((bs_env%nkp_scf_desymm + bs_env%para_env%num_pe - 1)/ &
-                                    bs_env%para_env%num_pe, dp)) + &
-                      chi_time_bytes/REAL(bs_env%para_env%num_pe, dp)
-      ! Streaming W_PQ(R) in fixed image batches bounds the only auxiliary real-space buffer;
-      ! no rank holds a complete W_PQ(R) or W_ll'(q/R) object.
-      W_replicated_bytes = n_aux**2* &
-                           (8.0_dp*REAL(MIN(32, PRODUCT(bs_env%kpoints_scf_desymm%nkp_grid)), dp) + &
-                            96.0_dp)
-      CALL m_memory(used_bytes)
-      mem_used_GB = REAL(used_bytes, dp)*1.0E-9_dp
-      CALL bs_env%para_env%max(mem_used_GB)
-      CALL mp_mem_avail_per_rank_GB(bs_env%para_env, mem_avail_GB)
-      IF (mem_avail_GB > 0.0_dp) THEN
-         ! Reserve at least half of the remaining memory for MPI and library workspaces,
-         ! but do not demand 2 GB per rank when the node has less memory available.
-         memory_reserve_GB = MIN(max_memory_reserve_GB, &
-                                 MAX(min_memory_reserve_GB, 0.5_dp*mem_avail_GB))
-         bytes_per_rank = MAX(0.0_dp, mem_avail_GB - memory_reserve_GB)*1.0E9_dp
-      ELSE
-         memory_reserve_GB = 0.0_dp
-         bytes_per_rank = 8.0_dp*1024.0_dp**3
-      END IF
-      group_size = bs_env%para_env%num_pe
-      ngroups = 1
-      my_group = 0
-      nowned = (bs_env%num_time_freq_points + group_size - 1)/group_size
-      W_aux_group_bytes = 16.0_dp*n_aux**2* &
-                          REAL(bs_env%nkp_scf_desymm*nowned, dp)/REAL(group_size, dp)
-      estimated_peak_bytes = MAX( &
-                             chi_distributed_bytes/REAL(group_size, dp) + &
-                             chi_stream_bytes, &
-                             W_replicated_bytes + W_owned_bytes, &
-                             sigma_x_replicated_bytes, &
-                             sigma_c_distributed_bytes/REAL(group_size, dp) + &
-                             sigma_c_replicated_bytes + &
-                             REAL(nowned, dp)*sigma_c_owned_bytes + W_aux_group_bytes)
-      IF (estimated_peak_bytes > bytes_per_rank) THEN
-         IF (bs_env%unit_nr > 0) THEN
-            WRITE (bs_env%unit_nr, '(T2,A,T72,F9.2)') &
-               'Periodic RI-RS available memory per rank [GB]', mem_avail_GB
-            WRITE (bs_env%unit_nr, '(T2,A,T72,F9.2)') &
-               'Periodic RI-RS workspace reserve per rank [GB]', memory_reserve_GB
-            WRITE (bs_env%unit_nr, '(T2,A,T72,F9.2)') &
-               'Periodic RI-RS usable memory after workspace reserve [GB]', &
-               bytes_per_rank*1.0E-9_dp
-            WRITE (bs_env%unit_nr, '(T2,A,T72,F9.2)') &
-               'Periodic RI-RS minimum additional peak per rank [GB]', &
-               estimated_peak_bytes*1.0E-9_dp
-         END IF
-         CPWARN(memory_error)
-      END IF
-      W_aux_total_bytes = 16.0_dp*n_aux**2* &
-                          REAL(bs_env%nkp_scf_desymm*bs_env%num_time_freq_points, dp)
-      estimated_total_bytes = mem_used_GB*1.0E9_dp*REAL(bs_env%para_env%num_pe, dp) + &
-                              MAX(chi_distributed_bytes + &
-                                  8.0_dp*n_aux**2* &
-                                  REAL(bs_env%para_env%num_pe + 1, dp), &
-                                  REAL(bs_env%para_env%num_pe, dp)* &
-                                  (W_replicated_bytes + W_owned_bytes), &
-                                  REAL(bs_env%para_env%num_pe, dp)*sigma_x_replicated_bytes, &
-                                  sigma_c_distributed_bytes + &
-                                  REAL(bs_env%para_env%num_pe, dp)*sigma_c_replicated_bytes + &
-                                  REAL(bs_env%num_time_freq_points, dp)*sigma_c_owned_bytes + &
-                                  W_aux_total_bytes)
-      ALLOCATE (group_env)
-      CALL group_env%from_split(bs_env%para_env, my_group)
-      IF (bs_env%unit_nr > 0) THEN
-         WRITE (bs_env%unit_nr, '(T2,A,T69,I9,A)') &
-            'Estimated total peak memory (all MPI ranks):', &
-            NINT(estimated_total_bytes*1.0E-9_dp), ' GB'
-      END IF
-
-      CALL timestop(handle)
-
-   END SUBROUTINE create_ri_rs_grid_groups
+   END SUBROUTINE prepare_gw_mpi
 
 ! **************************************************************************************************
 !> \brief Retain G orbitals, Z and fixed W in the smallest memory-feasible time groups.
@@ -1519,10 +1349,10 @@ CONTAINS
       n_threads = 1
 !$    n_threads = omp_get_max_threads()
       n_world = bs_env%para_env%num_pe
-      n_grid = SIZE(gwkp_env%psi_lm_k, 1)
-      n_ao = SIZE(gwkp_env%psi_lm_k, 2)
-      n_spin = SIZE(gwkp_env%psi_lm_k, 4)
-      n_aux = SIZE(gwkp_env%Z_lP_q, 2)
+      n_grid = bs_env%ri_rs%n_grid_points
+      n_ao = bs_env%n_ao
+      n_spin = bs_env%n_spin
+      n_aux = bs_env%n_RI
       n_k = bs_env%nkp_scf_desymm
       n_time = bs_env%num_time_freq_points
       CALL mp_mem_avail_per_rank_GB(bs_env%para_env, available_GB)
@@ -1560,7 +1390,7 @@ CONTAINS
          IF (peak_bytes <= budget_bytes) EXIT
       END DO
       IF (i_group_size > n_world) THEN
-         CPABORT('Insufficient node memory for GW self-energy time groups')
+         CPABORT('Insufficient memory per MPI rank for GW self-energy time groups')
       END IF
       gwkp_env%ngroups = n_world/i_group_size
       gwkp_env%my_group = bs_env%para_env%mepos/i_group_size
@@ -1666,7 +1496,7 @@ CONTAINS
          time_bytes
       REAL(KIND=dp), ALLOCATABLE                         :: chi_grid_R(:, :, :), G_occ_R(:, :, :), &
                                                             green_norm_sq(:), qpoints(:, :)
-      TYPE(mp_comm_type)                                 :: column_env, node_env
+      TYPE(mp_comm_type)                                 :: column_env
       TYPE(mp_para_env_type), POINTER                    :: chi_env
       TYPE(ri_q_matrix_block_type), ALLOCATABLE          :: chi_partial(:)
 
@@ -1675,8 +1505,8 @@ CONTAINS
       CPASSERT(gwkp_env%ngroups == 1 .AND. gwkp_env%my_group == 0)
       CALL build_full_cell_grid(bs_env, full_cells)
       CPASSERT(.NOT. ALLOCATED(gwkp_env%band_orbitals))
-      n_grid = SIZE(gwkp_env%psi_lm_k, 1)
-      n_aux = SIZE(gwkp_env%Z_lP_q, 2)
+      n_grid = bs_env%ri_rs%n_grid_points
+      n_aux = bs_env%n_RI
       n_world = gwkp_env%group_env%num_pe
       ALLOCATE (qpoints(3, bs_env%nkp_scf_desymm))
       DO iq = 1, bs_env%nkp_scf_desymm
@@ -1690,7 +1520,6 @@ CONTAINS
       budget = MAX(0.0_dp, available_GB - MAX(1.0_dp, 0.1_dp*available_GB))*1.0E9_dp
       n_cells = SIZE(full_cells, 2)
       n_threads = omp_get_max_threads()
-      CALL node_env%from_split_type(gwkp_env%group_env, mp_comm_split_type_shared, key=gwkp_env%group_env%mepos)
       DO i_size = MIN(2, MAX(1, n_world/2)), n_world
          IF (MODULO(n_world, i_size) /= 0) CYCLE
          n_groups = n_world/i_size
@@ -1722,15 +1551,11 @@ CONTAINS
          peak = input_bytes + time_bytes + 16.0_dp*REAL(n_aux, dp)**2*n_q_max + &
                 MAX(live_bytes, 16.0_dp*REAL(n_aux, dp)**2*REAL(bs_env%num_time_freq_points, dp)) + &
                 32.0_dp*REAL(n_threads*bs_env%nkp_scf_desymm, dp) + 256.0_dp*1024.0_dp**2
-         ! Cyclic rank placement can balance unequal q ownership on the same node.
-         CALL node_env%sum(peak)
-         peak = peak/REAL(node_env%num_pe, dp)
          CALL gwkp_env%group_env%max(peak)
          IF (peak <= budget) EXIT
       END DO
-      CALL node_env%free()
       IF (i_size > n_world) THEN
-         CPABORT("Insufficient node memory for GW time groups")
+         CPABORT("Insufficient memory per MPI rank for GW time groups")
       END IF
       n_groups = n_world/i_size
       i_group = gwkp_env%group_env%mepos/i_size
@@ -1963,7 +1788,7 @@ CONTAINS
 
       phase_start = m_walltime()
       is_slab = ALL(bs_env%periodic == [1, 1, 0])
-      valid_layout = ALL(SHAPE(gwkp_env%Z_lP_zero) == [SIZE(gwkp_env%psi_lm_k, 1), bs_env%n_RI + 1, 1])
+      valid_layout = ALL(SHAPE(gwkp_env%Z_lP_zero) == [bs_env%ri_rs%n_grid_points, bs_env%n_RI + 1, 1])
       CPASSERT(valid_layout)
 
       volume = bs_env%ri_rs%cell%deth
@@ -2015,7 +1840,7 @@ CONTAINS
          gwkp_env%gamma_correction%radii(n_angular + i_direction) = qnorm
       END DO
       ALLOCATE (head_freq(n_directions, bs_env%num_time_freq_points), &
-                wing_freq(SIZE(gwkp_env%Z_lP_zero, 1), n_directions, bs_env%num_time_freq_points))
+                wing_freq(bs_env%ri_rs%n_grid_points, n_directions, bs_env%num_time_freq_points))
       ! The finite RI metric at q=0 retains its complete Gaussian channel.
       ! The singular full-Coulomb Gamma-correction head is integrated separately.
       CALL timeset('gamma_ri_metric_build', detail_handle)
@@ -2058,9 +1883,9 @@ CONTAINS
 
       ALLOCATE (eps_P_cartesian(bs_env%n_RI, 3), pi_cartesian(3, 3), &
                 response_cartesian(bs_env%n_RI, 3), schur_cartesian(3, 3), &
-                wing_cartesian(SIZE(gwkp_env%Z_lP_zero, 1), 3), &
+                wing_cartesian(bs_env%ri_rs%n_grid_points, 3), &
                 F_response_cartesian(bs_env%n_RI, 3), wing_local(bs_env%n_RI))
-      IF (is_slab) ALLOCATE (gwkp_env%gamma_correction%slab_wing_cartesian(SIZE(gwkp_env%Z_lP_zero, 1), 3, &
+      IF (is_slab) ALLOCATE (gwkp_env%gamma_correction%slab_wing_cartesian(bs_env%ri_rs%n_grid_points, 3, &
                                                                            bs_env%num_time_freq_points), SOURCE=z_zero)
       head_freq = z_zero
       wing_freq = z_zero
@@ -2078,19 +1903,19 @@ CONTAINS
             CALL zgemm('N', 'N', bs_env%n_RI, 3, bs_env%n_RI, z_one, &
                        F_external, bs_env%n_RI, response_cartesian, bs_env%n_RI, &
                        z_zero, F_response_cartesian, bs_env%n_RI)
-            CALL zgemm('N', 'N', SIZE(gwkp_env%Z_lP_zero, 1), 3, bs_env%n_RI, &
+            CALL zgemm('N', 'N', bs_env%ri_rs%n_grid_points, 3, bs_env%n_RI, &
                        CMPLX(twopi/ri_metric_head_zero(bs_env), 0.0_dp, dp), &
-                       gwkp_env%Z_lP_zero(:, 2:, 1), SIZE(gwkp_env%Z_lP_zero, 1), F_response_cartesian, bs_env%n_RI, &
-                       z_zero, wing_cartesian, SIZE(gwkp_env%Z_lP_zero, 1))
+                       gwkp_env%Z_lP_zero(:, 2:, 1), bs_env%ri_rs%n_grid_points, F_response_cartesian, bs_env%n_RI, &
+                       z_zero, wing_cartesian, bs_env%ri_rs%n_grid_points)
             gwkp_env%gamma_correction%slab_wing_cartesian(:, :, j_w) = -wing_cartesian
          ELSE
             CALL zgemm('N', 'N', bs_env%n_RI, 3, bs_env%n_RI, z_one, &
                        F_zero, bs_env%n_RI, response_cartesian, bs_env%n_RI, &
                        z_zero, F_response_cartesian, bs_env%n_RI)
-            CALL zgemm('N', 'N', SIZE(gwkp_env%Z_lP_zero, 1), 3, bs_env%n_RI, &
+            CALL zgemm('N', 'N', bs_env%ri_rs%n_grid_points, 3, bs_env%n_RI, &
                        CMPLX(fourpi/ri_metric_head_zero(bs_env), 0.0_dp, dp), &
-                       gwkp_env%Z_lP_zero(:, 2:, 1), SIZE(gwkp_env%Z_lP_zero, 1), F_response_cartesian, bs_env%n_RI, &
-                       z_zero, wing_cartesian, SIZE(gwkp_env%Z_lP_zero, 1))
+                       gwkp_env%Z_lP_zero(:, 2:, 1), bs_env%ri_rs%n_grid_points, F_response_cartesian, bs_env%n_RI, &
+                       z_zero, wing_cartesian, bs_env%ri_rs%n_grid_points)
          END IF
          DO i_direction = 1, n_directions
             q_direction_complex(:) = CMPLX(gwkp_env%gamma_correction%directions(:, i_direction), 0.0_dp, dp)
@@ -2135,7 +1960,7 @@ CONTAINS
       END IF
       CALL timeset('gamma_time_transform', detail_handle)
       ALLOCATE (gwkp_env%gamma_correction%head_tau(n_directions, bs_env%num_time_freq_points), &
-                gwkp_env%gamma_correction%wing_tau(SIZE(gwkp_env%Z_lP_zero, 1), n_directions, bs_env%num_time_freq_points))
+                gwkp_env%gamma_correction%wing_tau(bs_env%ri_rs%n_grid_points, n_directions, bs_env%num_time_freq_points))
       gwkp_env%gamma_correction%head_tau = z_zero
       gwkp_env%gamma_correction%wing_tau = z_zero
       DO i_t = 1, bs_env%num_time_freq_points
@@ -2975,7 +2800,7 @@ CONTAINS
 
       CALL timeset(routineN, handle)
 
-      n_grid = SIZE(Z_zero_q, 1)
+      n_grid = bs_env%ri_rs%n_grid_points
       CPASSERT(SIZE(cells, 2) == SIZE(model%slab_head_cell_tau, 1))
       ALLOCATE (wing_left(n_grid), wing_right(n_grid))
       DO i_cell = 1, SIZE(cells, 2)
@@ -3027,7 +2852,7 @@ CONTAINS
       INTEGER                                            :: icell, idir, n_grid, nk
       REAL(KIND=dp)                                      :: a, L, qcart(3), qnorm, rcart(3), volume
 
-      n_grid = SIZE(Z_zero_q, 1)
+      n_grid = bs_env%ri_rs%n_grid_points
       nk = PRODUCT(bs_env%nkp_grid_chi_eps_W_orig)
       volume = bs_env%ri_rs%cell%deth
       ALLOCATE (wing_left(n_grid), wing_right(n_grid))
@@ -3097,7 +2922,7 @@ CONTAINS
       CALL timeset(routineN, handle)
 
       ALLOCATE (gwkp_env%sigma_x_bands(bs_env%n_ao, bs_env%nkp_bs_and_DOS, bs_env%n_spin))
-      n_grid = SIZE(gwkp_env%psi_lm_k, 1)
+      n_grid = bs_env%ri_rs%n_grid_points
       CALL local_grid_row_range(n_grid, bs_env%para_env, first_row, last_row, nrows_local)
       ALLOCATE (V_grid_q(nrows_local, n_grid, bs_env%nkp_scf_desymm))
       n_q_local = SIZE(gwkp_env%Z_lP_q, 3)
@@ -3110,7 +2935,7 @@ CONTAINS
       END DO
       CPASSERT(SIZE(gwkp_env%Z_lP_q, 2) == bs_env%n_RI)
       CPASSERT(ALLOCATED(gwkp_env%metric_coulomb_factor))
-      ALLOCATE (interaction_q(SIZE(gwkp_env%Z_lP_q, 2), SIZE(gwkp_env%Z_lP_q, 2), n_q_local))
+      ALLOCATE (interaction_q(bs_env%n_RI, bs_env%n_RI, n_q_local))
       DO iq_local = 1, n_q_local
          interaction_q(:, :, iq_local) = MATMUL(gwkp_env%metric_coulomb_factor(:, :, iq_local), &
                                                 CONJG(TRANSPOSE(gwkp_env%metric_coulomb_factor(:, :, iq_local))))
@@ -3226,7 +3051,7 @@ CONTAINS
       CPASSERT(ALLOCATED(gwkp_env%band_orbitals))
       IF (ALLOCATED(gwkp_env%sigma_c_bands)) DEALLOCATE (gwkp_env%sigma_c_bands)
       CALL build_full_cell_grid(bs_env, full_cells)
-      n_grid = SIZE(gwkp_env%psi_lm_k, 1)
+      n_grid = bs_env%ri_rs%n_grid_points
       CALL initialize_pair_transfer(W_plan, n_grid, bs_env%nkp_scf_desymm, 0, gwkp_env%group_env)
       CALL initialize_pair_transfer(green_plan, n_grid, bs_env%nkp_scf_desymm, -1, gwkp_env%group_env)
       n_pairs_local = W_plan%n_local
@@ -3235,7 +3060,7 @@ CONTAINS
       n_group_times = (bs_env%num_time_freq_points - gwkp_env%my_group + gwkp_env%ngroups - 1)/gwkp_env%ngroups
       DO iq = 1, SIZE(gwkp_env%W_PQ_tau)
          CPASSERT(ALLOCATED(gwkp_env%W_PQ_tau(iq)%values))
-         IF (.NOT. (SIZE(gwkp_env%W_PQ_tau(iq)%values, 1) == SIZE(gwkp_env%Z_lP_q, 2))) THEN
+         IF (.NOT. (SIZE(gwkp_env%W_PQ_tau(iq)%values, 1) == bs_env%n_RI)) THEN
             CPABORT("Internal GW array shape mismatch")
          END IF
          valid_layout = SIZE(gwkp_env%W_PQ_tau(iq)%values, 3) == n_group_times
@@ -3454,7 +3279,7 @@ CONTAINS
 
       CALL timeset('collect_scf_grid_orbitals', handle)
 
-      n_grid = SIZE(psi, 1)
+      n_grid = bs_env%ri_rs%n_grid_points
       CPASSERT(n_grid > 0 .AND. SIZE(psi, 2) == bs_env%n_ao)
       CPASSERT(SIZE(psi, 4) == bs_env%n_spin)
       n_owned = (bs_env%nkp_scf_desymm + para_env%num_pe - 1 - para_env%mepos)/para_env%num_pe
@@ -3475,7 +3300,7 @@ CONTAINS
       i_progress = 1
       n_total = bs_env%n_spin*bs_env%nkp_scf_desymm
       IF (bs_env%unit_nr > 0) THEN
-         WRITE (bs_env%unit_nr, '(T2,A)') 'GW: sharing existing SCF orbitals between ranks on each node'
+         WRITE (bs_env%unit_nr, '(T2,A)') 'GW: collecting SCF orbitals in the MPI time group'
          CALL m_flush(bs_env%unit_nr)
       END IF
       DO ispin = 1, bs_env%n_spin
@@ -3587,9 +3412,9 @@ CONTAINS
       ! The occupied and virtual Green functions contain disjoint band sums.
       ! Omit the identically zero columns of the other band sector.
 
-      ALLOCATE (scaled_coeff(SIZE(psi_lm_k, 1), MAX(1, n_bands)))
+      ALLOCATE (scaled_coeff(bs_env%ri_rs%n_grid_points, MAX(1, n_bands)))
       scaled_coeff(:, :) = z_zero
-      CALL initialize_product_row_transfer(transfer, group_env, SIZE(psi_lm_k, 1), &
+      CALL initialize_product_row_transfer(transfer, group_env, bs_env%ri_rs%n_grid_points, &
                                            bs_env%nkp_scf_desymm, -1, n_bands, max_rows)
       DO WHILE (next_transfer_block(transfer))
          CALL timeset('chi_green_local_products', phase_handle)
@@ -3614,7 +3439,7 @@ CONTAINS
             END DO
             DO i_dest = 0, group_env%num_pe - 1
                CALL pack_product_row_block(transfer, i_dest, scaled_coeff(:, 1:n_bands), &
-                                           scaled_coeff(:, 1:n_bands), SIZE(scaled_coeff, 1), n_bands, ikp_local, max_rows)
+                                           scaled_coeff(:, 1:n_bands), bs_env%ri_rs%n_grid_points, n_bands, ikp_local, max_rows)
             END DO
          END DO
          CPASSERT(ikp_local <= SIZE(psi_lm_k, 3))
@@ -3665,7 +3490,7 @@ CONTAINS
 
       CALL get_gw_work(bs_env, gwkp_env)
 
-      n_grid = SIZE(orbitals, 1)
+      n_grid = bs_env%ri_rs%n_grid_points
       n_local = SIZE(G_pairs, 1)
       CPASSERT(n_grid > 0 .AND. SIZE(orbitals, 2) == bs_env%n_ao)
       CPASSERT(SIZE(orbitals, 3) >= bs_env%nkp_scf_desymm)
@@ -3776,7 +3601,7 @@ CONTAINS
       ! The occupied and virtual Green functions contain disjoint band sums.
       ! Omit the identically zero columns of the other band sector.
       CPASSERT(plan%owner_offset == -1)
-      ALLOCATE (G_k_local(SIZE(psi_lm_k, 1), SIZE(psi_lm_k, 1), SIZE(psi_lm_k, 3)))
+      ALLOCATE (G_k_local(bs_env%ri_rs%n_grid_points, bs_env%ri_rs%n_grid_points, SIZE(psi_lm_k, 3)))
       nowned_k = COUNT([(MODULO(ikp - 1, group_env%num_pe) == &
                          group_env%mepos, ikp=1, bs_env%nkp_scf_desymm)])
       CPASSERT(SIZE(psi_lm_k, 3) == nowned_k)
@@ -3784,7 +3609,7 @@ CONTAINS
       !$OMP SHARED(bs_env, G_k_local, group_env, ispin, first_band, n_bands, psi_lm_k, &
       !$OMP        gwkp_env, tau) &
       !$OMP PRIVATE(band, i_band, ikp, ikp_local, scaled_coeff, tau_E)
-      ALLOCATE (scaled_coeff(SIZE(psi_lm_k, 1), MAX(1, n_bands)))
+      ALLOCATE (scaled_coeff(bs_env%ri_rs%n_grid_points, MAX(1, n_bands)))
       !$OMP DO SCHEDULE(STATIC)
       DO ikp_local = 1, SIZE(psi_lm_k, 3)
          ikp = group_env%mepos + 1 + (ikp_local - 1)*group_env%num_pe
@@ -3803,10 +3628,10 @@ CONTAINS
                scaled_coeff(:, i_band) = z_zero
             END IF
          END DO
-         CALL zgemm('N', 'C', SIZE(scaled_coeff, 1), SIZE(scaled_coeff, 1), &
-                    n_bands, z_one, scaled_coeff, SIZE(scaled_coeff, 1), &
-                    scaled_coeff, SIZE(scaled_coeff, 1), z_zero, G_k_local(:, :, ikp_local), &
-                    SIZE(G_k_local, 1))
+         CALL zgemm('N', 'C', bs_env%ri_rs%n_grid_points, bs_env%ri_rs%n_grid_points, &
+                    n_bands, z_one, scaled_coeff, bs_env%ri_rs%n_grid_points, &
+                    scaled_coeff, bs_env%ri_rs%n_grid_points, z_zero, G_k_local(:, :, ikp_local), &
+                    bs_env%ri_rs%n_grid_points)
       END DO
       !$OMP END DO
       DEALLOCATE (scaled_coeff)
@@ -3845,7 +3670,7 @@ CONTAINS
 
       n_owned_max = (bs_env%nkp_scf_desymm + bs_env%para_env%num_pe - 1)/ &
                     bs_env%para_env%num_pe
-      ALLOCATE (psi_lm_k(SIZE(phi_lmu_k, 1), bs_env%n_ao, SIZE(phi_lmu_k, 3), &
+      ALLOCATE (psi_lm_k(bs_env%ri_rs%n_grid_points, bs_env%n_ao, SIZE(phi_lmu_k, 3), &
                          bs_env%n_spin), SOURCE=z_zero)
       batch_size = MAX(1, INT(coefficient_batch_bytes/ &
                               (16.0_dp*REAL(bs_env%n_ao, dp)**2)))
@@ -3887,62 +3712,37 @@ CONTAINS
 ! **************************************************************************************************
 !> \brief Cache Bloch sums of the RI-RS grid values for the k-points owned by this rank.
 !> \param bs_env ...
-!> \param phi_lmu_R ...
 !> \param phi_lmu_k ...
 ! **************************************************************************************************
-   SUBROUTINE build_all_phi_k(bs_env, phi_lmu_R, phi_lmu_k)
+   SUBROUTINE build_all_phi_k(bs_env, phi_lmu_k)
       TYPE(post_scf_bandstructure_type), POINTER         :: bs_env
-      REAL(KIND=dp), DIMENSION(:, :, :), INTENT(IN)      :: phi_lmu_R
-      COMPLEX(KIND=dp), ALLOCATABLE, INTENT(OUT)         :: phi_lmu_k(:, :, :)
+      COMPLEX(dp), ALLOCATABLE, INTENT(OUT)              :: phi_lmu_k(:, :, :)
 
-      CHARACTER(LEN=*), PARAMETER                        :: routineN = 'build_all_phi_k'
+      INTEGER                                            :: handle, i_R, ikp, ikp_local, n_k_local
+      REAL(dp), ALLOCATABLE                              :: phi_R(:, :)
 
-      INTEGER                                            :: handle, ikp, ikp_local, n_k_local
+      CALL timeset('build_all_phi_k', handle)
 
-      CALL timeset(routineN, handle)
-
-      n_k_local = 0
-      DO ikp = 1, bs_env%nkp_scf_desymm
-         IF (MODULO(ikp - 1, bs_env%para_env%num_pe) == bs_env%para_env%mepos) THEN
-            n_k_local = n_k_local + 1
-         END IF
-      END DO
-      ALLOCATE (phi_lmu_k(SIZE(phi_lmu_R, 1), SIZE(phi_lmu_R, 2), n_k_local))
+      n_k_local = (bs_env%nkp_scf_desymm + bs_env%para_env%num_pe - 1 - &
+                   bs_env%para_env%mepos)/bs_env%para_env%num_pe
+      ALLOCATE (phi_lmu_k(bs_env%ri_rs%n_grid_points, bs_env%n_ao, n_k_local))
       phi_lmu_k = z_zero
-      ikp_local = 0
-      DO ikp = 1, bs_env%nkp_scf_desymm
-         IF (MODULO(ikp - 1, bs_env%para_env%num_pe) /= bs_env%para_env%mepos) CYCLE
-         ikp_local = ikp_local + 1
-         CALL build_phi_k(phi_lmu_R, bs_env%index_to_cell_3c, &
-                          bs_env%kpoints_scf_desymm%xkp(:, ikp), phi_lmu_k(:, :, ikp_local))
-      END DO
-      CPASSERT(ikp_local == n_k_local)
+      IF (n_k_local > 0) THEN
+         ALLOCATE (phi_R(bs_env%ri_rs%n_grid_points, bs_env%n_ao))
+         DO i_R = 1, SIZE(bs_env%index_to_cell_3c, 2)
+            CALL evaluate_mu_rl_R_values(bs_env, bs_env%ri_rs%grid_points, i_R, phi_R)
+            ikp_local = 0
+            DO ikp = bs_env%para_env%mepos + 1, bs_env%nkp_scf_desymm, bs_env%para_env%num_pe
+               ikp_local = ikp_local + 1
+               phi_lmu_k(:, :, ikp_local) = phi_lmu_k(:, :, ikp_local) + &
+                                         lattice_phase(bs_env%kpoints_scf_desymm%xkp(:, ikp), bs_env%index_to_cell_3c(:, i_R))*phi_R
+            END DO
+         END DO
+      END IF
 
       CALL timestop(handle)
 
    END SUBROUTINE build_all_phi_k
-
-! **************************************************************************************************
-!> \brief Assemble the Bloch sum of explicitly translated AO values.
-!> \param phi_lmu_R ...
-!> \param index_to_cell ...
-!> \param kpoint ...
-!> \param phi_k ...
-! **************************************************************************************************
-   SUBROUTINE build_phi_k(phi_lmu_R, index_to_cell, kpoint, phi_k)
-      REAL(KIND=dp), DIMENSION(:, :, :), INTENT(IN)      :: phi_lmu_R
-      INTEGER, DIMENSION(:, :), INTENT(IN)               :: index_to_cell
-      REAL(KIND=dp), DIMENSION(3), INTENT(IN)            :: kpoint
-      COMPLEX(KIND=dp), DIMENSION(:, :), INTENT(OUT)     :: phi_k
-
-      INTEGER                                            :: i_R
-
-      phi_k = z_zero
-      DO i_R = 1, SIZE(phi_lmu_R, 3)
-         phi_k = phi_k + lattice_phase(kpoint, index_to_cell(:, i_R))*phi_lmu_R(:, :, i_R)
-      END DO
-
-   END SUBROUTINE build_phi_k
 
 ! **************************************************************************************************
 !> \brief Copy the locally owned elements of a distributed complex full matrix.
@@ -4501,7 +4301,7 @@ CONTAINS
       CALL timeset('gamma_ao_time_prepare', handle)
 
       CALL gamma_ao_time_release(state)
-      CALL initialize_time_state(bs_env, SIZE(psi, 1), state)
+      CALL initialize_time_state(bs_env, bs_env%ri_rs%n_grid_points, state)
       CALL validate_time_transform(bs_env)
       CALL accumulate_time_state(bs_env, psi, dipole, volume, state)
 
@@ -4623,7 +4423,7 @@ CONTAINS
                END IF
                DO i = 1, 32
                   delta = lo*(hi/lo)**(REAL(i - 1, dp)/31.0_dp)
-                  DO w = 1, SIZE(bs_env%time_frequency_grid%frequency)
+                  DO w = 1, bs_env%num_time_freq_points
                      omega = bs_env%time_frequency_grid%frequency(w)
                      exact = 2.0_dp*delta/(delta*delta + omega*omega)
                      approximate = 0.0_dp
@@ -4675,7 +4475,7 @@ CONTAINS
          nv = bs_env%n_mo_retained - no
          CPASSERT(nv >= 0)
          IF (no == 0 .OR. nv == 0) CYCLE
-         ALLOCATE (orbitals(SIZE(psi, 1), no + nv), gamma_corr(no, nv, 3))
+         ALLOCATE (orbitals(bs_env%ri_rs%n_grid_points, no + nv), gamma_corr(no, nv, 3))
          DO k = 1, bs_env%nkp_scf_desymm
             owner = MODULO(k - 1, bs_env%para_env%num_pe)
             IF (bs_env%para_env%mepos == owner) THEN
@@ -4727,7 +4527,7 @@ CONTAINS
       no = bs_env%n_occ(spin)
       nv = bs_env%n_mo_retained - no
       CPASSERT(nv >= 0)
-      ng = SIZE(orbitals, 1)
+      ng = bs_env%ri_rs%n_grid_points
       nr = SIZE(state%chi_tau, 1)
       first = state%first_row
       last = first + nr - 1
@@ -5535,7 +5335,7 @@ CONTAINS
       REAL(KIND=dp), ALLOCATABLE                         :: fractional_grid(:, :)
 
       CPASSERT(PRESENT(wing_left) .EQV. PRESENT(wing_right))
-      ngrid = SIZE(head_vector)
+      ngrid = bs_env%ri_rs%n_grid_points
       CPASSERT(ngrid > 0)
       CPASSERT(ALLOCATED(bs_env%ri_rs%grid_points))
       CPASSERT(ASSOCIATED(bs_env%ri_rs%cell))
@@ -5633,139 +5433,54 @@ CONTAINS
    END SUBROUTINE add_gamma_corr_pair_cell
 
 ! **************************************************************************************************
-!> \brief Form band Bloch orbitals once instead of communicating them for every self-energy.
+!> \brief Evaluate band Bloch orbitals locally from one AO cell at a time.
 !> \param bs_env ...
-!> \param phi_R ...
 !> \param orbitals ...
-!> \param phi_native_k ...
 ! **************************************************************************************************
-   SUBROUTINE collect_band_bloch_orbitals(bs_env, phi_R, orbitals, phi_native_k)
+   SUBROUTINE collect_band_bloch_orbitals(bs_env, orbitals)
       TYPE(post_scf_bandstructure_type), POINTER         :: bs_env
-      REAL(KIND=dp), INTENT(IN)                          :: phi_R(:, :, :)
-      COMPLEX(dp), ALLOCATABLE, INTENT(INOUT)            :: orbitals(:, :, :, :)
-      COMPLEX(dp), INTENT(IN), OPTIONAL                  :: phi_native_k(:, :, :)
+      COMPLEX(dp), ALLOCATABLE, INTENT(OUT)              :: orbitals(:, :, :, :)
 
-      CHARACTER(LEN=*), PARAMETER :: routineN = 'collect_band_bloch_orbitals'
-      REAL(dp), PARAMETER :: progress_fraction(9) = [0.001_dp, 0.003_dp, 0.01_dp, 0.03_dp, 0.1_dp, &
-         0.3_dp, 0.6_dp, 0.9_dp, 1.0_dp]
+      COMPLEX(dp), ALLOCATABLE                           :: coefficients(:, :, :, :), phi_k(:, :)
+      INTEGER                                            :: handle, i_kp, i_R, ispin, n_grid
+      REAL(dp)                                           :: available_GB, orbital_bytes
+      REAL(dp), ALLOCATABLE                              :: phi_R(:, :)
 
-      COMPLEX(KIND=dp)                                   :: phase
-      COMPLEX(KIND=dp), ALLOCATABLE                      :: coefficients(:, :, :, :), phi_k(:, :), &
-                                                            phi_plane(:, :), psi_k(:, :)
-      INTEGER :: handle, i_kp_eval, i_local, i_native, i_node, i_owned, i_progress, i_R, i_root, &
-         i_row, ispin, n_grid, n_local, n_local_max, n_node, n_owned
-      REAL(KIND=dp)                                      :: available_GB, delta_k(3), orbital_bytes, &
-                                                            start_time
-      TYPE(mp_comm_type)                                 :: node_comm
+      CALL timeset('collect_band_bloch_orbitals', handle)
 
-      CALL timeset(routineN, handle)
-
-      n_grid = SIZE(phi_R, 1)
-      IF (PRESENT(phi_native_k)) THEN
-         CPASSERT(SIZE(phi_native_k, 1) == n_grid)
-         CPASSERT(SIZE(phi_native_k, 2) == bs_env%n_ao)
-         n_owned = (bs_env%nkp_scf_desymm + bs_env%para_env%num_pe - 1 - bs_env%para_env%mepos)/ &
-                   bs_env%para_env%num_pe
-         CPASSERT(SIZE(phi_native_k, 3) == n_owned)
-      END IF
-      CPASSERT(SIZE(phi_R, 2) == bs_env%n_ao)
-      CPASSERT(SIZE(phi_R, 3) == SIZE(bs_env%index_to_cell_3c, 2))
-      CPASSERT(bs_env%para_env%num_pe > 0)
-      CPASSERT(bs_env%para_env%mepos >= 0)
-      CPASSERT(bs_env%para_env%mepos < bs_env%para_env%num_pe)
-      CPASSERT(.NOT. ALLOCATED(orbitals))
+      n_grid = bs_env%ri_rs%n_grid_points
       CALL collect_band_mo_coefficients(bs_env, coefficients)
-      CALL node_comm%from_split_type(bs_env%para_env, mp_comm_split_type_shared, key=bs_env%para_env%mepos)
-      n_node = node_comm%num_pe
-      i_node = node_comm%mepos
-      n_local_max = n_grid/n_node + MIN(1, MODULO(n_grid, n_node))
-      n_local = n_grid/n_node + MERGE(1, 0, i_node < MODULO(n_grid, n_node))
-      ! Charge each rank its complete orbital copy and its own work arrays.
-      orbital_bytes = 16.0_dp*REAL(n_grid, dp)*REAL(bs_env%n_ao, dp)* &
-                      REAL(bs_env%nkp_bs_and_DOS, dp)*REAL(bs_env%n_spin, dp) + &
-                      32.0_dp*REAL(n_local_max, dp)*REAL(bs_env%n_ao, dp)
-      IF (PRESENT(phi_native_k)) orbital_bytes = orbital_bytes + &
-                                                 16.0_dp*REAL(n_grid, dp)*REAL(bs_env%n_ao, dp)
-      ! Already allocated coefficients and interpolation data are included in the
-      ! measured usage. Leave half the available memory for subsequent workspaces.
+      orbital_bytes = REAL(n_grid, dp)*REAL(bs_env%n_ao, dp)* &
+                      (16.0_dp*REAL(bs_env%nkp_bs_and_DOS*bs_env%n_spin, dp) + 24.0_dp)
       CALL mp_mem_avail_per_rank_GB(bs_env%para_env, available_GB)
       CALL bs_env%para_env%min(available_GB)
       IF (orbital_bytes > 0.5_dp*MAX(0.0_dp, available_GB)*1.0E9_dp) THEN
          CPABORT("Insufficient memory for GW band-path orbitals")
       END IF
-      ALLOCATE (orbitals(n_grid, bs_env%n_ao, bs_env%nkp_bs_and_DOS, bs_env%n_spin), SOURCE=z_zero)
-      ALLOCATE (phi_k(n_local, bs_env%n_ao), psi_k(n_local, bs_env%n_ao))
-      IF (bs_env%unit_nr > 0) THEN
-         WRITE (bs_env%unit_nr, '(T2,A,T69,F12.1)') &
-            'GW band-path orbitals: GB per rank', 16.0_dp*REAL(SIZE(orbitals, KIND=int_8), dp)*1.0E-9_dp
-         FLUSH (bs_env%unit_nr)
-      END IF
-      ! Node-local ranks compute disjoint rows and exchange each completed band.
-      IF (PRESENT(phi_native_k)) ALLOCATE (phi_plane(n_grid, bs_env%n_ao))
-      start_time = m_walltime()
-      i_progress = 1
-      IF (bs_env%unit_nr > 0) THEN
-         WRITE (bs_env%unit_nr, '(T2,A)') 'GW: evaluating band-path orbitals on the RI-RS grid'
-         FLUSH (bs_env%unit_nr)
-      END IF
-      DO i_kp_eval = 1, bs_env%nkp_bs_and_DOS
-         i_native = 0
-         IF (PRESENT(phi_native_k) .AND. i_kp_eval <= bs_env%nkp_scf_desymm) THEN
-            delta_k = bs_env%kpoints_DOS%xkp(:, i_kp_eval) - bs_env%kpoints_scf_desymm%xkp(:, i_kp_eval)
-            IF (MAXVAL(ABS(delta_k - ANINT(delta_k))) <= 64.0_dp*EPSILON(1.0_dp)) i_native = i_kp_eval
-         END IF
-         phi_k = z_zero
-         IF (i_native > 0) THEN
-            i_root = MODULO(i_native - 1, bs_env%para_env%num_pe)
-            i_owned = (i_native - 1)/bs_env%para_env%num_pe + 1
-            IF (bs_env%para_env%mepos == i_root) phi_plane(:, :) = phi_native_k(:, :, i_owned)
-            CALL bs_env%para_env%bcast(phi_plane, i_root)
-            DO i_local = 1, n_local
-               i_row = i_node + 1 + (i_local - 1)*n_node
-               phi_k(i_local, :) = phi_plane(i_row, :)
-            END DO
-         ELSE
-            DO i_R = 1, SIZE(phi_R, 3)
-               phase = EXP(CMPLX(0.0_dp, twopi*SUM(bs_env%kpoints_DOS%xkp(:, i_kp_eval)* &
-                                                   bs_env%index_to_cell_3c(:, i_R)), KIND=dp))
-               DO i_local = 1, n_local
-                  i_row = i_node + 1 + (i_local - 1)*n_node
-                  phi_k(i_local, :) = phi_k(i_local, :) + phase*CMPLX(phi_R(i_row, :, i_R), 0.0_dp, dp)
-               END DO
-            END DO
-         END IF
-         IF (n_local > 0) THEN
-            DO ispin = 1, bs_env%n_spin
-               CALL zgemm('N', 'N', n_local, bs_env%n_ao, bs_env%n_ao, z_one, phi_k, n_local, &
-                          coefficients(:, :, i_kp_eval, ispin), bs_env%n_ao, z_zero, psi_k, n_local)
-               DO i_local = 1, n_local
-                  i_row = i_node + 1 + (i_local - 1)*n_node
-                  orbitals(i_row, :, i_kp_eval, ispin) = psi_k(i_local, :)
-               END DO
-            END DO
-         END IF
-         DO ispin = 1, bs_env%n_spin
-            CALL node_comm%sum(orbitals(:, :, i_kp_eval, ispin))
+      ALLOCATE (phi_k(n_grid, bs_env%n_ao), phi_R(n_grid, bs_env%n_ao))
+      ALLOCATE (orbitals(n_grid, bs_env%n_ao, bs_env%nkp_bs_and_DOS, bs_env%n_spin))
+      orbitals = z_zero
+      DO i_R = 1, SIZE(bs_env%index_to_cell_3c, 2)
+         IF (bs_env%para_env%mepos >= bs_env%nkp_bs_and_DOS) EXIT
+         CALL evaluate_mu_rl_R_values(bs_env, bs_env%ri_rs%grid_points, i_R, phi_R)
+         DO i_kp = bs_env%para_env%mepos + 1, bs_env%nkp_bs_and_DOS, bs_env%para_env%num_pe
+            orbitals(:, :, i_kp, 1) = orbitals(:, :, i_kp, 1) + &
+                                      lattice_phase(bs_env%kpoints_DOS%xkp(:, i_kp), bs_env%index_to_cell_3c(:, i_R))*phi_R
          END DO
-         IF (i_progress <= SIZE(progress_fraction)) THEN
-            IF (REAL(i_kp_eval, dp) >= progress_fraction(i_progress)*REAL(bs_env%nkp_bs_and_DOS, dp)) THEN
-            IF (bs_env%unit_nr > 0) THEN
-               WRITE (bs_env%unit_nr, '(T2,A,T26,I5,A,I0,T40,F5.1,A,T55,A,T69,F10.1,A)') &
-                  'GW band-path k-points ', i_kp_eval, ' / ', bs_env%nkp_bs_and_DOS, &
-                  100.0_dp*REAL(i_kp_eval, dp)/REAL(bs_env%nkp_bs_and_DOS, dp), ' %', &
-                  'Total time:', m_walltime() - start_time, ' s'
-               FLUSH (bs_env%unit_nr)
-            END IF
-            DO WHILE (i_progress <= SIZE(progress_fraction))
-               IF (REAL(i_kp_eval, dp) < progress_fraction(i_progress)*REAL(bs_env%nkp_bs_and_DOS, dp)) EXIT
-               i_progress = i_progress + 1
-            END DO
-            END IF
-         END IF
       END DO
-      IF (ALLOCATED(phi_plane)) DEALLOCATE (phi_plane)
-      CALL node_comm%free()
-      DEALLOCATE (phi_k, psi_k, coefficients)
+      DO i_kp = bs_env%para_env%mepos + 1, bs_env%nkp_bs_and_DOS, bs_env%para_env%num_pe
+         phi_k(:, :) = orbitals(:, :, i_kp, 1)
+         DO ispin = 1, bs_env%n_spin
+            CALL zgemm('N', 'N', n_grid, bs_env%n_ao, bs_env%n_ao, z_one, &
+                       phi_k, n_grid, coefficients(:, :, i_kp, ispin), &
+                       bs_env%n_ao, z_zero, orbitals(:, :, i_kp, ispin), n_grid)
+         END DO
+      END DO
+
+      ! Share completed MO orbitals; AO values are evaluated locally on each k rank.
+      DO i_kp = 1, bs_env%nkp_bs_and_DOS
+         CALL bs_env%para_env%bcast(orbitals(:, :, i_kp, :), MODULO(i_kp - 1, bs_env%para_env%num_pe))
+      END DO
 
       CALL timestop(handle)
 
@@ -5907,7 +5622,7 @@ CONTAINS
 
       CALL timeset(routineN, handle)
 
-      n_grid = SIZE(band_orbitals, 1)
+      n_grid = bs_env%ri_rs%n_grid_points
       nrows = last_row - first_row + 1
       CPASSERT(first_row >= 1 .AND. last_row <= n_grid .AND. nrows >= 0)
       valid_layout = SIZE(sigma_grid, 1) == nrows .AND. SIZE(sigma_grid, 2) == n_grid
@@ -5993,7 +5708,7 @@ CONTAINS
       CALL timeset(routineN, handle)
 
       CPASSERT(ALLOCATED(band_orbitals))
-      n_grid = SIZE(band_orbitals, 1)
+      n_grid = bs_env%ri_rs%n_grid_points
       n_local = SIZE(sigma_pairs, 1)
       CPASSERT(SIZE(sigma_pairs, 2) == 1)
       CPASSERT(SIZE(sigma_pairs, 3) == bs_env%nkp_scf_desymm)
@@ -6111,7 +5826,7 @@ CONTAINS
 
       CPASSERT(ALLOCATED(bs_env%ri_rs%grid_points))
       CPASSERT(ASSOCIATED(bs_env%ri_rs%cell))
-      ALLOCATE (fractional_grid(3, SIZE(bs_env%ri_rs%grid_points, 2)))
+      ALLOCATE (fractional_grid(3, bs_env%ri_rs%n_grid_points))
       fractional_grid(:, :) = MATMUL(bs_env%ri_rs%cell%h_inv, bs_env%ri_rs%grid_points)
       DO idir = 1, 3
          IF (bs_env%periodic(idir) == 0) fractional_grid(idir, :) = 0.0_dp
@@ -6270,7 +5985,7 @@ CONTAINS
 
       CPASSERT(ALLOCATED(bs_env%ri_rs%grid_points))
       CPASSERT(ASSOCIATED(bs_env%ri_rs%cell))
-      n_grid = SIZE(bs_env%ri_rs%grid_points, 2)
+      n_grid = bs_env%ri_rs%n_grid_points
       ALLOCATE (fractional_grid(3, n_grid), pair_order(n_local))
       fractional_grid(:, :) = MATMUL(bs_env%ri_rs%cell%h_inv, bs_env%ri_rs%grid_points)
       DO idir = 1, 3
@@ -6420,7 +6135,7 @@ CONTAINS
       CPASSERT(SIZE(values_k, 1) == SIZE(values_R, 1))
       CPASSERT(SIZE(values_k, 2) == SIZE(values_R, 2))
       CPASSERT(SIZE(values_k, 3) == SIZE(xkp, 2))
-      ngrid = SIZE(bs_env%ri_rs%grid_points, 2)
+      ngrid = bs_env%ri_rs%n_grid_points
       nmesh = bs_env%kpoints_scf_desymm%nkp_grid
       CPASSERT(ALL(nmesh > 0))
       IF (first_pair > 0) THEN
@@ -7569,9 +7284,7 @@ CONTAINS
    END SUBROUTINE unpack_transfer_matrix
 
 ! **************************************************************************************************
-!> \brief Keep balanced q groups contiguous in physical-node rank order.
-!> Every MPI rank participates. Group sizes differ by at most one; at most
-!> n_node-1 groups cross node boundaries, independent of the launch rank order.
+!> \brief Partition MPI ranks into balanced contiguous q groups.
 !> \param para_env ...
 !> \param n_qgroups ...
 !> \param my_qgroup ...
@@ -7583,56 +7296,18 @@ CONTAINS
       INTEGER, INTENT(OUT)                               :: my_qgroup
       INTEGER, ALLOCATABLE, INTENT(OUT)                  :: q_roots(:)
 
-      INTEGER                                            :: node_first_rank
-      INTEGER, ALLOCATABLE                               :: node_ids(:), rank_groups(:)
-      TYPE(mp_comm_type)                                 :: node_comm
+      INTEGER                                            :: i_first, i_group, i_last
 
-      CALL node_comm%from_split_type(para_env, mp_comm_split_type_shared, key=para_env%mepos)
-      node_first_rank = para_env%mepos
-      CALL node_comm%min(node_first_rank)
-      CALL node_comm%free()
-      ALLOCATE (node_ids(para_env%num_pe), SOURCE=0)
-      node_ids(para_env%mepos + 1) = node_first_rank
-      CALL para_env%sum(node_ids)
-      ALLOCATE (rank_groups(para_env%num_pe), q_roots(n_qgroups))
-      CALL partition_w_ranks(node_ids, rank_groups, q_roots)
-      my_qgroup = rank_groups(para_env%mepos + 1)
-   END SUBROUTINE grouped_w_partition
-
-! **************************************************************************************************
-!> \brief Assign contiguous balanced intervals of node-ordered ranks to q groups.
-!> The root is the smallest world rank in each group, matching communicator split.
-!> \param node_ids ...
-!> \param rank_groups ...
-!> \param q_roots ...
-! **************************************************************************************************
-   SUBROUTINE partition_w_ranks(node_ids, rank_groups, q_roots)
-      INTEGER, INTENT(IN)                                :: node_ids(:)
-      INTEGER, INTENT(OUT)                               :: rank_groups(:), q_roots(:)
-
-      INTEGER                                            :: igroup, inode, iposition, irank, &
-                                                            n_groups, n_rank
-
-      n_rank = SIZE(node_ids)
-      n_groups = SIZE(q_roots)
-      CPASSERT(n_rank > 0 .AND. n_groups > 0 .AND. n_groups <= n_rank)
-      CPASSERT(SIZE(rank_groups) == n_rank)
-      CPASSERT(ALL(node_ids >= 0) .AND. ALL(node_ids < n_rank))
-      rank_groups = -1
-      q_roots = n_rank
-      iposition = 0
-      DO inode = 0, n_rank - 1
-         DO irank = 0, n_rank - 1
-            IF (node_ids(irank + 1) /= inode) CYCLE
-            igroup = INT(INT(iposition, int_8)*n_groups/n_rank)
-            rank_groups(irank + 1) = igroup
-            q_roots(igroup + 1) = MIN(q_roots(igroup + 1), irank)
-            iposition = iposition + 1
-         END DO
+      CPASSERT(n_qgroups > 0 .AND. n_qgroups <= para_env%num_pe)
+      ALLOCATE (q_roots(n_qgroups))
+      DO i_group = 0, n_qgroups - 1
+         i_first = (para_env%num_pe*i_group)/n_qgroups
+         i_last = (para_env%num_pe*(i_group + 1))/n_qgroups - 1
+         q_roots(i_group + 1) = i_first
+         IF (para_env%mepos >= i_first .AND. para_env%mepos <= i_last) my_qgroup = i_group
       END DO
-      CPASSERT(iposition == n_rank .AND. ALL(rank_groups >= 0))
-      CPASSERT(ALL(q_roots < n_rank))
-   END SUBROUTINE partition_w_ranks
+
+   END SUBROUTINE grouped_w_partition
 
 ! **************************************************************************************************
 !> \brief ...
