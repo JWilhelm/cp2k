@@ -2014,7 +2014,6 @@ CONTAINS
       TYPE(dbcsr_p_type), DIMENSION(:, :), POINTER       :: matrix_ks_kp
       TYPE(dft_control_type), POINTER                    :: dft_control
       TYPE(qs_energy_type), POINTER                      :: energy
-      TYPE(qs_rho_type), POINTER                         :: rho
       TYPE(section_vals_type), POINTER                   :: hf_section, input, xc_section
 
       CALL timeset(routineN, handle)
@@ -2079,11 +2078,8 @@ CONTAINS
 
       CASE (tensor_small_cell_full_kp, ri_rs_small_cell_full_kp)
 
-         ! Refresh atom-local density fields after changing the XC functional.
-         CALL get_qs_env(qs_env, rho=rho)
-         CALL qs_rho_update_rho(rho, qs_env)
          ! calculate KS-matrix without XC
-         CALL qs_ks_build_kohn_sham_matrix(qs_env, calculate_forces=.FALSE., just_energy=.FALSE.)
+         CALL build_periodic_ks_with_gapw_density(qs_env)
          CALL get_qs_env(qs_env=qs_env, matrix_ks_kp=matrix_ks_kp)
 
          ALLOCATE (bs_env%fm_V_xc_R(dft_control%nimages, bs_env%n_spin))
@@ -2119,9 +2115,8 @@ CONTAINS
 
       IF (bs_env%gw_implementation == tensor_small_cell_full_kp .OR. &
           bs_env%gw_implementation == ri_rs_small_cell_full_kp) THEN
-         CALL qs_rho_update_rho(rho, qs_env)
          ! calculate KS-matrix again with XC
-         CALL qs_ks_build_kohn_sham_matrix(qs_env, calculate_forces=.FALSE., just_energy=.FALSE.)
+         CALL build_periodic_ks_with_gapw_density(qs_env)
          DO ispin = 1, bs_env%n_spin
             DO img = 1, dft_control%nimages
                ! store h_ks in fm_work_mo
@@ -2136,6 +2131,25 @@ CONTAINS
       CALL timestop(handle)
 
    END SUBROUTINE compute_V_xc
+
+! **************************************************************************************************
+!> \brief Rebuild a periodic KS matrix with the GAPW density derived from the converged AO density.
+!> \param qs_env ...
+! **************************************************************************************************
+   SUBROUTINE build_periodic_ks_with_gapw_density(qs_env)
+      TYPE(qs_environment_type), POINTER                 :: qs_env
+
+      TYPE(dft_control_type), POINTER                    :: dft_control
+      TYPE(qs_rho_type), POINTER                         :: rho
+
+      CALL get_qs_env(qs_env, dft_control=dft_control)
+      IF (dft_control%qs_control%gapw .OR. dft_control%qs_control%gapw_xc) THEN
+         CALL get_qs_env(qs_env, rho=rho)
+         CALL qs_rho_update_rho(rho, qs_env)
+      END IF
+      CALL qs_ks_build_kohn_sham_matrix(qs_env, calculate_forces=.FALSE., just_energy=.FALSE.)
+
+   END SUBROUTINE build_periodic_ks_with_gapw_density
 
 ! **************************************************************************************************
 !> \brief Sets the interaction radii used by the GW calculation.
@@ -3296,7 +3310,6 @@ CONTAINS
       TYPE(kpoint_type), POINTER                         :: kpoints_scf
       TYPE(neighbor_list_set_p_type), DIMENSION(:), &
          POINTER                                         :: sab_nl
-      TYPE(qs_rho_type), POINTER                         :: rho
 
       CALL timeset(routineN, handle)
 
@@ -3353,11 +3366,8 @@ CONTAINS
 
       CALL kpoint_operator_context_release(operators)
 
-      ! Refresh atom-local density fields before restoring the KS matrix.
-      CALL get_qs_env(qs_env, rho=rho)
-      CALL qs_rho_update_rho(rho, qs_env)
       ! just rebuild the overwritten KS matrix again
-      CALL qs_ks_build_kohn_sham_matrix(qs_env, calculate_forces=.FALSE., just_energy=.FALSE.)
+      CALL build_periodic_ks_with_gapw_density(qs_env)
 
       CALL cp_cfm_release(cfm_V_xc)
       CALL cp_cfm_release(cfm_mo_coeff)

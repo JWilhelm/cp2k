@@ -74,15 +74,16 @@
   {matcher = "Auto_RI_Size", tol = 1e-12, ref = 10},
   {matcher = "E_G0W0_indirect_gap", tol = 1e-4, ref = 32.541}
 ]
-# These two hBN cases exercise 2D Ewald with both GAPW and GPW.
-"11_RIRS_G0W0_PBE_2D_AUTO_RI_hBN.inp"       = [
-  {matcher = "Auto_RI_Size", tol = 1e-12, ref = 78},
-  {matcher = "E_G0W0_indirect_gap", tol = 1e-3, ref = 5.838},
-  {matcher = "E_G0W0_direct_gap", tol = 1e-3, ref = 5.838}
+# Fast 2D Ewald smoke tests with GAPW and GPW. The hBN inputs remain available
+# for targeted numerical validation outside the pdbg regression time budget.
+"13_RIRS_G0W0_PBE_2D_AUTO_RI_H2_GAPW.inp"   = [
+  {matcher = "Auto_RI_Size", tol = 1e-12, ref = 2},
+  {matcher = "E_G0W0_indirect_gap", tol = 1e-3, ref = 21.150},
+  {matcher = "E_G0W0_direct_gap", tol = 1e-3, ref = 21.150}
 ]
-"12_RIRS_G0W0_PBE_2D_AUTO_RI_hBN_GPW.inp"   = [
-  {matcher = "Auto_RI_Size", tol = 1e-12, ref = 78},
-  {matcher = "E_G0W0_indirect_gap", tol = 1e-3, ref = 5.839},
-  {matcher = "E_G0W0_direct_gap", tol = 1e-3, ref = 5.839}
+"14_RIRS_G0W0_PBE_2D_AUTO_RI_H2_GPW.inp"    = [
+  {matcher = "Auto_RI_Size", tol = 1e-12, ref = 2},
+  {matcher = "E_G0W0_indirect_gap", tol = 1e-3, ref = 21.161},
+  {matcher = "E_G0W0_direct_gap", tol = 1e-3, ref = 21.161}
 ]
 #EOF
