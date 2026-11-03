@@ -122,7 +122,7 @@ CONTAINS
       CALL get_gw_work(bs_env, gwkp_env)
 
       ! Sample AO/Bloch orbitals and fit the auxiliary functions: Eqs. (1)-(2).
-      CALL prepare_ri_rs(qs_env, bs_env, gwkp_env)
+      CALL prepare_ri_rs(bs_env, gwkp_env)
 
       ! G^occ/vir_ll′(R,iτ), χ_ll′(R,iτ), and χ_PQ(q,iω): Eqs. (3)-(6).
       CALL compute_G_and_chi(qs_env, bs_env, gwkp_env)

@@ -130,8 +130,6 @@ CONTAINS
       REAL(dp), INTENT(IN)                               :: qpoints(:, :)
       COMPLEX(dp), ALLOCATABLE, INTENT(OUT)              :: charge_lq(:, :)
 
-      CHARACTER(LEN=*), PARAMETER                        :: routineN = 'compute_d_lP_R'
-
       INTEGER                                            :: first_l, handle, last_l
       TYPE(uniform_settings_type)                        :: settings
 

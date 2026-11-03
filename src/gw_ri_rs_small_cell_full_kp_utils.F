@@ -283,12 +283,10 @@ CONTAINS
 
 ! **************************************************************************************************
 !> \brief Prepare RI-RS radial data, grid values, and Bloch orbitals.
-!> \param qs_env Required for periodic AUTO_RI metric optimization via existing two-centre integrals.
 !> \param bs_env Band-structure settings and physical results.
 !> \param gwkp_env Temporary periodic GW work data.
 ! **************************************************************************************************
-   SUBROUTINE prepare_ri_rs(qs_env, bs_env, gwkp_env)
-      TYPE(qs_environment_type), POINTER                 :: qs_env
+   SUBROUTINE prepare_ri_rs(bs_env, gwkp_env)
       TYPE(post_scf_bandstructure_type), POINTER         :: bs_env
       TYPE(gwkp_type), INTENT(INOUT)                     :: gwkp_env
 
