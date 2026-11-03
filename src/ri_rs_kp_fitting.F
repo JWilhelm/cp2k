@@ -13,8 +13,7 @@ MODULE ri_rs_kp_fitting
    USE basis_set_types,                 ONLY: gto_basis_set_type
    USE cell_types,                      ONLY: cell_type,&
                                               pbc
-   USE input_constants,                 ONLY: do_potential_short,&
-                                              do_potential_truncated
+   USE input_constants,                 ONLY: do_potential_short
    USE kinds,                           ONLY: dp,&
                                               int_8
    USE machine,                         ONLY: m_walltime
@@ -97,8 +96,7 @@ CONTAINS
       END IF
 
       ! Each rank stores a rectangular (l,l') block for every translation A.
-      first_l = (n_grid*bs_env%para_env%mepos)/bs_env%para_env%num_pe + 1
-      last_l = (n_grid*(bs_env%para_env%mepos + 1))/bs_env%para_env%num_pe
+      CALL get_local_l_range(n_grid, bs_env%para_env%num_pe, bs_env%para_env%mepos, first_l, last_l)
       ALLOCATE (D_llp_R(last_l - first_l + 1, n_grid, n_D_cells))
       CALL compute_D_llp(bs_env, grid_points, cells_R_D_llp, active_cells, first_l, last_l, D_llp_R)
       CALL mp_print_mem_per_rank(bs_env%para_env, bs_env%unit_nr, "After distribution of D_ll'^R:")
@@ -243,19 +241,12 @@ CONTAINS
       n_RI = bs_env%n_RI
       n_RI_solve = n_RI
       IF (PRESENT(charge_lq)) THEN
-         IF (bs_env%ri_metric%potential_type /= do_potential_truncated) THEN
-            IF (bs_env%ri_metric%potential_type /= do_potential_short) THEN
-               CPABORT('Unsupported RI metric')
-            END IF
+         IF (bs_env%ri_metric%potential_type /= do_potential_short) THEN
+            CPABORT('Unsupported RI metric')
          END IF
          n_RI_solve = n_RI + 1
       END IF
-      CPASSERT(SIZE(qpoints, 1) >= 3)
       n_q = SIZE(qpoints, 2)
-      IF (PRESENT(charge_lq)) THEN
-         CPASSERT(SIZE(charge_lq, 1) == n_grid)
-         CPASSERT(SIZE(charge_lq, 2) == n_q)
-      END IF
       ! q points are cyclic: rank MOD(q,P) for the SCF mesh, MOD(q-1,P) otherwise.
       iq = MODULO(bs_env%para_env%mepos - MERGE(1, 0, distributed), bs_env%para_env%num_pe) + 1
       n_q_local = n_q
@@ -271,8 +262,7 @@ CONTAINS
                 recvcounts(bs_env%para_env%num_pe), displs(bs_env%para_env%num_pe), &
                 d_lP_q(n_grid, n_RI_solve))
       DO i_rank = 0, bs_env%para_env%num_pe - 1
-         first_l_rank = (n_grid*i_rank)/bs_env%para_env%num_pe + 1
-         last_l_rank = (n_grid*(i_rank + 1))/bs_env%para_env%num_pe
+         CALL get_local_l_range(n_grid, bs_env%para_env%num_pe, i_rank, first_l_rank, last_l_rank)
          recvcounts(i_rank + 1) = (last_l_rank - first_l_rank + 1)*n_grid
          displs(i_rank + 1) = SUM(recvcounts(1:i_rank))
       END DO
@@ -337,11 +327,7 @@ CONTAINS
                                bs_env%hmat(2, 1)*bs_env%hmat(1, 2)])
             END IF
             CPASSERT(volume > 0.0_dp)
-            IF (bs_env%ri_metric%potential_type == do_potential_short) THEN
-               metric_head = pi/bs_env%ri_metric%omega**2
-            ELSE
-               metric_head = 2.0_dp*pi*bs_env%ri_metric%cutoff_radius**2
-            END IF
+            metric_head = pi/bs_env%ri_metric%omega**2
             d_lP_q(:, 1) = metric_head/SQRT(volume)*charge_lq(:, iq)
          END IF
 

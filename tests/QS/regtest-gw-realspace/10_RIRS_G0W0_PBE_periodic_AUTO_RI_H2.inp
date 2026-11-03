@@ -64,7 +64,7 @@
           RI_AO_RATIO 3
         &END AUTO_RI
         &RI_RS
-          TIKHONOV 1.0E-4
+          TIKHONOV 1.0E-8
           &GRID_OPTIMIZATION
             CUTOFF_ATOMIC_CLUSTER [angstrom] 2.5
             MAX_ITER 20

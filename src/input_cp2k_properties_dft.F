@@ -2545,7 +2545,8 @@ CONTAINS
       CALL keyword_create(keyword, __LOCATION__, name="REGULARIZATION_RI", &
                           description="Regularization applied to the GW RI fitting matrix "// &
                           "$M_{PQ}$. A negative value selects the context-dependent default: "// &
-                          "zero for molecules and 1.0E-2 for periodic systems.", &
+                          "zero for molecules, 1.0E-8 for periodic RI-RS GW and 1.0E-2 "// &
+                          "for other periodic systems.", &
                           usage="REGULARIZATION_RI 1.0E-4", &
                           default_r_val=-1.0_dp)
       CALL section_add_keyword(section, keyword)

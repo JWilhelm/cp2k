@@ -61,12 +61,12 @@
         EPS_FILTER 1.0E-4
         FREQ_MAX_FIT 27.211
         NUM_TIME_FREQ_POINTS 8
-        REGULARIZATION_RI 1.0E-10
+        REGULARIZATION_RI -1
         &AUTO_RI
           RI_AO_RATIO 3
         &END AUTO_RI
         &RI_RS
-          TIKHONOV 1.0E-4
+          TIKHONOV 1.0E-8
           &GRID_OPTIMIZATION
             CUTOFF_ATOMIC_CLUSTER [angstrom] 1.5
             MAX_ITER 5

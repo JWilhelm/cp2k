@@ -14,15 +14,14 @@ MODULE ri_rs_kp_integrals
    USE cell_types,                      ONLY: cell_type,&
                                               pbc
    USE ieee_arithmetic,                 ONLY: ieee_is_finite
-   USE input_constants,                 ONLY: do_potential_coulomb,&
-                                              do_potential_short,&
-                                              do_potential_truncated
+   USE input_constants,                 ONLY: do_potential_short
    USE kinds,                           ONLY: dp,&
                                               int_8
    USE machine,                         ONLY: m_walltime
    USE mathconstants,                   ONLY: pi,&
                                               twopi
-   USE mathlib,                         ONLY: diamat_all
+   USE mathlib,                         ONLY: diamat_all,&
+                                              gauss_legendre
    USE message_passing,                 ONLY: mp_comm_type,&
                                               mp_mem_avail_per_rank_GB
    USE omp_lib,                         ONLY: omp_get_max_threads,&
@@ -40,6 +39,15 @@ MODULE ri_rs_kp_integrals
    PRIVATE
 
    CHARACTER(len=*), PARAMETER, PRIVATE :: moduleN = 'ri_rs_kp_integrals'
+
+   ! Uniform d_lP integration grid: spacing prefactor calibrated on the AO exponents
+   ! (including the matched reference RI basis) and safety factor of the Gaussian padding.
+   REAL(dp), PARAMETER :: spacing_prefactor = 0.4_dp*SQRT(2.693604_dp*LOG(1.0E8_dp)), &
+                          padding_safety = 1.1_dp
+   ! Largest Gaussian phase error alpha*|delta r**2| accepted for a tabulated radial moment.
+   REAL(dp), PARAMETER :: eps_mesh_phase = 1.0E-8_dp
+   ! Tolerance for integer lattice-metric ratios that allow tabulated radial moments.
+   REAL(dp), PARAMETER :: eps_integer = 1.0E-10_dp
 
    PUBLIC :: compute_d_lP_R, &
              compute_d_lP_cutoffs, &
@@ -66,15 +74,14 @@ MODULE ri_rs_kp_integrals
    TYPE                                 :: ao_image_type
       TYPE(gto_basis_set_type), POINTER :: basis => NULL()
       REAL(dp)                          :: center(3) = 0.0_dp
-      REAL(dp)                          :: bound = 0.0_dp, decay = 0.0_dp, &
-                                           radius2 = HUGE(0.0_dp)
+      REAL(dp)                          :: bound = 0.0_dp, decay = 0.0_dp
       REAL(dp), ALLOCATABLE             :: primary(:, :)
       INTEGER, ALLOCATABLE              :: primary_l(:)
       REAL(dp), ALLOCATABLE             :: envelope_exponents(:), &
                                            radial_envelope(:, :)
    END TYPE ao_image_type
 
-   ! Per-atom interpolation tables for the existing Coulomb/erfc kernel.
+   ! Per-atom interpolation tables for the erfc kernel.
    TYPE                                 :: radial_interpolation_type
       REAL(dp), ALLOCATABLE             :: short_abscissae(:)
       REAL(dp), ALLOCATABLE             :: coefficients(:, :), &
@@ -95,8 +102,7 @@ MODULE ri_rs_kp_integrals
       REAL(dp)                          :: mesh_spacing = 0.0_dp, &
                                            mesh_offset = 0.0_dp, &
                                            mesh_exponent = 0.0_dp
-      REAL(dp)                          :: cutoff = 0.0_dp, &
-                                           attenuation = 0.0_dp
+      REAL(dp)                          :: attenuation = 0.0_dp
    END TYPE radial_interpolation_type
 
    TYPE                                 :: radial_work_type
@@ -121,10 +127,12 @@ CONTAINS
       REAL(dp), INTENT(IN)                               :: grid_points(:, :)
       INTEGER, INTENT(IN)                                :: cells_R_d_lP(:, :)
       REAL(dp), ALLOCATABLE, INTENT(OUT)                 :: d_lP_R(:, :, :)
-      REAL(dp), INTENT(IN), OPTIONAL                     :: qpoints(:, :)
-      COMPLEX(dp), ALLOCATABLE, INTENT(OUT), OPTIONAL    :: charge_lq(:, :)
+      REAL(dp), INTENT(IN)                               :: qpoints(:, :)
+      COMPLEX(dp), ALLOCATABLE, INTENT(OUT)              :: charge_lq(:, :)
 
-      INTEGER                                            :: first_l, handle, last_l, n_P
+      CHARACTER(LEN=*), PARAMETER                        :: routineN = 'compute_d_lP_R'
+
+      INTEGER                                            :: first_l, handle, last_l
       TYPE(uniform_settings_type)                        :: settings
 
       IF (bs_env%unit_nr > 0) THEN
@@ -132,21 +140,14 @@ CONTAINS
       END IF
       CALL get_local_l_range(bs_env%ri_rs%n_grid_points, bs_env%para_env%num_pe, &
                              bs_env%para_env%mepos, first_l, last_l)
-      n_P = bs_env%n_RI
-      IF (bs_env%auto_ri%enabled) n_P = SUM(bs_env%auto_ri%sizes_opt_RI)
-      ALLOCATE (d_lP_R(last_l - first_l + 1, n_P, SIZE(cells_R_d_lP, 2)))
+      ALLOCATE (d_lP_R(last_l - first_l + 1, bs_env%n_RI, SIZE(cells_R_d_lP, 2)))
 
       CALL timeset("d_lP_uniform_grid", handle)
 
       CALL prepare_d_lP_integration_grid(bs_env, grid_points, settings)
-      IF (PRESENT(charge_lq)) THEN
-         CPASSERT(PRESENT(qpoints))
-         ALLOCATE (charge_lq(bs_env%ri_rs%n_grid_points, SIZE(qpoints, 2)))
-         CALL integrate_d_lP_R(bs_env, grid_points, cells_R_d_lP, settings, d_lP_R, first_l, &
-                               qpoints, charge_lq)
-      ELSE
-         CALL integrate_d_lP_R(bs_env, grid_points, cells_R_d_lP, settings, d_lP_R, first_l)
-      END IF
+      ALLOCATE (charge_lq(bs_env%ri_rs%n_grid_points, SIZE(qpoints, 2)))
+      CALL integrate_d_lP_R(bs_env, grid_points, cells_R_d_lP, settings, d_lP_R, first_l, &
+                            qpoints, charge_lq)
 
       IF (.NOT. ALL(ieee_is_finite(d_lP_R))) CPABORT("Nonfinite DLP cell value")
 
@@ -157,7 +158,7 @@ CONTAINS
 ! **************************************************************************************************
 !> \brief Automatic l/P cutoff from the overlap of the diffuse AO-field square and RI potential.
 !>
-!> Outside a truncated Coulomb sphere, conservative Gaussian envelopes are
+!> Outside the metric cutoff sphere, conservative Gaussian envelopes are
 !> f_l(r)^2 ~ exp[-alpha_AO |r-r_l|^2] and
 !> v_PT(r) ~ exp[-alpha_RI (|r-R_PT|-r_c)^2/2]. Maximizing their product over r gives
 !> exp[-gamma (|r_l-R_PT|-r_c)^2], with 1/gamma=1/alpha_AO+2/alpha_RI.
@@ -178,11 +179,6 @@ CONTAINS
       accuracy = d_lP_integration_accuracy(bs_env)
       ALLOCATE (cutoffs(bs_env%n_atom))
       DO iatom = 1, bs_env%n_atom
-         IF (bs_env%ri_metric%potential_type == do_potential_coulomb) THEN
-            cutoffs(iatom) = 2.0_dp*MAXVAL(bs_env%ri_rs%radius_ao_per_atom) + &
-                             bs_env%ri_rs%radius_ri_per_atom(iatom)
-            CYCLE
-         END IF
          ikind = particles(iatom)%atomic_kind%kind_number
          basis => bs_env%basis_set_AO(ikind)%gto_basis_set
          CALL basis_exponent_range(basis, ao_min, ao_max)
@@ -302,14 +298,12 @@ CONTAINS
       REAL(dp)                                   :: available_GB, cell_bytes, required_bytes, cyclic_bytes, workspace_bytes
 
       np = bs_env%n_RI
-      IF (bs_env%auto_ri%enabled) np = SUM(bs_env%auto_ri%sizes_opt_RI)
       CALL mp_mem_avail_per_rank_GB(comm, available_GB)
       result_bytes = 8.0_dp*REAL(nresult, dp)
       CALL comm%max(result_bytes)
       cell_bytes = 8.0_dp*REAL(nl, dp)*REAL(np, dp)
       cyclic_bytes = cell_bytes*REAL((nt + comm%num_pe - 1)/comm%num_pe, dp)
       maxnp = MAXVAL(bs_env%i_RI_end_from_atom - bs_env%i_RI_start_from_atom + 1)
-      IF (bs_env%auto_ri%enabled) maxnp = MAXVAL(bs_env%auto_ri%sizes_opt_RI)
       contraction_bytes = 8.0_dp*(REAL(nl, dp)*REAL(maxnp + 512, dp) + 512.0_dp*REAL(maxnp, dp))
       workspace_bytes = 96.0_dp*1024.0_dp**2 + 40.0_dp*REAL(nl + 3, dp)*512.0_dp + &
                         MAX(128.0_dp*1024.0_dp**2, contraction_bytes)
@@ -427,7 +421,7 @@ CONTAINS
       INTEGER, INTENT(IN)             :: first_l
       REAL(dp), INTENT(OUT)           :: d_lP_R(:, :, :)
 
-      INTEGER                         :: il, ip, irank, it, local_it, nl, np, nlocal_l, nlocal_T, nranks, nt, position
+      INTEGER                         :: il, ip, irank, it, local_it, np, nlocal_l, nlocal_T, nranks, position
       INTEGER(int_8)                  :: count_wide
       INTEGER, ALLOCATABLE            :: first_rows(:), row_counts(:), cell_counts(:), send_counts(:), send_offsets(:), &
                                          recv_counts(:), recv_offsets(:)
@@ -439,19 +433,14 @@ CONTAINS
       CALL timeset(routineN, handle)
 
       nranks = comm%num_pe
-      nl = SIZE(cell_values, 1)
       np = SIZE(d_lP_R, 2)
       nlocal_l = SIZE(d_lP_R, 1)
-      nt = SIZE(d_lP_R, 3)
       nlocal_T = SIZE(cell_values, 3)
-      CPASSERT(SIZE(cell_values, 2) == np)
       ALLOCATE (first_rows(nranks), row_counts(nranks), cell_counts(nranks), &
                 send_counts(nranks), send_offsets(nranks), recv_counts(nranks), recv_offsets(nranks))
       CALL comm%allgather(first_l, first_rows)
       CALL comm%allgather(nlocal_l, row_counts)
       CALL comm%allgather(nlocal_T, cell_counts)
-      CPASSERT(SUM(cell_counts) == nt)
-      CPASSERT(SUM(row_counts) == nl)
       DO irank = 1, nranks
          count_wide = INT(np, int_8)*INT(row_counts(irank), int_8)*INT(nlocal_T, int_8)
          CPASSERT(count_wide <= HUGE(0))
@@ -484,7 +473,6 @@ CONTAINS
                END DO
             END DO
          END DO
-         CPASSERT(position == send_offsets(irank) + send_counts(irank))
       END DO
       CALL comm%alltoall(send_values, send_counts, send_offsets, &
                          receive_values, recv_counts, recv_offsets)
@@ -492,7 +480,6 @@ CONTAINS
          position = recv_offsets(irank)
          DO local_it = 1, cell_counts(irank)
             it = irank + (local_it - 1)*nranks
-            CPASSERT(it <= nt)
             DO ip = 1, np
                DO il = 1, nlocal_l
                   position = position + 1
@@ -500,7 +487,6 @@ CONTAINS
                END DO
             END DO
          END DO
-         CPASSERT(position == recv_offsets(irank) + recv_counts(irank))
       END DO
 
       CALL timestop(handle)
@@ -533,9 +519,6 @@ CONTAINS
       ng = SIZE(points, 2)
       nl = SIZE(field, 2)
       nq = SIZE(q_cart, 2)
-      CPASSERT(SIZE(points, 1) == 3 .AND. SIZE(q_cart, 1) == 3)
-      CPASSERT(SIZE(field, 1) >= ng)
-      CPASSERT(SIZE(charge_lq, 1) == nl .AND. SIZE(charge_lq, 2) == nq)
       IF (ng == 0 .OR. nl == 0 .OR. nq == 0) RETURN
       ALLOCATE (phase_parts(ng, 2*nq))
       DO iq = 1, nq
@@ -574,27 +557,22 @@ CONTAINS
 !> \param bs_env ...
 !> \param grid_points ...
 !> \param settings ...
-!> \param report ...
 ! **************************************************************************************************
-   SUBROUTINE prepare_d_lP_integration_grid(bs_env, grid_points, settings, report)
+   SUBROUTINE prepare_d_lP_integration_grid(bs_env, grid_points, settings)
       TYPE(post_scf_bandstructure_type), POINTER         :: bs_env
       REAL(dp), INTENT(IN)                               :: grid_points(:, :)
       TYPE(uniform_settings_type), INTENT(OUT)           :: settings
-      LOGICAL, INTENT(IN), OPTIONAL                      :: report
-
-      REAL(dp), PARAMETER :: padding_safety = 1.1_dp, &
-         spacing_prefactor = 0.4_dp*SQRT(2.693604_dp*LOG(1.0E8_dp))
 
       INTEGER(int_8)                                     :: npoints
-      LOGICAL                                            :: report_settings
       REAL(dp)                                           :: exponent_max, exponent_min
 
       settings%accuracy = d_lP_integration_accuracy(bs_env)
-      IF (bs_env%ri_metric%potential_type /= do_potential_coulomb .AND. &
-          bs_env%ri_metric%potential_type /= do_potential_truncated .AND. &
-          bs_env%ri_metric%potential_type /= do_potential_short) THEN
-         CPABORT('Uniform DLP requires a Coulomb, truncated or short-range RI metric')
+      ! The full-k RI-RS path always uses the erfc(omega r)/r RI metric with omega > 0.
+      IF (bs_env%ri_metric%potential_type /= do_potential_short .OR. &
+          .NOT. (bs_env%ri_metric%omega > 0.0_dp)) THEN
+         CPABORT('Uniform DLP requires the short-range erfc RI metric with positive omega')
       END IF
+      IF (ALL(bs_env%ri_rs%cell%perd == 0)) CPABORT('Uniform DLP requires a periodic cell')
       CALL ao_exponent_range(bs_env, exponent_min, exponent_max)
       settings%l_block_edge = 1.0_dp/angstrom
       settings%spacing = spacing_prefactor/ &
@@ -602,9 +580,7 @@ CONTAINS
       settings%padding = padding_safety*SQRT(LOG(1.0_dp/settings%accuracy)/exponent_min)
       CALL build_d_lP_integration_grid(bs_env, grid_points, settings)
       npoints = PRODUCT(INT(settings%counts, int_8))
-      report_settings = .TRUE.
-      IF (PRESENT(report)) report_settings = report
-      IF (bs_env%unit_nr > 0 .AND. report_settings) THEN
+      IF (bs_env%unit_nr > 0) THEN
          WRITE (bs_env%unit_nr, '(T2,A,T72,ES9.1E2)') 'd_lP uniform quadrature points', REAL(npoints, dp)
          WRITE (bs_env%unit_nr, '(T2,A,T72,ES9.1)') 'd_lP integration threshold', settings%accuracy
          WRITE (bs_env%unit_nr, '(T2,A,T69,F12.3)') 'd_lP largest AO exponent [bohr^-2]', exponent_max
@@ -632,43 +608,22 @@ CONTAINS
       TYPE(cell_type), POINTER                           :: cell
       TYPE(particle_type), POINTER                       :: particles(:)
 
-      CPASSERT(SIZE(grid_points, 1) == 3 .AND. SIZE(grid_points, 2) > 0)
-      CPASSERT(settings%spacing > 0.0_dp)
       cell => bs_env%ri_rs%cell
       particles => bs_env%ri_rs%particle_set
-      settings%origin = 0.0_dp
-      settings%step = 0.0_dp
-      inverse_step = 0.0_dp
-      settings%weight = settings%spacing**3
+      settings%origin = pbc(particles(1)%r, cell)
       DO idir = 1, 3
-         settings%step(idir, idir) = settings%spacing
-         inverse_step(idir, idir) = 1.0_dp/settings%spacing
+         subdivisions(idir) = MAX(1, CEILING(NORM2(cell%hmat(:, idir))/settings%spacing))
+         settings%step(:, idir) = cell%hmat(:, idir)/REAL(subdivisions(idir), dp)
       END DO
-      IF (ANY(cell%perd /= 0)) THEN
-         CPASSERT(ASSOCIATED(particles))
-         CPASSERT(SIZE(particles) > 0 .AND. ABS(cell%deth) > TINY(1.0_dp))
-         settings%origin = pbc(particles(1)%r, cell)
-         DO idir = 1, 3
-            subdivisions(idir) = MAX(1, CEILING(NORM2(cell%hmat(:, idir))/settings%spacing))
-            settings%step(:, idir) = cell%hmat(:, idir)/REAL(subdivisions(idir), dp)
-         END DO
-         metric = MATMUL(TRANSPOSE(settings%step), settings%step)
-         CALL diamat_all(metric, eigenvalues, dac=.TRUE.)
-         scale = MAX(1.0_dp, SQRT(MAXVAL(eigenvalues))/settings%spacing)
-         subdivisions = CEILING(scale*REAL(subdivisions, dp))
-         DO idir = 1, 3
-            settings%step(:, idir) = cell%hmat(:, idir)/REAL(subdivisions(idir), dp)
-            inverse_step(idir, :) = REAL(subdivisions(idir), dp)*cell%h_inv(idir, :)
-         END DO
-         settings%weight = ABS(cell%deth)/PRODUCT(REAL(subdivisions, dp))
-      ELSE
-         settings%lower = REAL(CEILING((MINVAL(grid_points, DIM=2) - settings%padding)/ &
-                                       settings%spacing), dp)
-         upper = REAL(FLOOR((MAXVAL(grid_points, DIM=2) + settings%padding)/settings%spacing), dp)
-         settings%counts = INT(upper - settings%lower) + 1
-         CPASSERT(ALL(settings%counts > 0))
-         RETURN
-      END IF
+      metric = MATMUL(TRANSPOSE(settings%step), settings%step)
+      CALL diamat_all(metric, eigenvalues, dac=.TRUE.)
+      scale = MAX(1.0_dp, SQRT(MAXVAL(eigenvalues))/settings%spacing)
+      subdivisions = CEILING(scale*REAL(subdivisions, dp))
+      DO idir = 1, 3
+         settings%step(:, idir) = cell%hmat(:, idir)/REAL(subdivisions(idir), dp)
+         inverse_step(idir, :) = REAL(subdivisions(idir), dp)*cell%h_inv(idir, :)
+      END DO
+      settings%weight = ABS(cell%deth)/PRODUCT(REAL(subdivisions, dp))
       box_center = 0.5_dp*(MINVAL(grid_points, DIM=2) + MAXVAL(grid_points, DIM=2)) - settings%origin
       box_extent = 0.5_dp*(MAXVAL(grid_points, DIM=2) - MINVAL(grid_points, DIM=2)) + settings%padding
       settings%lower = REAL(CEILING(MATMUL(inverse_step, box_center) - &
@@ -695,7 +650,6 @@ CONTAINS
                                                             next(:)
       REAL(dp)                                           :: origin(3)
 
-      CPASSERT(edge > 0.0_dp)
       origin = MINVAL(grid_points, DIM=2)
       ALLOCATE (block_of_l(SIZE(grid_points, 2)), cubes(3, SIZE(grid_points, 2)))
       blocks%nblocks = 0
@@ -831,10 +785,9 @@ CONTAINS
 !> at epsilon=1e-8. The padding is 1.1 sqrt[log(1/epsilon)/alpha_min].
 !> Periodic cells use r_0 at atom 1 and S=H diag(1/N_i), with integer N_i and ||S||_2<=h.
 !> Translation and cell wrapping then only shift the quadrature lattice or relabel its points.
-!> Nonperiodic systems retain r_0=0 and S=h I. Finite-box and screening errors still converge.
 !> (4) Spatial blocks of r_l are screened separately for every P-atom/T pair immediately before
 !> contraction. A triangle-inequality product bound controls discarded discrete terms, not
-!> quadrature error. For a truncated kernel, it decays outside the Coulomb cutoff.
+!> quadrature error.
 !> The usual l/P/T cutoff removes individual l rows before contraction.
 !> Eq. (1) retains all AO pairs in the explicit cell domain; cell-domain and screening errors
 !> must be converged together with the numerical quadrature.
@@ -862,35 +815,32 @@ CONTAINS
       TYPE(uniform_settings_type), INTENT(IN)            :: settings
       REAL(dp), INTENT(OUT)                              :: d_lP_R(:, :, :)
       INTEGER, INTENT(IN)                                :: first_l
-      REAL(dp), INTENT(IN), OPTIONAL                     :: qpoints(:, :)
-      COMPLEX(dp), INTENT(OUT), OPTIONAL                 :: charge_lq(:, :)
+      REAL(dp), INTENT(IN)                               :: qpoints(:, :)
+      COMPLEX(dp), INTENT(OUT)                           :: charge_lq(:, :)
 
       INTEGER, PARAMETER :: quadrature_block_edge = 8, &
          quadrature_block_size = quadrature_block_edge**3
 
       INTEGER :: counts(3), handle, iatom, ibatch, iblock, idir, ig, igroup, il, &
-         indices(quadrature_block_size), integration_rank, irank, it, last_rank, next_progress, &
-         ngroups, nkeep, nl, np, npoints, nranks, nreceived, position, quadrature_block_counts(3), &
+         indices(quadrature_block_size), irank, it, last_rank, next_progress, ngroups, nkeep, nl, &
+         np, npoints, nranks, nreceived, position, quadrature_block_counts(3), &
          quadrature_block_first(3), quadrature_block_points(3), rank, ranks_per_batch
-      INTEGER(int_8) :: block_contractions, coalesced_contractions, contraction_products, &
-         index_grid, iquadrature_block, iround, n_completed_quadrature_blocks, &
-         n_local_quadrature_blocks, nquadrature_blocks, nrounds, ntotal, potential_points, &
-         screened_blocks
+      INTEGER(int_8) :: contraction_products, index_grid, iquadrature_block, iround, &
+         n_completed_quadrature_blocks, n_local_quadrature_blocks, nquadrature_blocks, nrounds, &
+         ntotal, potential_points
       INTEGER, ALLOCATABLE                               :: kept_per_rank(:), local_cells(:, :), &
                                                             recv_counts(:), recv_offsets(:)
       LOGICAL, ALLOCATABLE                               :: include_l_blocks_P_R(:, :, :), &
                                                             include_lP_R(:, :, :)
-      REAL(dp) :: bound, discarded, elapsed, field_bound(quadrature_block_size), lower(3), &
-         mesh_index(3), omitted, points(3, quadrature_block_size), prep_start, RI_center_R(3), &
-         threshold, weight
+      REAL(dp) :: bound, elapsed, field_bound(quadrature_block_size), lower(3), mesh_index(3), &
+         points(3, quadrature_block_size), prep_start, RI_center_R(3), threshold, weight
       REAL(dp), ALLOCATABLE :: cutoffs_lP(:), cyclic_d_lP_R(:, :, :), envelopes(:, :), &
-         local_d_lP_R(:, :, :), q_cart(:, :), receive_fields(:), send_fields(:)
+         field(:, :), local_d_lP_R(:, :, :), q_cart(:, :), receive_fields(:), send_fields(:)
       TYPE(ao_image_type), ALLOCATABLE                   :: images(:)
       TYPE(cell_type), POINTER                           :: cell
       TYPE(l_block_partition_type)                       :: blocks
       TYPE(mp_comm_type)                                 :: field_comm, integration_comm
       TYPE(particle_type), POINTER                       :: particles(:)
-      REAL(dp) :: field(quadrature_block_size, bs_env%ri_rs%n_grid_points)
       TYPE(radial_interpolation_type), ALLOCATABLE       :: aux_potentials(:)
 
       IF (bs_env%unit_nr > 0) THEN
@@ -904,18 +854,11 @@ CONTAINS
          WRITE (bs_env%unit_nr, '(T2,A)') 'd_lP_sum_g_f2_v: Contract potential with squared AO fields'
       END IF
       nl = bs_env%ri_rs%n_grid_points
-      IF (PRESENT(qpoints) .NEQV. PRESENT(charge_lq)) THEN
-         CPABORT('Request DLP q points and Fourier charges together')
-      END IF
-      IF (PRESENT(qpoints)) THEN
-         CPASSERT(SIZE(qpoints, 1) == 3)
-         CPASSERT(SIZE(charge_lq, 1) == nl)
-         CPASSERT(SIZE(charge_lq, 2) == SIZE(qpoints, 2))
-         cell => bs_env%ri_rs%cell
-         ALLOCATE (q_cart(3, SIZE(qpoints, 2)))
-         q_cart(:, :) = MATMUL(twopi*TRANSPOSE(cell%h_inv), qpoints)
-         charge_lq = CMPLX(0.0_dp, 0.0_dp, dp)
-      END IF
+      cell => bs_env%ri_rs%cell
+      particles => bs_env%ri_rs%particle_set
+      ALLOCATE (field(quadrature_block_size, nl), q_cart(3, SIZE(qpoints, 2)))
+      q_cart(:, :) = MATMUL(twopi*TRANSPOSE(cell%h_inv), qpoints)
+      charge_lq = CMPLX(0.0_dp, 0.0_dp, dp)
       elapsed = m_walltime()
       prep_start = elapsed
       IF (bs_env%unit_nr > 0) THEN
@@ -928,7 +871,7 @@ CONTAINS
             'd_lP AO image values, rank 0 time:', m_walltime() - prep_start, ' s'
          FLUSH (bs_env%unit_nr)
       END IF
-      CALL prepare_auto_ri_potentials(bs_env, settings, aux_potentials)
+      CALL prepare_aux_potentials(bs_env, settings, aux_potentials)
       CALL auxiliary_potential_bound(bs_env, aux_potentials, envelopes)
       CALL group_points_l_by_position(grid_points, settings%l_block_edge, blocks)
       bound = MAXVAL(envelopes(1, :))
@@ -936,18 +879,14 @@ CONTAINS
       CALL prepare_d_lP_mpi_groups(bs_env%para_env, nl, bs_env, SIZE(cells_R_d_lP, 2), SIZE(d_lP_R, KIND=int_8), &
                                    integration_comm, field_comm, ngroups)
       igroup = field_comm%mepos
-      integration_rank = integration_comm%mepos
       nranks = field_comm%num_pe
       rank = field_comm%mepos
       np = bs_env%n_RI
-      IF (bs_env%auto_ri%enabled) np = SUM(bs_env%auto_ri%sizes_opt_RI)
       ALLOCATE (local_cells(3, SIZE(cells_R_d_lP(:, igroup + 1::ngroups), 2)))
       local_cells(:, :) = cells_R_d_lP(:, igroup + 1::ngroups)
 
       CALL timeset('d_lP_prepare_RI_geometry', handle)
 
-      cell => bs_env%ri_rs%cell
-      particles => bs_env%ri_rs%particle_set
       CALL compute_d_lP_cutoffs(bs_env, cutoffs_lP)
       ALLOCATE (include_lP_R(nl, bs_env%n_atom, SIZE(local_cells, 2)))
       ALLOCATE (include_l_blocks_P_R(blocks%nblocks, bs_env%n_atom, SIZE(local_cells, 2)), source=.FALSE.)
@@ -980,12 +919,8 @@ CONTAINS
       ranks_per_batch = MIN(nranks, ranks_per_batch)
       ALLOCATE (send_fields((nl + 3)*quadrature_block_size), &
                 receive_fields((nl + 3)*quadrature_block_size*ranks_per_batch))
-      omitted = 0.0_dp
-      block_contractions = 0_int_8
-      coalesced_contractions = 0_int_8
       contraction_products = 0_int_8
       potential_points = 0_int_8
-      screened_blocks = 0_int_8
       weight = settings%weight
       lower = settings%lower
       counts = settings%counts
@@ -997,8 +932,6 @@ CONTAINS
       next_progress = 1
       n_local_quadrature_blocks = nrounds
       threshold = 0.5_dp*settings%accuracy/(REAL(ntotal, dp)*weight)
-      CALL screen_ao_images(images, settings%accuracy/ &
-                            (8.0_dp*weight*REAL(ntotal, dp)*MAX(1.0_dp, bound)))
       DO iround = 0_int_8, nrounds - 1_int_8
          iquadrature_block = iround*INT(bs_env%para_env%num_pe, int_8) + &
                              INT(bs_env%para_env%mepos, int_8)
@@ -1025,11 +958,9 @@ CONTAINS
             CALL evaluate_rho_l_squared(images, points(:, 1:npoints), field(1:npoints, :), &
                                         settings%accuracy/(8.0_dp*weight*REAL(ntotal, dp)*MAX(1.0_dp, bound)))
             CALL timestop(handle)
-            IF (PRESENT(charge_lq)) THEN
-               CALL timeset('d_lP_charge_fourier', handle)
-               CALL accumulate_fourier_charge(points(:, 1:npoints), field, q_cart, weight, charge_lq)
-               CALL timestop(handle)
-            END IF
+            CALL timeset('d_lP_charge_fourier', handle)
+            CALL accumulate_fourier_charge(points(:, 1:npoints), field, q_cart, weight, charge_lq)
+            CALL timestop(handle)
             CALL timeset('d_lP_screen_pack_fields', handle)
             nkeep = 0
             field_bound(1:npoints) = 0.0_dp
@@ -1040,12 +971,9 @@ CONTAINS
                END DO
             END DO
             DO ig = 1, npoints
-               discarded = field_bound(ig)
-               IF (discarded*bound > threshold) THEN
+               IF (field_bound(ig)*bound > threshold) THEN
                   nkeep = nkeep + 1
                   indices(nkeep) = ig
-               ELSE
-                  omitted = omitted + weight*bound*discarded
                END IF
             END DO
             DO ig = 1, nkeep
@@ -1089,10 +1017,9 @@ CONTAINS
                END DO
                CALL timestop(handle)
                CALL timeset('d_lP_integrate_quadrature_blocks', handle)
-               CALL integrate_potentials(bs_env, grid_points, local_cells, include_lP_R, include_l_blocks_P_R, &
+               CALL integrate_potentials(bs_env, local_cells, include_lP_R, include_l_blocks_P_R, &
                                          points(:, 1:nkeep), field(1:nkeep, :), &
-                                         weight, envelopes, blocks, threshold, omitted, potential_points, &
-                                         block_contractions, screened_blocks, coalesced_contractions, &
+                                         weight, envelopes, blocks, threshold, potential_points, &
                                          contraction_products, local_d_lP_R, aux_potentials)
                CALL timestop(handle)
             END DO
@@ -1104,7 +1031,7 @@ CONTAINS
 
       CALL timeset('d_lP_uniform_reduce', handle)
 
-      DEALLOCATE (send_fields, receive_fields, kept_per_rank, recv_counts, recv_offsets)
+      DEALLOCATE (field, send_fields, receive_fields, kept_per_rank, recv_counts, recv_offsets)
       CALL apply_d_lP_distance_cutoff(bs_env, grid_points, local_cells, local_d_lP_R)
       CALL sum_d_lP_R_over_mpi_ranks(integration_comm, local_d_lP_R, cyclic_d_lP_R)
       DEALLOCATE (local_d_lP_R, local_cells)
@@ -1112,12 +1039,8 @@ CONTAINS
       DEALLOCATE (cyclic_d_lP_R)
       CALL integration_comm%free()
       CALL field_comm%free()
-      IF (PRESENT(charge_lq)) CALL bs_env%para_env%sum(charge_lq)
-      CALL bs_env%para_env%sum(omitted)
+      CALL bs_env%para_env%sum(charge_lq)
       CALL bs_env%para_env%sum(potential_points)
-      CALL bs_env%para_env%sum(block_contractions)
-      CALL bs_env%para_env%sum(screened_blocks)
-      CALL bs_env%para_env%sum(coalesced_contractions)
       CALL bs_env%para_env%sum(contraction_products)
 
       CALL timestop(handle)
@@ -1142,30 +1065,29 @@ CONTAINS
 
 ! **************************************************************************************************
 !> \brief Form each atom-local auxiliary potential's spherical coefficients just once.
+!> Without AUTO_RI, the contraction U_Pp is the identity.
 !> \param bs_env ...
 !> \param settings ...
 !> \param aux_potentials ...
 ! **************************************************************************************************
-   SUBROUTINE prepare_auto_ri_potentials(bs_env, settings, aux_potentials)
+   SUBROUTINE prepare_aux_potentials(bs_env, settings, aux_potentials)
       TYPE(post_scf_bandstructure_type), POINTER         :: bs_env
       TYPE(uniform_settings_type), INTENT(IN)            :: settings
       TYPE(radial_interpolation_type), ALLOCATABLE, &
          INTENT(OUT)                                     :: aux_potentials(:)
 
       CHARACTER(LEN=12)                                  :: spacing_text
-      INTEGER                                            :: first_U, iatom, ikind, nmesh, np, nref
-      REAL(dp)                                           :: cutoff, mesh_bytes, &
-                                                            mesh_displacement(3), mesh_spacing
+      INTEGER                                            :: first_U, iatom, ikind, ip, nmesh, np, &
+                                                            nref
+      REAL(dp)                                           :: mesh_bytes, mesh_displacement(3), &
+                                                            mesh_spacing
       REAL(dp), ALLOCATABLE                              :: U_Pp(:, :)
       TYPE(cell_type), POINTER                           :: cell
       TYPE(gto_basis_set_type), POINTER                  :: basis
       TYPE(particle_type), POINTER                       :: particles(:)
 
-      IF (.NOT. bs_env%auto_ri%enabled) RETURN
       particles => bs_env%ri_rs%particle_set
       cell => bs_env%ri_rs%cell
-      cutoff = 0.0_dp
-      IF (bs_env%ri_metric%potential_type == do_potential_truncated) cutoff = bs_env%ri_metric%cutoff_radius
       ALLOCATE (aux_potentials(bs_env%n_atom))
       nmesh = 0
       mesh_bytes = 0.0_dp
@@ -1173,13 +1095,20 @@ CONTAINS
       DO iatom = 1, bs_env%n_atom
          ikind = particles(iatom)%atomic_kind%kind_number
          basis => bs_env%basis_set_RI(ikind)%gto_basis_set
-         nref = bs_env%auto_ri%sizes_ref_RI(iatom)
-         np = bs_env%auto_ri%sizes_opt_RI(iatom)
-         first_U = bs_env%auto_ri%U_Pp_atom_offset(iatom)
-         ALLOCATE (U_Pp(nref, np))
-         U_Pp(:, :) = RESHAPE(bs_env%auto_ri%U_Pp_atom(first_U:first_U + nref*np - 1), [nref, np])
+         IF (bs_env%auto_ri%enabled) THEN
+            nref = bs_env%auto_ri%sizes_ref_RI(iatom)
+            np = bs_env%auto_ri%sizes_opt_RI(iatom)
+            first_U = bs_env%auto_ri%U_Pp_atom_offset(iatom)
+            ALLOCATE (U_Pp(nref, np))
+            U_Pp(:, :) = RESHAPE(bs_env%auto_ri%U_Pp_atom(first_U:first_U + nref*np - 1), [nref, np])
+         ELSE
+            ALLOCATE (U_Pp(basis%nsgf, basis%nsgf), source=0.0_dp)
+            DO ip = 1, basis%nsgf
+               U_Pp(ip, ip) = 1.0_dp
+            END DO
+         END IF
          mesh_displacement = settings%origin - pbc(particles(iatom)%r, cell)
-         CALL prepare_contracted_potential(basis, U_Pp, aux_potentials(iatom), cutoff, &
+         CALL prepare_contracted_potential(basis, U_Pp, aux_potentials(iatom), &
                                            MAX(0.0_dp, bs_env%ri_metric%omega), &
                                            radial_table_bytes=256.0_dp*1024.0_dp**2/REAL(MAX(1, bs_env%n_atom), dp), &
                                            mesh_step=settings%step, &
@@ -1201,7 +1130,7 @@ CONTAINS
          END IF
       END IF
 
-   END SUBROUTINE prepare_auto_ri_potentials
+   END SUBROUTINE prepare_aux_potentials
 
 ! **************************************************************************************************
 !> \brief Store nonzero atom-image coefficients ϕ_mu,R(r_l) in Eq. (1) once.
@@ -1263,8 +1192,6 @@ CONTAINS
       LOGICAL, ALLOCATABLE                               :: nonzero(:)
       REAL(dp), ALLOCATABLE                              :: primary(:, :)
 
-      CPASSERT(ALLOCATED(image%primary))
-      CPASSERT(.NOT. ALLOCATED(image%primary_l))
       nl = SIZE(image%primary, 1)
       ALLOCATE (nonzero(nl))
       DO il = 1, nl
@@ -1348,10 +1275,7 @@ CONTAINS
       REAL(dp), ALLOCATABLE                              :: ao_weight(:)
       TYPE(gto_basis_set_type), POINTER                  :: basis
 
-      CPASSERT(ASSOCIATED(image%basis))
-      CPASSERT(ALLOCATED(image%primary))
       basis => image%basis
-      IF (ALLOCATED(image%envelope_exponents)) DEALLOCATE (image%envelope_exponents, image%radial_envelope)
       ALLOCATE (image%envelope_exponents(SUM(basis%npgf(:basis%nset))), &
                 image%radial_envelope(0:MAXVAL(basis%lmax(:basis%nset)), SUM(basis%npgf(:basis%nset))), &
                 ao_weight(SIZE(image%primary, 2)))
@@ -1408,10 +1332,6 @@ CONTAINS
       REAL(dp)                                           :: exponent, polynomial, radius, &
                                                             radius_squared
 
-      IF (.NOT. ALLOCATED(image%radial_envelope)) THEN
-         bound = image%bound*EXP(-image%decay*distance_squared)
-         RETURN
-      END IF
       bound = 0.0_dp
       lmax = UBOUND(image%radial_envelope, 1)
       radius = SQRT(distance_squared)
@@ -1434,40 +1354,6 @@ CONTAINS
    END FUNCTION bound_ao_image_distance
 
 ! **************************************************************************************************
-!> \brief Bound the omitted squared field in Eq. (2) by tolerance at every point.
-!> With A=sum_i B_i and delta<=min(1,tolerance/(2A+1)), 2A delta+delta^2<=tolerance.
-!> Each omitted image contributes at most delta/N; box distances bound every point in a integration-point block.
-!> \param images ...
-!> \param tolerance ...
-! **************************************************************************************************
-   SUBROUTINE screen_ao_images(images, tolerance)
-      TYPE(ao_image_type), INTENT(INOUT)                 :: images(:)
-      REAL(dp), INTENT(IN)                               :: tolerance
-
-      INTEGER                                            :: iimage, nimages
-      REAL(dp)                                           :: amplitude, delta
-
-      nimages = 0
-      amplitude = 0.0_dp
-      DO iimage = 1, SIZE(images)
-         IF (.NOT. ALLOCATED(images(iimage)%primary)) EXIT
-         nimages = nimages + 1
-         amplitude = amplitude + images(iimage)%bound
-      END DO
-      IF (nimages == 0) RETURN
-      delta = MIN(1.0_dp, tolerance/(2.0_dp*amplitude + 1.0_dp))/REAL(nimages, dp)
-      IF (delta <= TINY(0.0_dp)) RETURN
-      DO iimage = 1, nimages
-         IF (images(iimage)%bound <= delta) THEN
-            images(iimage)%radius2 = -1.0_dp
-         ELSE
-            images(iimage)%radius2 = (LOG(images(iimage)%bound) - LOG(delta))/images(iimage)%decay
-         END IF
-      END DO
-
-   END SUBROUTINE screen_ao_images
-
-! **************************************************************************************************
 !> \brief Evaluate the complete squared AO field in Eq. (2) on one Cartesian integration-point block.
 !> \param images ...
 !> \param points ...
@@ -1478,22 +1364,19 @@ CONTAINS
       TYPE(ao_image_type), INTENT(IN)                    :: images(:)
       REAL(dp), INTENT(IN)                               :: points(:, :)
       REAL(dp), INTENT(OUT)                              :: field_squared(:, :)
-      REAL(dp), INTENT(IN), OPTIONAL                     :: field_accuracy
+      REAL(dp), INTENT(IN)                               :: field_accuracy
 
       INTEGER                                            :: first, last, nblock, ng, nthreads
-      REAL(dp)                                           :: tolerance
 
-      tolerance = 0.0_dp
-      IF (PRESENT(field_accuracy)) tolerance = field_accuracy
       ng = SIZE(points, 2)
       nthreads = 1
 !$    nthreads = omp_get_max_threads()
       nblock = MAX(1, (ng + nthreads - 1)/nthreads)
       !$OMP PARALLEL DO DEFAULT(NONE) SCHEDULE(STATIC) &
-      !$OMP SHARED(images, points, field_squared, ng, nblock, tolerance) PRIVATE(first, last)
+      !$OMP SHARED(images, points, field_squared, ng, nblock, field_accuracy) PRIVATE(first, last)
       DO first = 1, ng, nblock
          last = MIN(ng, first + nblock - 1)
-         CALL evaluate_rho_l_squared_block(images, points(:, first:last), field_squared(first:last, :), tolerance)
+         CALL evaluate_rho_l_squared_block(images, points(:, first:last), field_squared(first:last, :), field_accuracy)
       END DO
       !$OMP END PARALLEL DO
 
@@ -1503,28 +1386,26 @@ CONTAINS
 !> \brief Evaluate Eq. (1), then square, with a integration-point block-local bound on the squared-field error.
 !> For image bounds b_i and A=sum_i b_i, omit at most delta=sqrt(A²+epsilon)-A in amplitude;
 !> then 2A*delta+delta²<=epsilon. Whole integration-point blocks with A²<=epsilon need no AO evaluation.
-!> The legacy radius bound applies when no positive squared-field accuracy is supplied.
+!> A nonpositive accuracy evaluates every image without screening.
 !> \param images ...
 !> \param points ...
 !> \param field_squared ...
-!> \param field_accuracy ...
+!> \param tolerance ...
 ! **************************************************************************************************
-   SUBROUTINE evaluate_rho_l_squared_block(images, points, field_squared, field_accuracy)
+   SUBROUTINE evaluate_rho_l_squared_block(images, points, field_squared, tolerance)
       TYPE(ao_image_type), INTENT(IN)                    :: images(:)
       REAL(dp), INTENT(IN)                               :: points(:, :)
       REAL(dp), INTENT(OUT)                              :: field_squared(:, :)
-      REAL(dp), INTENT(IN), OPTIONAL                     :: field_accuracy
+      REAL(dp), INTENT(IN)                               :: tolerance
 
       INTEGER                                            :: handle, iimage, il, nao, ng, nimages, &
                                                             nl, nprimary
       REAL(dp)                                           :: amplitude, delta, lower(3), &
-                                                            root_tolerance, tolerance, upper(3)
+                                                            root_tolerance, upper(3)
       REAL(dp), ALLOCATABLE                              :: field(:, :), image_field(:, :), &
                                                             values(:, :)
       REAL(dp)                                           :: image_bounds(SIZE(images))
 
-      tolerance = 0.0_dp
-      IF (PRESENT(field_accuracy)) tolerance = field_accuracy
       ng = SIZE(points, 2)
       nl = SIZE(field_squared, 2)
       ALLOCATE (field(ng, nl))
@@ -1557,8 +1438,6 @@ CONTAINS
             IF (image_bounds(iimage) <= delta) CYCLE
             IF (bound_ao_image_distance(images(iimage), &
                                         distance_to_box_squared(images(iimage)%center, lower, upper)) <= delta) CYCLE
-         ELSE
-            IF (distance_to_box_squared(images(iimage)%center, lower, upper) > images(iimage)%radius2) CYCLE
          END IF
          nao = SIZE(images(iimage)%primary, 2)
          ALLOCATE (values(ng, nao), SOURCE=0.0_dp)
@@ -1610,11 +1489,8 @@ CONTAINS
                                                             monomial(:, :), primitive(:, :), &
                                                             radius2(:)
 
-      CPASSERT(ASSOCIATED(basis))
       ng = SIZE(points, 2)
-      CPASSERT(SIZE(values, 1) == ng)
       IF (ng == 0) RETURN
-      CPASSERT(basis%nset > 0)
       ALLOCATE (offsets(basis%nset), monomial(ng, ncoset(MAXVAL(basis%lmax))), &
                 coordinate_power(3, 0:MAXVAL(basis%lmax)), radius2(ng), exponential(ng))
       nprimitive = 0
@@ -1677,7 +1553,7 @@ CONTAINS
 ! **************************************************************************************************
 !> \brief Bound every auxiliary potential in Eq. (2), including contracted angular functions.
 !> |x^n exp(-a x²/2)| <= (n/(a e))^(n/2); the remaining Gaussian potential is <=4 pi/a.
-!> The triangle inequality uses the transformed primitive coefficients for AUTO_RI functions.
+!> The triangle inequality uses the contracted primitive coefficients of each function.
 !> Truncating the positive kernel preserves the bound; envelopes are indexed (bound/exponents,atom).
 !> \param bs_env ...
 !> \param aux_potentials ...
@@ -1689,9 +1565,8 @@ CONTAINS
          INTENT(IN)                                      :: aux_potentials(:)
       REAL(dp), ALLOCATABLE, INTENT(OUT)                 :: envelopes(:, :)
 
-      INTEGER                                            :: iatom, ico, idir, ikind, ipgf, irow, &
-                                                            irow_packed, iset, isgf, ishell, l, &
-                                                            ncart, power
+      INTEGER                                            :: iatom, ico, idir, ikind, ipgf, &
+                                                            irow_packed, iset, ishell, l, power
       LOGICAL, ALLOCATABLE                               :: angular_used(:)
       REAL(dp)                                           :: exponent, factor
       REAL(dp), ALLOCATABLE                              :: bounds(:)
@@ -1705,18 +1580,12 @@ CONTAINS
          ikind = particles(iatom)%atomic_kind%kind_number
          basis => bs_env%basis_set_RI(ikind)%gto_basis_set
          CPASSERT(ASSOCIATED(basis))
-         IF (bs_env%auto_ri%enabled) THEN
-            CPASSERT(ALLOCATED(aux_potentials))
-            ALLOCATE (bounds(SIZE(aux_potentials(iatom)%coefficients, 2)))
-         ELSE
-            ALLOCATE (bounds(SIZE(basis%sphi, 2)))
-         END IF
+         ALLOCATE (bounds(SIZE(aux_potentials(iatom)%coefficients, 2)))
          ALLOCATE (angular_used(0:MAXVAL(basis%lmax)))
          bounds = 0.0_dp
          irow_packed = 0
          envelopes(2, iatom) = HUGE(1.0_dp)
          DO iset = 1, basis%nset
-            ncart = ncoset(basis%lmax(iset))
             angular_used = .FALSE.
             DO ishell = 1, basis%nshell(iset)
                angular_used(basis%l(ishell, iset)) = .TRUE.
@@ -1728,7 +1597,6 @@ CONTAINS
                DO l = 0, basis%lmax(iset)
                   IF (.NOT. angular_used(l)) CYCLE
                   DO ico = ncoset(l - 1) + 1, ncoset(l)
-                     irow = (ipgf - 1)*ncart + ico
                      irow_packed = irow_packed + 1
                      factor = 4.0_dp*pi/exponent
                      DO idir = 1, 3
@@ -1736,25 +1604,11 @@ CONTAINS
                         IF (power > 0) factor = factor*(REAL(power, dp)/(exponent*EXP(1.0_dp)))** &
                                                 (0.5_dp*REAL(power, dp))
                      END DO
-                     IF (bs_env%auto_ri%enabled) THEN
-                        bounds(:) = bounds(:) + ABS(aux_potentials(iatom)%coefficients(irow_packed, :))*factor
-                     ELSE
-                        DO ishell = 1, basis%nshell(iset)
-                           IF (basis%l(ishell, iset) /= l) CYCLE
-                           DO isgf = basis%first_sgf(ishell, iset), basis%last_sgf(ishell, iset)
-                              bounds(isgf) = bounds(isgf) + ABS(basis%sphi(irow, isgf))*factor
-                           END DO
-                        END DO
-                     END IF
+                     bounds(:) = bounds(:) + ABS(aux_potentials(iatom)%coefficients(irow_packed, :))*factor
                   END DO
                END DO
             END DO
          END DO
-         IF (bs_env%auto_ri%enabled) THEN
-            IF (.NOT. (irow_packed == SIZE(aux_potentials(iatom)%coefficients, 1))) THEN
-               CPABORT('Inconsistent packed auxiliary rows')
-            END IF
-         END IF
          envelopes(1, iatom) = MAXVAL(bounds)
          DEALLOCATE (bounds, angular_used)
       END DO
@@ -1763,7 +1617,6 @@ CONTAINS
 
 ! **************************************************************************************************
 !> \brief Contract Eqs. (2),(4), screening every spatial l/P-atom/T block separately.
-!> For d=max(0,|r-center|-rc), |v_P(r)|<=B min(1,a_max rc² exp(-a_min d²/2)/2).
 !> B bounds every selected potential on this atom; a_min/max bound its primitive exponents.
 !> For erfc(ωr)/r, |v_P(r)|<=B exp[-a_min ω² |r-center|²/(a_min+2ω²)].
 !> This follows from erfc(x)<=exp(-x²), completing the square, and the Gaussian Coulomb bound.
@@ -1771,7 +1624,6 @@ CONTAINS
 !> every d_lP(T): a point is contracted for one l block only when its local product bound exceeds
 !> the per-point threshold. The exact l/P/T distance criterion is applied before each GEMM.
 !> \param bs_env ...
-!> \param grid_points ...
 !> \param cells_R_d_lP Retained integer cell vectors R, indexed (3,R).
 !> \param include_lP_R ...
 !> \param include_l_blocks_P_R ...
@@ -1781,22 +1633,15 @@ CONTAINS
 !> \param envelopes ...
 !> \param blocks ...
 !> \param threshold ...
-!> \param omitted ...
 !> \param potential_points ...
-!> \param block_contractions ...
-!> \param screened_blocks ...
-!> \param coalesced_contractions ...
 !> \param contraction_products ...
 !> \param d_lP_R Numerical integrals indexed by local point l, RI function P and cell R.
 !> \param aux_potentials ...
 ! **************************************************************************************************
-   SUBROUTINE integrate_potentials(bs_env, grid_points, cells_R_d_lP, include_lP_R, include_l_blocks_P_R, &
-                                   points, field_squared, weight, &
-                                   envelopes, blocks, threshold, omitted, potential_points, block_contractions, &
-                                   screened_blocks, coalesced_contractions, contraction_products, d_lP_R, &
-                                   aux_potentials)
+   SUBROUTINE integrate_potentials(bs_env, cells_R_d_lP, include_lP_R, include_l_blocks_P_R, &
+                                   points, field_squared, weight, envelopes, blocks, threshold, &
+                                   potential_points, contraction_products, d_lP_R, aux_potentials)
       TYPE(post_scf_bandstructure_type), POINTER         :: bs_env
-      REAL(dp), INTENT(IN)                               :: grid_points(:, :)
       INTEGER, INTENT(IN)                                :: cells_R_d_lP(:, :)
       LOGICAL, INTENT(IN)                                :: include_lP_R(:, :, :), &
                                                             include_l_blocks_P_R(:, :, :)
@@ -1804,21 +1649,15 @@ CONTAINS
                                                             weight, envelopes(:, :)
       TYPE(l_block_partition_type), INTENT(IN)           :: blocks
       REAL(dp), INTENT(IN)                               :: threshold
-      REAL(dp), INTENT(INOUT)                            :: omitted
-      INTEGER(int_8), INTENT(INOUT)                      :: potential_points, block_contractions, &
-                                                            screened_blocks, &
-                                                            coalesced_contractions, &
-                                                            contraction_products
+      INTEGER(int_8), INTENT(INOUT)                      :: potential_points, contraction_products
       REAL(dp), INTENT(INOUT)                            :: d_lP_R(:, :, :)
       TYPE(radial_interpolation_type), ALLOCATABLE, &
          INTENT(IN)                                      :: aux_potentials(:)
 
       INTEGER                                            :: firstp, handle, iatom, iblock, ig, &
                                                             ikind, ilocal, it, lastp, maxnp, &
-                                                            nactive, nkeep, np, nthreads, nunion, &
-                                                            row
-      REAL(dp)                                           :: center(3), cutoff, decay, distance, &
-                                                            estimate
+                                                            nactive, np, nthreads, nunion, row
+      REAL(dp)                                           :: center(3), decay, estimate
       REAL(dp), ALLOCATABLE                              :: block_field_bound(:, :), block_RI(:, :), &
                                                             field_work(:, :), point_bound(:), &
                                                             potential(:, :)
@@ -1833,10 +1672,7 @@ CONTAINS
 
       cell => bs_env%ri_rs%cell
       particles => bs_env%ri_rs%particle_set
-      cutoff = 0.0_dp
-      IF (bs_env%ri_metric%potential_type == do_potential_truncated) cutoff = bs_env%ri_metric%cutoff_radius
       maxnp = MAXVAL(bs_env%i_RI_end_from_atom - bs_env%i_RI_start_from_atom + 1)
-      IF (bs_env%auto_ri%enabled) maxnp = MAXVAL(bs_env%auto_ri%sizes_opt_RI)
 
       CALL timeset('d_lP_allocate_field_bounds', handle)
 
@@ -1868,15 +1704,14 @@ CONTAINS
       ! Each atom/image owns disjoint P/T columns of Eq. (2).
 
       !$OMP PARALLEL DEFAULT(NONE) NUM_THREADS(nthreads) &
-      !$OMP SHARED(bs_env, grid_points, cells_R_d_lP, points, field_squared, weight, envelopes, &
-      !$OMP blocks, threshold, d_lP_R, aux_potentials, cell, particles, cutoff, &
+      !$OMP SHARED(bs_env, cells_R_d_lP, points, field_squared, weight, envelopes, &
+      !$OMP blocks, threshold, d_lP_R, aux_potentials, cell, particles, &
       !$OMP maxnp, block_field_bound, include_lP_R, include_l_blocks_P_R) &
-      !$OMP PRIVATE(firstp, handle, iatom, iblock, ig, ikind, ilocal, it, lastp, nactive, nkeep, &
-      !$OMP np, nunion, row, center, decay, distance, estimate, basis, &
+      !$OMP PRIVATE(firstp, handle, iatom, iblock, ig, ikind, ilocal, it, lastp, nactive, &
+      !$OMP np, nunion, row, center, decay, estimate, basis, &
       !$OMP block_RI, field_work, point_bound, potential, point_needed, union_indices, &
       !$OMP active_l, block_needed, block_active_last, block_active_first) &
-      !$OMP REDUCTION(+:omitted, potential_points, block_contractions, screened_blocks, &
-      !$OMP coalesced_contractions, contraction_products)
+      !$OMP REDUCTION(+:potential_points, contraction_products)
 
       CALL timeset('d_lP_allocate_thread_buffers', handle)
 
@@ -1893,29 +1728,16 @@ CONTAINS
             basis => bs_env%basis_set_RI(ikind)%gto_basis_set
             firstp = bs_env%i_RI_start_from_atom(iatom)
             lastp = bs_env%i_RI_end_from_atom(iatom)
-            IF (bs_env%auto_ri%enabled) THEN
-               firstp = 1 + SUM(bs_env%auto_ri%sizes_opt_RI(:iatom - 1))
-               lastp = firstp + bs_env%auto_ri%sizes_opt_RI(iatom) - 1
-            END IF
             np = lastp - firstp + 1
             center = pbc(particles(iatom)%r, cell) + MATMUL(bs_env%hmat, REAL(cells_R_d_lP(:, it), dp))
             IF (.NOT. ANY(include_l_blocks_P_R(:, iatom, it))) CYCLE
             CALL timeset('d_lP_screen_atom_image', handle)
-            decay = 0.0_dp
-            IF (bs_env%ri_metric%potential_type == do_potential_short) THEN
-               decay = envelopes(2, iatom)*bs_env%ri_metric%omega**2/ &
-                       (envelopes(2, iatom) + 2.0_dp*bs_env%ri_metric%omega**2)
-            END IF
+            decay = envelopes(2, iatom)*bs_env%ri_metric%omega**2/ &
+                    (envelopes(2, iatom) + 2.0_dp*bs_env%ri_metric%omega**2)
             DO ig = 1, SIZE(points, 2)
                point_bound(ig) = envelopes(1, iatom)
                IF (decay > 0.0_dp) point_bound(ig) = point_bound(ig)* &
                                                      EXP(-decay*SUM((points(:, ig) - center)**2))
-               IF (cutoff > 0.0_dp) THEN
-                  distance = MAX(0.0_dp, NORM2(points(:, ig) - center) - cutoff)
-                  point_bound(ig) = point_bound(ig)* &
-                                    MIN(1.0_dp, 0.5_dp*envelopes(3, iatom)*cutoff**2* &
-                                        EXP(-0.5_dp*envelopes(2, iatom)*distance**2))
-               END IF
             END DO
             block_needed = .FALSE.
             point_needed = .FALSE.
@@ -1926,11 +1748,8 @@ CONTAINS
                   IF (estimate > threshold) THEN
                      block_needed(iblock) = .TRUE.
                      point_needed(ig) = .TRUE.
-                  ELSE
-                     omitted = omitted + weight*estimate
                   END IF
                END DO
-               IF (.NOT. block_needed(iblock)) screened_blocks = screened_blocks + 1_int_8
             END DO
             nunion = 0
             DO ig = 1, SIZE(points, 2)
@@ -1943,17 +1762,9 @@ CONTAINS
             IF (nunion == 0) CYCLE
             potential_points = potential_points + INT(nunion, int_8)
             CALL timeset('d_lP_potential_eval', handle)
-            IF (bs_env%auto_ri%enabled) THEN
-               CALL evaluate_RI_potential(potential(:, 1:np), &
-                                          points(:, union_indices(1:nunion)), &
-                                          basis, center, cutoff, aux_potentials(iatom), &
-                                          attenuation=MAX(0.0_dp, bs_env%ri_metric%omega))
-            ELSE
-               CALL evaluate_RI_potential(potential(1:nunion, 1:np), &
-                                          points(:, union_indices(1:nunion)), &
-                                          basis, center, cutoff, &
-                                          attenuation=MAX(0.0_dp, bs_env%ri_metric%omega))
-            END IF
+            CALL contract_selected_potentials(potential(:, 1:np), &
+                                              points(:, union_indices(1:nunion)), &
+                                              basis, center, aux_potentials(iatom))
             CALL timestop(handle)
             CALL timeset('d_lP_prepare_quadrature', handle)
             nactive = 0
@@ -1969,9 +1780,6 @@ CONTAINS
                   END IF
                END DO
                block_active_last(iblock) = nactive
-               IF (.NOT. (block_active_last(iblock) >= block_active_first(iblock))) THEN
-                  CPABORT('Empty active integration block')
-               END IF
             END DO
             DO iblock = 1, blocks%nblocks
                IF (.NOT. block_needed(iblock)) CYCLE
@@ -1979,15 +1787,12 @@ CONTAINS
                   ig = union_indices(row)
                   point_needed(row) = block_field_bound(ig, iblock)*point_bound(ig) > threshold
                END DO
-               nkeep = COUNT(point_needed(1:nunion))
                DO ilocal = block_active_first(iblock), block_active_last(iblock)
                   DO row = 1, nunion
                      field_work(row, ilocal) = MERGE( &
                                                field_squared(union_indices(row), active_l(ilocal)), 0.0_dp, point_needed(row))
                   END DO
                END DO
-               CPASSERT(nkeep > 0)
-               block_contractions = block_contractions + 1_int_8
             END DO
             CALL timestop(handle)
             CALL timeset('d_lP_sum_g_f2_v', handle)
@@ -1998,7 +1803,6 @@ CONTAINS
                   d_lP_R(active_l(ilocal), firstp:lastp, it) + block_RI(ilocal, 1:np)
             END DO
             CALL timestop(handle)
-            coalesced_contractions = coalesced_contractions + 1_int_8
             contraction_products = contraction_products + &
                                    INT(nactive, int_8)*INT(np, int_8)*INT(nunion, int_8)
          END DO
@@ -2069,10 +1873,6 @@ CONTAINS
             center = pbc(particles(iatom)%r, cell) + MATMUL(bs_env%hmat, REAL(cells_R_d_lP(:, it), dp))
             firstp = bs_env%i_RI_start_from_atom(iatom)
             lastp = bs_env%i_RI_end_from_atom(iatom)
-            IF (bs_env%auto_ri%enabled) THEN
-               firstp = 1 + SUM(bs_env%auto_ri%sizes_opt_RI(:iatom - 1))
-               lastp = firstp + bs_env%auto_ri%sizes_opt_RI(iatom) - 1
-            END IF
             cutoff = cutoffs_lP(iatom)
             DO il = 1, bs_env%ri_rs%n_grid_points
                IF (NORM2(grid_points(:, il) - center) > cutoff) d_lP_R(il, firstp:lastp, it) = 0.0_dp
@@ -2084,59 +1884,21 @@ CONTAINS
    END SUBROUTINE apply_d_lP_distance_cutoff
 
 ! **************************************************************************************************
-!> \brief Evaluate v_P(r) for a contracted spherical auxiliary basis, without Gaussian smearing.
-!> For a primitive H_l(r) exp(-a r²), H_l is a homogeneous harmonic polynomial.
-!> (1) Its potential is H_l(r) (-1/a)^l d^l F(s)/ds^l, s=r².
-!> (2) F is the s-Gaussian convolution with theta(rc-|r-r'|)/|r-r'|:
-!> F(r²)=pi^(3/2)[2 erf(sqrt(a)r)-erf(sqrt(a)(r-rc))-erf(sqrt(a)(r+rc))]/(2 a^(3/2) r).
-!> The existing sphi coefficients supply all contraction and angular normalization factors.
-!> A nonpositive rc selects the untruncated Coulomb kernel. No spatial cutoff is applied here.
-!> The origin uses a convergent power series; elsewhere Taylor arithmetic differentiates (2).
-!> \param values Potentials indexed by integration point and contracted auxiliary function.
-!> \param points Cartesian integration points in bohr, indexed (3,point).
-!> \param basis Contracted spherical auxiliary basis.
-!> \param center Auxiliary atomic center in bohr.
-!> \param cutoff Coulomb cutoff in bohr, or nonpositive for the full kernel.
-!> \param contracted ...
-!> \param attenuation Positive omega (inverse bohr) selects erfc(omega*r)/r.
-! **************************************************************************************************
-   SUBROUTINE evaluate_RI_potential(values, points, basis, center, cutoff, contracted, attenuation)
-      REAL(dp), CONTIGUOUS, INTENT(OUT)                  :: values(:, :)
-      REAL(dp), INTENT(IN)                               :: points(:, :)
-      TYPE(gto_basis_set_type), POINTER                  :: basis
-      REAL(dp), INTENT(IN)                               :: center(3), cutoff
-      TYPE(radial_interpolation_type), INTENT(IN), &
-         OPTIONAL                                        :: contracted
-      REAL(dp), INTENT(IN), OPTIONAL                     :: attenuation
-
-      CPASSERT(ASSOCIATED(basis))
-      CPASSERT(SIZE(points, 1) == 3)
-      IF (PRESENT(contracted)) THEN
-         CPASSERT(SIZE(values, 1) >= SIZE(points, 2))
-      ELSE
-         CPASSERT(SIZE(values, 1) == SIZE(points, 2))
-      END IF
-      CALL contract_potentials(values, points, basis, center, cutoff, contracted, attenuation)
-
-   END SUBROUTINE evaluate_RI_potential
-
-! **************************************************************************************************
-!> \brief Transform spherical coefficients once; bound optional radial tables by radial_table_bytes.
+!> \brief Transform spherical coefficients once; bound the radial tables by radial_table_bytes.
 !> \param basis ...
 !> \param U_Pp ...
 !> \param contracted ...
-!> \param cutoff ...
 !> \param attenuation ...
 !> \param radial_table_bytes ...
 !> \param mesh_step ...
 !> \param mesh_displacement ...
 ! **************************************************************************************************
-   SUBROUTINE prepare_contracted_potential(basis, U_Pp, contracted, cutoff, attenuation, radial_table_bytes, &
+   SUBROUTINE prepare_contracted_potential(basis, U_Pp, contracted, attenuation, radial_table_bytes, &
                                            mesh_step, mesh_displacement)
       TYPE(gto_basis_set_type), POINTER                  :: basis
-      REAL(dp), INTENT(IN), OPTIONAL                     :: U_Pp(:, :)
+      REAL(dp), INTENT(IN)                               :: U_Pp(:, :)
       TYPE(radial_interpolation_type), INTENT(OUT)       :: contracted
-      REAL(dp), INTENT(IN), OPTIONAL                     :: cutoff, attenuation, radial_table_bytes, &
+      REAL(dp), INTENT(IN)                               :: attenuation, radial_table_bytes, &
                                                             mesh_step(3, 3), mesh_displacement(3)
 
       INTEGER                                            :: ico, iopt, ipgf, irow, irow_packed, &
@@ -2146,13 +1908,9 @@ CONTAINS
       REAL(dp)                                           :: bytes_per_node, table_bytes
       REAL(dp), ALLOCATABLE                              :: full_abscissae(:), moments(:, :)
 
-      CPASSERT(ASSOCIATED(basis))
       ALLOCATE (angular_used(0:MAXVAL(basis%lmax)))
-      np = basis%nsgf
-      IF (PRESENT(U_Pp)) THEN
-         CPASSERT(SIZE(U_Pp, 1) == basis%nsgf)
-         np = SIZE(U_Pp, 2)
-      END IF
+      CPASSERT(SIZE(U_Pp, 1) == basis%nsgf)
+      np = SIZE(U_Pp, 2)
       nrows = 0
       DO iset = 1, basis%nset
          angular_used = .FALSE.
@@ -2182,68 +1940,51 @@ CONTAINS
                   DO ishell = 1, basis%nshell(iset)
                      IF (basis%l(ishell, iset) /= l) CYCLE
                      DO isgf = basis%first_sgf(ishell, iset), basis%last_sgf(ishell, iset)
-                        IF (PRESENT(U_Pp)) THEN
-                           DO iopt = 1, np
-                              contracted%coefficients(irow_packed, iopt) = &
-                                 contracted%coefficients(irow_packed, iopt) + basis%sphi(irow, isgf)*U_Pp(isgf, iopt)
-                           END DO
-                        ELSE
-                           contracted%coefficients(irow_packed, isgf) = &
-                              contracted%coefficients(irow_packed, isgf) + basis%sphi(irow, isgf)
-                        END IF
+                        DO iopt = 1, np
+                           contracted%coefficients(irow_packed, iopt) = &
+                              contracted%coefficients(irow_packed, iopt) + basis%sphi(irow, isgf)*U_Pp(isgf, iopt)
+                        END DO
                      END DO
                   END DO
                END DO
             END DO
          END DO
       END DO
-      CPASSERT(irow_packed == nrows)
       DEALLOCATE (angular_used)
-      IF (PRESENT(U_Pp) .AND. basis%nsgf < nrows) THEN
-         CALL prepare_spherical_potential_factorization(basis, U_Pp, contracted)
+      IF (basis%nsgf < nrows) CALL prepare_spherical_potential_factorization(basis, U_Pp, contracted)
+      contracted%attenuation = MAX(0.0_dp, attenuation)
+      CALL prepare_radial_series(basis, contracted%attenuation, contracted%series, contracted%short_series)
+      table_bytes = MAX(0.0_dp, radial_table_bytes)
+      ! Budget the actual logarithmic nodes, including one primitive preparation buffer.
+      bytes_per_node = 8.0_dp*REAL(MAXVAL(basis%lmax) + 7, dp)* &
+                       REAL(MAXVAL(basis%npgf)*basis%nset + 1, dp)
+      CALL prepare_short_radial_grid(512.0_dp, contracted%short_abscissae)
+      table_bytes = MAX(0.0_dp, table_bytes - 8.0_dp*REAL(SIZE(contracted%short_abscissae), dp))
+      ninterval = INT(MIN(REAL(SIZE(contracted%short_abscissae), dp), &
+                          table_bytes/bytes_per_node)) - 1
+      IF (ninterval < 1) THEN
+         DEALLOCATE (contracted%short_abscissae)
+         RETURN
       END IF
-      IF (PRESENT(cutoff) .OR. PRESENT(attenuation)) THEN
-         IF (PRESENT(cutoff)) contracted%cutoff = cutoff
-         IF (PRESENT(attenuation)) contracted%attenuation = MAX(0.0_dp, attenuation)
-         CALL prepare_radial_series(basis, contracted%cutoff, contracted%attenuation, &
-                                    contracted%series, contracted%short_series)
-         IF (contracted%attenuation > 0.0_dp) THEN
-            table_bytes = 16.0_dp*1024.0_dp**2
-            IF (PRESENT(radial_table_bytes)) table_bytes = MAX(0.0_dp, radial_table_bytes)
-            ! Budget the actual logarithmic nodes, including one primitive preparation buffer.
-            bytes_per_node = 8.0_dp*REAL(MAXVAL(basis%lmax) + 7, dp)* &
-                             REAL(MAXVAL(basis%npgf)*basis%nset + 1, dp)
-            CALL prepare_short_radial_grid(512.0_dp, contracted%short_abscissae)
-            table_bytes = MAX(0.0_dp, table_bytes - 8.0_dp*REAL(SIZE(contracted%short_abscissae), dp))
-            ninterval = INT(MIN(REAL(SIZE(contracted%short_abscissae), dp), &
-                                table_bytes/bytes_per_node)) - 1
-            IF (ninterval < 1) THEN
-               DEALLOCATE (contracted%short_abscissae)
-               RETURN
-            END IF
-            IF (ninterval < UBOUND(contracted%short_abscissae, 1)) THEN
-               CALL MOVE_ALLOC(contracted%short_abscissae, full_abscissae)
-               ALLOCATE (contracted%short_abscissae(0:ninterval))
-               contracted%short_abscissae(:) = full_abscissae(0:ninterval)
-               DEALLOCATE (full_abscissae)
-            END IF
-            ALLOCATE (contracted%short_moments(0:MAXVAL(basis%lmax) + 6, &
-                                               0:ninterval, MAXVAL(basis%npgf), basis%nset))
-            DO iset = 1, basis%nset
-               DO ipgf = 1, basis%npgf(iset)
-                  CALL prepare_short_radial_table(basis%zet(ipgf, iset), contracted%attenuation, &
-                                                  MAXVAL(basis%lmax), moments, ninterval, abscissae=contracted%short_abscissae)
-                  contracted%short_moments(:, :, ipgf, iset) = moments
-                  DEALLOCATE (moments)
-               END DO
-            END DO
-            ! Keep the generic radial lookup at all radii before using remaining storage for mesh nodes.
-            table_bytes = MAX(0.0_dp, table_bytes - 8.0_dp*REAL(SIZE(contracted%short_moments, KIND=int_8), dp))
-            IF (PRESENT(mesh_step) .AND. PRESENT(mesh_displacement)) THEN
-               CALL prepare_mesh_radial_moments(basis, contracted, mesh_step, mesh_displacement, table_bytes)
-            END IF
-         END IF
+      IF (ninterval < UBOUND(contracted%short_abscissae, 1)) THEN
+         CALL MOVE_ALLOC(contracted%short_abscissae, full_abscissae)
+         ALLOCATE (contracted%short_abscissae(0:ninterval))
+         contracted%short_abscissae(:) = full_abscissae(0:ninterval)
+         DEALLOCATE (full_abscissae)
       END IF
+      ALLOCATE (contracted%short_moments(0:MAXVAL(basis%lmax) + 6, &
+                                         0:ninterval, MAXVAL(basis%npgf), basis%nset))
+      DO iset = 1, basis%nset
+         DO ipgf = 1, basis%npgf(iset)
+            CALL prepare_short_radial_table(basis%zet(ipgf, iset), contracted%attenuation, &
+                                            MAXVAL(basis%lmax), moments, ninterval, abscissae=contracted%short_abscissae)
+            contracted%short_moments(:, :, ipgf, iset) = moments
+            DEALLOCATE (moments)
+         END DO
+      END DO
+      ! Keep the generic radial lookup at all radii before using remaining storage for mesh nodes.
+      table_bytes = MAX(0.0_dp, table_bytes - 8.0_dp*REAL(SIZE(contracted%short_moments, KIND=int_8), dp))
+      CALL prepare_mesh_radial_moments(basis, contracted, mesh_step, mesh_displacement, table_bytes)
 
    END SUBROUTINE prepare_contracted_potential
 
@@ -2354,17 +2095,16 @@ CONTAINS
    END SUBROUTINE prepare_spherical_potential_factorization
 
 ! **************************************************************************************************
-!> \brief Prepare the origin series in Eq. (2) once for a fixed basis and interaction kernel.
+!> \brief Prepare the origin series in Eq. (2) once for a fixed basis and erfc(omega*r)/r kernel.
 !> The coefficients depend on neither the integration point nor the translated atomic center.
 !> \param basis ...
-!> \param cutoff ...
 !> \param omega ...
 !> \param series ...
 !> \param short_series ...
 ! **************************************************************************************************
-   SUBROUTINE prepare_radial_series(basis, cutoff, omega, series, short_series)
+   SUBROUTINE prepare_radial_series(basis, omega, series, short_series)
       TYPE(gto_basis_set_type), POINTER                  :: basis
-      REAL(dp), INTENT(IN)                               :: cutoff, omega
+      REAL(dp), INTENT(IN)                               :: omega
       REAL(dp), ALLOCATABLE, INTENT(OUT)                 :: series(:, :, :), short_series(:, :, :)
 
       INTEGER                                            :: in, ipgf, iset, lmax
@@ -2376,162 +2116,53 @@ CONTAINS
       DO iset = 1, basis%nset
          DO ipgf = 1, basis%npgf(iset)
             exponent = basis%zet(ipgf, iset)
-            IF (omega > 0.0_dp) THEN
-               CALL origin_series(exponent, 0.0_dp, series(:, ipgf, iset))
-               beta_ratio = omega**2/(exponent + omega**2)
-               DO in = 0, UBOUND(series, 1)
-                  short_series(in, ipgf, iset) = series(in, ipgf, iset)* &
-                                                 (1.0_dp - beta_ratio**(REAL(in, dp) + 0.5_dp))
-               END DO
-            ELSE
-               CALL origin_series(exponent, cutoff, series(:, ipgf, iset))
-               short_series(:, ipgf, iset) = 0.0_dp
-            END IF
+            CALL origin_series(series(:, ipgf, iset))
+            beta_ratio = omega**2/(exponent + omega**2)
+            DO in = 0, UBOUND(series, 1)
+               short_series(in, ipgf, iset) = series(in, ipgf, iset)* &
+                                              (1.0_dp - beta_ratio**(REAL(in, dp) + 0.5_dp))
+            END DO
          END DO
       END DO
 
    END SUBROUTINE prepare_radial_series
 
 ! **************************************************************************************************
-!> \brief Contract primitive potentials from Eq. (1) using the CP2K spherical coefficients.
+!> \brief Evaluate the auxiliary potentials v_P(r) for the erfc(omega*r)/r kernel.
+!> For a primitive H_l(r) exp(-a r²), H_l is a homogeneous harmonic polynomial.
+!> (1) Its potential is H_l(r) (-1/a)^l d^l F(s)/ds^l, s=r².
+!> (2) For the full Coulomb kernel, F(r²)=pi^(3/2) erf(sqrt(a)r)/(a^(3/2) r);
+!> radial_potential_short subtracts the long-range part of erfc(omega*r)/r.
+!> The potential columns are the contracted functions P of contracted%coefficients
+!> (AUTO_RI functions or the plain RI basis); a final GEMM applies the contraction.
+!> The erfc kernel and its origin series are those prepared in contracted.
 !> \param values ...
 !> \param points ...
 !> \param basis ...
 !> \param center ...
-!> \param cutoff ...
 !> \param contracted ...
-!> \param attenuation ...
 ! **************************************************************************************************
-   SUBROUTINE contract_potentials(values, points, basis, center, cutoff, contracted, attenuation)
+   SUBROUTINE contract_selected_potentials(values, points, basis, center, contracted)
       REAL(dp), CONTIGUOUS, INTENT(OUT)                  :: values(:, :)
       REAL(dp), INTENT(IN)                               :: points(:, :)
       TYPE(gto_basis_set_type), POINTER                  :: basis
-      REAL(dp), INTENT(IN)                               :: center(3), cutoff
-      TYPE(radial_interpolation_type), INTENT(IN), &
-         OPTIONAL                                        :: contracted
-      REAL(dp), INTENT(IN), OPTIONAL                     :: attenuation
-
-      INTEGER                                            :: ico, in, ipgf, ipoint, irow, iset, isgf, &
-                                                            ishell, l, lmax, ncart
-      LOGICAL                                            :: parallel_points, short
-      REAL(dp)                                           :: beta_ratio, exponent, minimum_radius2, &
-                                                            omega, polynomial, radius, &
-                                                            relative(3), weight
-      REAL(dp), ALLOCATABLE                              :: long_radial(:), radial(:), &
-                                                            series(:, :, :), short_series(:, :, :)
-      TYPE(radial_work_type)                             :: radial_work
-
-      lmax = MAXVAL(basis%lmax)
-      omega = 0.0_dp
-      IF (PRESENT(attenuation)) omega = attenuation
-      short = omega > 0.0_dp
-      IF (PRESENT(contracted)) THEN
-         CPASSERT(ALLOCATED(contracted%coefficients))
-         CPASSERT(SIZE(contracted%coefficients, 2) == SIZE(values, 2))
-         CALL contract_selected_potentials(values, points, basis, center, cutoff, contracted, attenuation)
-         RETURN
-      END IF
-      ALLOCATE (series(0:lmax + 24, MAXVAL(basis%npgf), basis%nset), &
-                short_series(0:lmax + 24, MAXVAL(basis%npgf), basis%nset))
-      minimum_radius2 = MINVAL(SUM((points - SPREAD(center, 2, SIZE(points, 2)))**2, DIM=1))
-      DO iset = 1, basis%nset
-         DO ipgf = 1, basis%npgf(iset)
-            exponent = basis%zet(ipgf, iset)
-            IF (short) THEN
-               CALL origin_series(exponent, 0.0_dp, series(:, ipgf, iset))
-               beta_ratio = omega**2/(exponent + omega**2)
-               DO in = 0, UBOUND(series, 1)
-                  short_series(in, ipgf, iset) = series(in, ipgf, iset)* &
-                                                 (1.0_dp - beta_ratio**(REAL(in, dp) + 0.5_dp))
-               END DO
-            ELSE IF (exponent*minimum_radius2 < 0.5_dp) THEN
-               CALL origin_series(exponent, cutoff, series(:, ipgf, iset))
-            ELSE
-               series(:, ipgf, iset) = 0.0_dp
-            END IF
-         END DO
-      END DO
-      values = 0.0_dp
-      parallel_points = .TRUE.
-!$    parallel_points = .NOT. omp_in_parallel()
-      !$OMP PARALLEL DEFAULT(NONE) IF(parallel_points) &
-      !$OMP SHARED(values, points, basis, center, cutoff, lmax, series, short_series, &
-      !$OMP short, omega, ncoset, indco) &
-      !$OMP PRIVATE(ipoint, relative, radius, iset, ipgf, exponent, radial, ishell, &
-      !$OMP l, isgf, ico, irow, ncart, polynomial, weight, radial_work, long_radial)
-      ALLOCATE (radial(0:lmax), long_radial(0:lmax), radial_work%jet(0:lmax), &
-                radial_work%gaussian(0:lmax), radial_work%derivative(0:lmax), radial_work%bracket(0:lmax))
-      !$OMP DO SCHEDULE(STATIC)
-      DO ipoint = 1, SIZE(points, 2)
-         relative = points(:, ipoint) - center
-         radius = NORM2(relative)
-         DO iset = 1, basis%nset
-            ncart = ncoset(basis%lmax(iset))
-            DO ipgf = 1, basis%npgf(iset)
-               exponent = basis%zet(ipgf, iset)
-               IF (short) THEN
-                  CALL radial_potential_short(radius, exponent, omega, series(:, ipgf, iset), &
-                                              short_series(:, ipgf, iset), radial, radial_work, long_radial)
-               ELSE
-                  CALL radial_potential(radius, exponent, cutoff, series(:, ipgf, iset), radial, radial_work)
-               END IF
-               DO ishell = 1, basis%nshell(iset)
-                  l = basis%l(ishell, iset)
-                  DO isgf = basis%first_sgf(ishell, iset), basis%last_sgf(ishell, iset)
-                     polynomial = 0.0_dp
-                     DO ico = ncoset(l - 1) + 1, ncoset(l)
-                        irow = (ipgf - 1)*ncart + ico
-                        weight = basis%sphi(irow, isgf)
-                        polynomial = polynomial + weight*relative(1)**indco(1, ico)* &
-                                     relative(2)**indco(2, ico)*relative(3)**indco(3, ico)
-                     END DO
-                     values(ipoint, isgf) = values(ipoint, isgf) + polynomial*radial(l)
-                  END DO
-               END DO
-            END DO
-         END DO
-      END DO
-      !$OMP END DO
-      DEALLOCATE (radial, long_radial, radial_work%jet, radial_work%gaussian, &
-                  radial_work%derivative, radial_work%bracket)
-      !$OMP END PARALLEL
-
-   END SUBROUTINE contract_potentials
-
-! **************************************************************************************************
-!> \brief Contract selected auxiliary potentials with BLAS after shared radial work.
-!> The potential columns are selected AUTO_RI functions throughout this routine.
-!> Each thread reuses radial work arrays over all points and Gaussian primitives.
-!> \param values ...
-!> \param points ...
-!> \param basis ...
-!> \param center ...
-!> \param cutoff ...
-!> \param contracted ...
-!> \param attenuation ...
-! **************************************************************************************************
-   SUBROUTINE contract_selected_potentials(values, points, basis, center, cutoff, contracted, attenuation)
-      REAL(dp), CONTIGUOUS, INTENT(OUT)                  :: values(:, :)
-      REAL(dp), INTENT(IN)                               :: points(:, :)
-      TYPE(gto_basis_set_type), POINTER                  :: basis
-      REAL(dp), INTENT(IN)                               :: center(3), cutoff
+      REAL(dp), INTENT(IN)                               :: center(3)
       TYPE(radial_interpolation_type), INTENT(IN), &
          TARGET                                          :: contracted
-      REAL(dp), INTENT(IN), OPTIONAL                     :: attenuation
 
-      INTEGER                                            :: handle, iangular, ico, ig, imesh, in, &
-                                                            ipgf, irow, iset, isgf, ishell, l, &
-                                                            lmax, m, nchannels, ng, np, nrows, &
-                                                            nwork
+      INTEGER                                            :: handle, iangular, ico, ig, imesh, ipgf, &
+                                                            irow, iset, isgf, ishell, l, lmax, m, &
+                                                            nchannels, ng, np, nrows, nwork
       INTEGER, ALLOCATABLE                               :: angular_count(:, :, :), &
                                                             angular_index(:), &
                                                             angular_term(:, :, :, :), &
                                                             mesh_channel(:), minimum_l(:)
       LOGICAL                                            :: factorized, in_table, parallel_points, &
-                                                            prepared, short, tabulated, use_mesh
+                                                            tabulated, use_mesh
       LOGICAL, ALLOCATABLE                               :: angular_used(:, :)
-      REAL(dp) :: beta_ratio, exponent, mesh_delta, mesh_position, minimum_radius2, omega, &
-         radial_sum, radius, radius2, relative(3), spherical_value, x
+      REAL(dp)                                           :: mesh_delta, mesh_position, omega, &
+                                                            radial_sum, radius, radius2, &
+                                                            relative(3), spherical_value, x
       REAL(dp), ALLOCATABLE :: angular_values(:, :, :), coordinate_power(:, :), long_radial(:), &
          monomial(:), radial(:), radial_channels(:, :, :), radial_mesh(:), work(:, :)
       REAL(dp), CONTIGUOUS, POINTER                      :: coefficient_matrix(:, :)
@@ -2555,60 +2186,29 @@ CONTAINS
             angular_used(basis%l(ishell, iset), iset) = .TRUE.
          END DO
       END DO
-      omega = 0.0_dp
-      IF (PRESENT(attenuation)) omega = attenuation
-      short = omega > 0.0_dp
+      omega = contracted%attenuation
       ALLOCATE (work(nwork, ng))
-      prepared = ALLOCATED(contracted%series) .AND. ALLOCATED(contracted%short_series)
-      prepared = prepared .AND. ABS(contracted%cutoff - cutoff) <= 0.0_dp .AND. &
-                 ABS(contracted%attenuation - omega) <= 0.0_dp
-      IF (prepared) THEN
-         series => contracted%series
-         short_series => contracted%short_series
-      ELSE
-         ALLOCATE (series(0:lmax + 24, MAXVAL(basis%npgf), basis%nset), &
-                   short_series(0:lmax + 24, MAXVAL(basis%npgf), basis%nset))
-         minimum_radius2 = MINVAL(SUM((points - SPREAD(center, 2, ng))**2, DIM=1))
-         DO iset = 1, basis%nset
-            DO ipgf = 1, basis%npgf(iset)
-               exponent = basis%zet(ipgf, iset)
-               IF (short) THEN
-                  CALL origin_series(exponent, 0.0_dp, series(:, ipgf, iset))
-                  beta_ratio = omega**2/(exponent + omega**2)
-                  DO in = 0, UBOUND(series, 1)
-                     short_series(in, ipgf, iset) = series(in, ipgf, iset)* &
-                                                    (1.0_dp - beta_ratio**(REAL(in, dp) + 0.5_dp))
-                  END DO
-               ELSE IF (exponent*minimum_radius2 < 0.5_dp) THEN
-                  CALL origin_series(exponent, cutoff, series(:, ipgf, iset))
-               ELSE
-                  series(:, ipgf, iset) = 0.0_dp
-               END IF
-            END DO
-         END DO
-      END IF
+      series => contracted%series
+      short_series => contracted%short_series
       ! Primitive/angular row labels are invariant over the integration points.
       ! Evaluate each tabulated radial channel once, then apply its Cartesian monomial.
       nchannels = 0
       ALLOCATE (mesh_channel(nrows), angular_index(nrows))
-      IF (prepared) THEN
-         IF (ALLOCATED(contracted%mesh_moments)) THEN
-            nchannels = SIZE(contracted%mesh_moments, 2)
-            irow = 0
-            DO iset = 1, basis%nset
-               DO ipgf = 1, basis%npgf(iset)
-                  DO l = 0, basis%lmax(iset)
-                     IF (.NOT. angular_used(l, iset)) CYCLE
-                     DO ico = ncoset(l - 1) + 1, ncoset(l)
-                        irow = irow + 1
-                        mesh_channel(irow) = contracted%mesh_first(ipgf, iset) + l - minimum_l(iset)
-                        angular_index(irow) = ico
-                     END DO
+      IF (ALLOCATED(contracted%mesh_moments)) THEN
+         nchannels = SIZE(contracted%mesh_moments, 2)
+         irow = 0
+         DO iset = 1, basis%nset
+            DO ipgf = 1, basis%npgf(iset)
+               DO l = 0, basis%lmax(iset)
+                  IF (.NOT. angular_used(l, iset)) CYCLE
+                  DO ico = ncoset(l - 1) + 1, ncoset(l)
+                     irow = irow + 1
+                     mesh_channel(irow) = contracted%mesh_first(ipgf, iset) + l - minimum_l(iset)
+                     angular_index(irow) = ico
                   END DO
                END DO
             END DO
-            CPASSERT(irow == nrows)
-         END IF
+         END DO
       END IF
       ! Preserve the order of the nonzero polynomial terms; omit only exact zeros.
       IF (factorized) THEN
@@ -2627,7 +2227,7 @@ CONTAINS
             END DO
          END DO
       END IF
-      tabulated = prepared .AND. ALLOCATED(contracted%short_moments)
+      tabulated = ALLOCATED(contracted%short_moments)
 
       CALL timestop(handle)
 
@@ -2636,8 +2236,8 @@ CONTAINS
       parallel_points = .TRUE.
 !$    parallel_points = .NOT. omp_in_parallel()
       !$OMP PARALLEL DEFAULT(NONE) IF(parallel_points) &
-      !$OMP SHARED(ng, points, center, basis, cutoff, series, short_series, short, omega, &
-      !$OMP work, indco, ncoset, lmax, angular_used, minimum_l, contracted, tabulated, prepared, &
+      !$OMP SHARED(ng, points, center, basis, series, short_series, omega, &
+      !$OMP work, indco, ncoset, lmax, angular_used, minimum_l, contracted, tabulated, &
       !$OMP nchannels, nrows, nwork, factorized, mesh_channel, angular_index, nso, angular_count, angular_term) &
       !$OMP PRIVATE(ig, ico, relative, radius, radius2, iset, ipgf, radial, monomial, l, irow, radial_work, long_radial, &
       !$OMP x, in_table, coordinate_power, imesh, mesh_delta, mesh_position, use_mesh, radial_mesh, &
@@ -2662,16 +2262,14 @@ CONTAINS
          use_mesh = .FALSE.
          mesh_delta = 0.0_dp
          imesh = 0
-         IF (prepared) THEN
-            IF (ALLOCATED(contracted%mesh_moments)) THEN
-               mesh_position = radius2/contracted%mesh_spacing - contracted%mesh_offset
-               IF (mesh_position >= -0.5_dp .AND. mesh_position <= REAL(UBOUND(contracted%mesh_moments, 3), dp) + 0.5_dp) THEN
-                  imesh = NINT(mesh_position)
-                  IF (imesh >= 0 .AND. imesh <= UBOUND(contracted%mesh_moments, 3)) THEN
-                     mesh_delta = radius2 - contracted%mesh_spacing*(REAL(imesh, dp) + contracted%mesh_offset)
-                     use_mesh = ABS(mesh_delta) <= 64.0_dp*EPSILON(1.0_dp)*MAX(1.0_dp, radius2)
-                     use_mesh = use_mesh .AND. contracted%mesh_exponent*ABS(mesh_delta) <= 1.0E-8_dp
-                  END IF
+         IF (ALLOCATED(contracted%mesh_moments)) THEN
+            mesh_position = radius2/contracted%mesh_spacing - contracted%mesh_offset
+            IF (mesh_position >= -0.5_dp .AND. mesh_position <= REAL(UBOUND(contracted%mesh_moments, 3), dp) + 0.5_dp) THEN
+               imesh = NINT(mesh_position)
+               IF (imesh >= 0 .AND. imesh <= UBOUND(contracted%mesh_moments, 3)) THEN
+                  mesh_delta = radius2 - contracted%mesh_spacing*(REAL(imesh, dp) + contracted%mesh_offset)
+                  use_mesh = ABS(mesh_delta) <= 64.0_dp*EPSILON(1.0_dp)*MAX(1.0_dp, radius2)
+                  use_mesh = use_mesh .AND. contracted%mesh_exponent*ABS(mesh_delta) <= eps_mesh_phase
                END IF
             END IF
          END IF
@@ -2709,13 +2307,10 @@ CONTAINS
                   IF (in_table) THEN
         CALL evaluate_short_radial_table(x, contracted%short_abscissae, contracted%short_moments(minimum_l(iset):, :, ipgf, iset), &
                                                       radial(minimum_l(iset):basis%lmax(iset)))
-                  ELSE IF (short) THEN
+                  ELSE
                      CALL radial_potential_short(radius, basis%zet(ipgf, iset), omega, &
                                                  series(:, ipgf, iset), short_series(:, ipgf, iset), &
                                                  radial(0:basis%lmax(iset)), radial_work, long_radial)
-                  ELSE
-                     CALL radial_potential(radius, basis%zet(ipgf, iset), cutoff, &
-                                           series(:, ipgf, iset), radial(0:basis%lmax(iset)), radial_work)
                   END IF
                   IF (factorized) THEN
                      DO l = 0, basis%lmax(iset)
@@ -2787,7 +2382,6 @@ CONTAINS
                  coefficient_matrix, nwork, 0.0_dp, values, SIZE(values, 1))
       IF (factorized) DEALLOCATE (angular_count, angular_term)
       DEALLOCATE (angular_used, minimum_l, mesh_channel, angular_index)
-      IF (.NOT. prepared) DEALLOCATE (series, short_series)
 
       CALL timestop(handle)
 
@@ -2820,7 +2414,7 @@ CONTAINS
                                                             ratio_power, root_x, upper_exp, x
 
       IF (exponent*radius**2 < 0.5_dp) THEN
-         CALL radial_potential(radius, exponent, 0.0_dp, short_coefficients, radial, radial_work)
+         CALL radial_potential(radius, exponent, short_coefficients, radial, radial_work)
          RETURN
       END IF
       beta_ratio = omega**2/(exponent + omega**2)
@@ -2843,8 +2437,8 @@ CONTAINS
          END DO
          RETURN
       END IF
-      CALL radial_potential(radius, exponent, 0.0_dp, coefficients, radial, radial_work)
-      CALL radial_potential(radius, beta, 0.0_dp, coefficients, long_radial(0:UBOUND(radial, 1)), radial_work)
+      CALL radial_potential(radius, exponent, coefficients, radial, radial_work)
+      CALL radial_potential(radius, beta, coefficients, long_radial(0:UBOUND(radial, 1)), radial_work)
       DO il = 0, UBOUND(radial, 1)
          radial(il) = radial(il) - beta_ratio**(REAL(il, dp) + 1.5_dp)*long_radial(il)
       END DO
@@ -2852,37 +2446,19 @@ CONTAINS
    END SUBROUTINE radial_potential_short
 
 ! **************************************************************************************************
-!> \brief Expand Eq. (2) in x=a r²: F=(2 pi/a) sum_n c_n x^n near the origin.
-!> \param exponent ...
-!> \param cutoff ...
+!> \brief Expand the full-Coulomb F of Eq. (2) in x=a r²: F=(2 pi/a) sum_n c_n x^n near the origin.
+!> The coefficients c_n are independent of the exponent a.
 !> \param coefficients ...
 ! **************************************************************************************************
-   SUBROUTINE origin_series(exponent, cutoff, coefficients)
-      REAL(dp), INTENT(IN)                               :: exponent, cutoff
+   SUBROUTINE origin_series(coefficients)
       REAL(dp), INTENT(OUT)                              :: coefficients(0:)
 
-      INTEGER                                            :: ij, ik, in
-      REAL(dp) :: factorial, gamma_p, integral, term, weight, y, terms(0:UBOUND(coefficients, 1))
+      INTEGER                                            :: ik, in
+      REAL(dp) :: factorial, weight, terms(0:UBOUND(coefficients, 1))
 
-      y = exponent*cutoff**2
       weight = 1.0_dp
       DO ik = 0, UBOUND(terms, 1)
-         gamma_p = 1.0_dp
-         IF (cutoff > 0.0_dp .AND. y < 200.0_dp) THEN
-            ! P(k+1,y) is a positive Poisson tail, avoiding subtraction near zero.
-            term = EXP(-y)
-            DO ij = 1, ik + 1
-               term = term*y/REAL(ij, dp)
-            END DO
-            integral = term
-            DO ij = ik + 2, ik + 1000
-               term = term*y/REAL(ij, dp)
-               integral = integral + term
-               IF (term < EPSILON(1.0_dp)*integral) EXIT
-            END DO
-            gamma_p = integral
-         END IF
-         terms(ik) = weight*gamma_p
+         terms(ik) = weight
          weight = weight*2.0_dp/REAL(2*ik + 3, dp)
       END DO
       DO in = 0, UBOUND(coefficients, 1)
@@ -2898,22 +2474,20 @@ CONTAINS
 
 ! **************************************************************************************************
 !> \brief Evaluate the radial derivatives in Eq. (1) by series or Taylor differentiation of (2).
+!> The full Coulomb kernel is used; radial_potential_short forms erfc(omega*r)/r from it.
 !> \param radius ...
 !> \param exponent ...
-!> \param cutoff ...
 !> \param coefficients ...
 !> \param radial ...
 !> \param radial_work ...
 ! **************************************************************************************************
-   SUBROUTINE radial_potential(radius, exponent, cutoff, coefficients, radial, radial_work)
-      REAL(dp), INTENT(IN)                               :: radius, exponent, cutoff, &
-                                                            coefficients(0:)
+   SUBROUTINE radial_potential(radius, exponent, coefficients, radial, radial_work)
+      REAL(dp), INTENT(IN)                               :: radius, exponent, coefficients(0:)
       REAL(dp), INTENT(OUT)                              :: radial(0:)
       TYPE(radial_work_type), INTENT(INOUT)              :: radial_work
 
       INTEGER                                            :: ij, il, in, lmax
-      REAL(dp)                                           :: displacement, factor, power, prefactor, &
-                                                            value, x
+      REAL(dp)                                           :: factor, power, prefactor, value, x
 
       lmax = UBOUND(radial, 1)
       x = exponent*radius**2
@@ -2934,34 +2508,17 @@ CONTAINS
          RETURN
       END IF
       radial_work%bracket(0:lmax) = 0.0_dp
-      DO ij = 1, 3
-         displacement = radius
-         factor = 2.0_dp
-         IF (ij > 1) THEN
-            IF (cutoff <= 0.0_dp) EXIT
-            displacement = radius + REAL(2*ij - 5, dp)*cutoff
-            factor = -1.0_dp
-         END IF
-         radial_work%gaussian(0) = EXP(-exponent*displacement**2)
-         IF (lmax > 0) radial_work%gaussian(1) = -2.0_dp*exponent*displacement*radial_work%gaussian(0)
-         DO in = 2, lmax
-            radial_work%gaussian(in) = -2.0_dp*exponent* &
-                                       (displacement*radial_work%gaussian(in - 1) + radial_work%gaussian(in - 2))/REAL(in, dp)
-         END DO
-         DO in = 1, lmax
-            radial_work%bracket(in) = radial_work%bracket(in) + &
-                                      factor*2.0_dp*SQRT(exponent/pi)*radial_work%gaussian(in - 1)/REAL(in, dp)
-         END DO
+      radial_work%gaussian(0) = EXP(-exponent*radius**2)
+      IF (lmax > 0) radial_work%gaussian(1) = -2.0_dp*exponent*radius*radial_work%gaussian(0)
+      DO in = 2, lmax
+         radial_work%gaussian(in) = -2.0_dp*exponent* &
+                                    (radius*radial_work%gaussian(in - 1) + radial_work%gaussian(in - 2))/REAL(in, dp)
       END DO
-      IF (cutoff <= 0.0_dp) THEN
-         radial_work%bracket(0) = 2.0_dp*ERF(SQRT(exponent)*radius)
-      ELSE IF (radius > cutoff) THEN
-         radial_work%bracket(0) = ERFC(SQRT(exponent)*(radius - cutoff)) + &
-                                  ERFC(SQRT(exponent)*(radius + cutoff)) - 2.0_dp*ERFC(SQRT(exponent)*radius)
-      ELSE
-         radial_work%bracket(0) = 2.0_dp*ERF(SQRT(exponent)*radius) - &
-                                  ERF(SQRT(exponent)*(radius - cutoff)) - ERF(SQRT(exponent)*(radius + cutoff))
-      END IF
+      DO in = 1, lmax
+         radial_work%bracket(in) = radial_work%bracket(in) + &
+                                   4.0_dp*SQRT(exponent/pi)*radial_work%gaussian(in - 1)/REAL(in, dp)
+      END DO
+      radial_work%bracket(0) = 2.0_dp*ERF(SQRT(exponent)*radius)
       prefactor = pi**1.5_dp/(2.0_dp*exponent**1.5_dp)
       radial_work%jet(0) = radial_work%bracket(0)/radius
       DO in = 1, lmax
@@ -3035,34 +2592,24 @@ CONTAINS
       REAL(dp), INTENT(IN)                               :: a, omega
       INTEGER, INTENT(IN)                                :: lmax
       REAL(dp), ALLOCATABLE, INTENT(OUT)                 :: table(:, :)
-      INTEGER, INTENT(IN), OPTIONAL                      :: ninterval
+      INTEGER, INTENT(IN)                                :: ninterval
       REAL(dp), INTENT(IN), OPTIONAL                     :: point_spacing, point_offset
       INTEGER, INTENT(IN), OPTIONAL                      :: last_moment
       REAL(dp), INTENT(IN), OPTIONAL                     :: abscissae(0:)
 
-      INTEGER                                            :: ig, ij, il, iter, ix, last, order, &
-                                                            quadrature_last
-      REAL(dp)                                           :: b, derivative, dz, factor, lower, &
-                                                            lower_exp, offset, p0, p1, p2, &
-                                                            ratio_power, root_x, spacing, t, t2, &
-                                                            term, upper_exp, w, width, x, z
+      INTEGER, PARAMETER                                 :: n_legendre = 64
 
-      CPASSERT(a > 0.0_dp .AND. omega > 0.0_dp .AND. lmax >= 0)
-      last = 25600
-      IF (PRESENT(ninterval)) last = ninterval
-      CPASSERT(last > 0)
+      INTEGER                                            :: ig, il, ix, last, order, quadrature_last
+      REAL(dp) :: b, factor, legendre_nodes(n_legendre), legendre_weights(n_legendre), lower, &
+         lower_exp, offset, ratio_power, root_x, spacing, t, t2, term, upper_exp, width, x
+
+      last = ninterval
       spacing = 0.02_dp
       offset = 0.0_dp
       order = lmax + 6
       IF (PRESENT(point_spacing)) spacing = point_spacing
       IF (PRESENT(point_offset)) offset = point_offset
       IF (PRESENT(last_moment)) order = last_moment
-      CPASSERT(spacing > 0.0_dp .AND. offset >= 0.0_dp .AND. order >= 0)
-      IF (PRESENT(abscissae)) THEN
-         CPASSERT(SIZE(abscissae) == last + 1)
-         CPASSERT(abscissae(0) >= 0.0_dp)
-         CPASSERT(ALL(abscissae(1:) > abscissae(:last - 1)))
-      END IF
       ALLOCATE (table(0:order, 0:last), source=0.0_dp)
       b = omega**2/(a + omega**2)
       lower = SQRT(b)
@@ -3075,29 +2622,14 @@ CONTAINS
             quadrature_last = INT(MIN(REAL(last, dp), MAX(0.0_dp, REAL(2*order + 8, dp)/spacing - offset)))
          END IF
       END IF
-      DO ig = 1, 64
-         z = COS(pi*(REAL(ig, dp) - 0.25_dp)/64.5_dp)
-         DO iter = 1, 30
-            p0 = 1.0_dp
-            p1 = z
-            DO ij = 2, 64
-               p2 = (REAL(2*ij - 1, dp)*z*p1 - REAL(ij - 1, dp)*p0)/REAL(ij, dp)
-               p0 = p1
-               p1 = p2
-            END DO
-            derivative = 64.0_dp*(z*p1 - p0)/(z*z - 1.0_dp)
-            dz = p1/derivative
-            z = z - dz
-            IF (ABS(dz) < 2.0E-16_dp) EXIT
-         END DO
-         IF (iter > 30) CPABORT('DLP radial quadrature failed')
-         w = 2.0_dp/((1.0_dp - z*z)*derivative**2)
-         t = lower + 0.5_dp*width*(1.0_dp + z)
+      CALL gauss_legendre(n_legendre, legendre_nodes, legendre_weights)
+      DO ig = 1, n_legendre
+         t = lower + 0.5_dp*width*(1.0_dp + legendre_nodes(ig))
          t2 = t*t
          DO ix = 0, quadrature_last
             x = spacing*(REAL(ix, dp) + offset)
             IF (PRESENT(abscissae)) x = abscissae(ix)
-            term = 0.5_dp*width*w*EXP(-x*t2)*2.0_dp*pi/a
+            term = 0.5_dp*width*legendre_weights(ig)*EXP(-x*t2)*2.0_dp*pi/a
             DO il = 0, UBOUND(table, 1)
                table(il, ix) = table(il, ix) + term
                term = term*t2
@@ -3202,11 +2734,11 @@ CONTAINS
          DO jdir = idir, 3
             ratio = metric(idir, jdir)/spacing
             IF (idir /= jdir) ratio = 2.0_dp*ratio
-            IF (ABS(ratio - ANINT(ratio)) > 1.0E-10_dp) RETURN
+            IF (ABS(ratio - ANINT(ratio)) > eps_integer) RETURN
          END DO
       END DO
       linear = 2.0_dp*MATMUL(TRANSPOSE(step), displacement)/spacing
-      IF (ANY(ABS(linear - ANINT(linear)) > 1.0E-10_dp)) RETURN
+      IF (ANY(ABS(linear - ANINT(linear)) > eps_integer)) RETURN
       offset = MODULO(SUM(displacement**2)/spacing, 1.0_dp)
       IF (1600.0_dp/spacing > REAL(HUGE(last) - 1, dp)) RETURN
       last = CEILING(1600.0_dp/spacing)

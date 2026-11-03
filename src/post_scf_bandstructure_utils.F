@@ -142,7 +142,7 @@ MODULE post_scf_bandstructure_utils
              eval_bandstructure_properties, cfm_ikp_from_fm_Gamma, &
              MIC_contribution_from_ikp, compute_xkp, kpoint_init_cell_index_simple, &
              rsmat_to_kp, soc, get_VBM_CBM_bandgaps, get_all_VBM_CBM_bandgaps, &
-             diagonalize_ks_matrix
+             diagonalize_ks_matrix, gw_flavour_label
 
    CHARACTER(len=*), PARAMETER, PRIVATE :: moduleN = 'post_scf_bandstructure_utils'
 
@@ -1246,13 +1246,7 @@ CONTAINS
 
       CALL timeset(routineN, handle)
 
-      SELECT CASE (bs_env%gw_flavour)
-      CASE (evGW0)
-         gw_label = "evGW0"
-      CASE DEFAULT
-         gw_label = "G0W0"
-      END SELECT
-      IF (bs_env%do_static_cohsex) gw_label = "static COHSEX"
+      gw_label = gw_flavour_label(bs_env)
 
       ! GW denotes the final result of the requested flavour.
       ! G0W0 denotes the first cycle, also retained separately during evGW0.
@@ -2744,13 +2738,7 @@ CONTAINS
 
       CALL timeset(routineN, handle)
 
-      SELECT CASE (bs_env%gw_flavour)
-      CASE (evGW0)
-         gw_label = "evGW0"
-      CASE DEFAULT
-         gw_label = "G0W0"
-      END SELECT
-      IF (bs_env%do_static_cohsex) gw_label = "static COHSEX"
+      gw_label = gw_flavour_label(bs_env)
 
       fname = "bandstructure_SCF_and_G0W0_plus_SOC"
       IF (PRESENT(file_name)) fname = file_name
@@ -3569,13 +3557,7 @@ CONTAINS
       CHARACTER(LEN=default_string_length)               :: gw_label
       REAL(KIND=dp)                                      :: gap, gap_scf
 
-      SELECT CASE (bs_env%gw_flavour)
-      CASE (evGW0)
-         gw_label = "evGW0"
-      CASE DEFAULT
-         gw_label = "G0W0"
-      END SELECT
-      IF (bs_env%do_static_cohsex) gw_label = "static COHSEX"
+      gw_label = gw_flavour_label(bs_env)
 
       gap = bs_env%band_edges_GW%IDBG
       gap_scf = bs_env%band_edges_scf%IDBG
@@ -3618,13 +3600,7 @@ CONTAINS
 
       CALL timeset(routineN, handle)
 
-      SELECT CASE (bs_env%gw_flavour)
-      CASE (evGW0)
-         gw_label = "evGW0"
-      CASE DEFAULT
-         gw_label = "G0W0"
-      END SELECT
-      IF (bs_env%do_static_cohsex) gw_label = "static COHSEX"
+      gw_label = gw_flavour_label(bs_env)
 
       n_mo = bs_env%n_ao
 
@@ -3856,4 +3832,24 @@ CONTAINS
       END IF
 
    END SUBROUTINE get_fermi_level_2c
+
+! **************************************************************************************************
+!> \brief Name of the GW flavour that was requested, for printing
+!> \param bs_env ...
+!> \return ...
+! **************************************************************************************************
+   FUNCTION gw_flavour_label(bs_env) RESULT(label)
+      TYPE(post_scf_bandstructure_type), POINTER         :: bs_env
+      CHARACTER(LEN=default_string_length)               :: label
+
+      SELECT CASE (bs_env%gw_flavour)
+      CASE (evGW0)
+         label = "evGW0"
+      CASE DEFAULT
+         label = "G0W0"
+      END SELECT
+      IF (bs_env%do_static_cohsex) label = "static COHSEX"
+
+   END FUNCTION gw_flavour_label
+
 END MODULE post_scf_bandstructure_utils

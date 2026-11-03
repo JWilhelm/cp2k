@@ -64,26 +64,26 @@
 "rirs-grid-rank-saturation-maximin-H2O.inp" = [{matcher = "RIRS_Grid", tol = 1e-12, ref = 280}]
 # Periodic full-k RI-RS GW: SCF mesh and a separate Gamma-X band path.
 "09_RIRS_G0W0_PBE_periodic_H2.inp"          = [
-  {matcher = "E_RIRS_HOMO", tol = 1e-4, ref = -6.409},
-  {matcher = "E_RIRS_LUMO", tol = 1e-4, ref = 20.813},
-  {matcher = "E_G0W0_indirect_gap", tol = 1e-4, ref = 27.222},
-  {matcher = "E_G0W0_direct_gap", tol = 1e-4, ref = 27.222}
+  {matcher = "E_RIRS_HOMO", tol = 1e-4, ref = -6.883},
+  {matcher = "E_RIRS_LUMO", tol = 1e-4, ref = 22.149},
+  {matcher = "E_G0W0_indirect_gap", tol = 1e-4, ref = 29.033},
+  {matcher = "E_G0W0_direct_gap", tol = 1e-4, ref = 29.033}
 ]
 # AUTO_RI trains on the shared SCF mesh before evaluating the separate band path.
 "10_RIRS_G0W0_PBE_periodic_AUTO_RI_H2.inp"  = [
   {matcher = "Auto_RI_Size", tol = 1e-12, ref = 10},
-  {matcher = "E_G0W0_indirect_gap", tol = 1e-4, ref = 32.541}
+  {matcher = "E_G0W0_indirect_gap", tol = 1e-4, ref = 27.265}
 ]
 # Fast 2D Ewald smoke tests with GAPW and GPW. The hBN inputs remain available
 # for targeted numerical validation outside the pdbg regression time budget.
 "13_RIRS_G0W0_PBE_2D_AUTO_RI_H2_GAPW.inp"   = [
   {matcher = "Auto_RI_Size", tol = 1e-12, ref = 2},
-  {matcher = "E_G0W0_indirect_gap", tol = 1e-3, ref = 21.150},
-  {matcher = "E_G0W0_direct_gap", tol = 1e-3, ref = 21.150}
+  {matcher = "E_G0W0_indirect_gap", tol = 1e-3, ref = 22.349},
+  {matcher = "E_G0W0_direct_gap", tol = 1e-3, ref = 23.245}
 ]
 "14_RIRS_G0W0_PBE_2D_AUTO_RI_H2_GPW.inp"    = [
   {matcher = "Auto_RI_Size", tol = 1e-12, ref = 2},
-  {matcher = "E_G0W0_indirect_gap", tol = 1e-3, ref = 21.161},
-  {matcher = "E_G0W0_direct_gap", tol = 1e-3, ref = 21.161}
+  {matcher = "E_G0W0_indirect_gap", tol = 1e-3, ref = 22.356},
+  {matcher = "E_G0W0_direct_gap", tol = 1e-3, ref = 23.252}
 ]
 #EOF

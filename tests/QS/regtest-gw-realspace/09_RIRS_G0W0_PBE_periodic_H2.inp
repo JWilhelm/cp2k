@@ -61,7 +61,7 @@
         FREQ_MAX_FIT 27.211
         NUM_TIME_FREQ_POINTS 32
         &RI_RS
-          TIKHONOV 1.0E-4
+          TIKHONOV 1.0E-8
           &GRID_OPTIMIZATION
             CUTOFF_ATOMIC_CLUSTER [angstrom] 2.5
             MAX_ITER 20

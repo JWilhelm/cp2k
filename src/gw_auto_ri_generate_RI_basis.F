@@ -26,7 +26,7 @@ MODULE gw_auto_ri_generate_RI_basis
                                               coulomb_integral_init,&
                                               coulomb_operator_type
    USE cp_blacs_env,                    ONLY: cp_blacs_env_type
-   USE cp_cfm_types,                    ONLY: cp_cfm_get_info
+   USE cp_cfm_types,                    ONLY: cp_cfm_get_submatrix
    USE cp_dbcsr_api,                    ONLY: &
         dbcsr_create, dbcsr_distribution_get, dbcsr_distribution_new, dbcsr_distribution_release, &
         dbcsr_distribution_type, dbcsr_finalize, dbcsr_put_block, dbcsr_release, dbcsr_type, &
@@ -87,6 +87,8 @@ MODULE gw_auto_ri_generate_RI_basis
    REAL(KIND=dp), PARAMETER :: relative_target_eigenval_threshold = 1.0E-12_dp
    REAL(KIND=dp), PARAMETER :: negative_eigenval_tolerance = 1.0E-10_dp
    REAL(KIND=dp), PARAMETER :: conditioned_negative_eigenval_tolerance = SQRT(EPSILON(1.0_dp))
+   ! Largest accepted deviation of the periodic AA metric from the identity after refinement.
+   REAL(KIND=dp), PARAMETER :: eps_metric_defect = 1.0E-7_dp
 
    PUBLIC :: generate_auto_ri_basis
 
@@ -1865,9 +1867,8 @@ CONTAINS
       COMPLEX(KIND=dp), ALLOCATABLE                      :: C_mu_n(:, :), D_empty(:, :), &
                                                             D_frontier(:, :), D_occ(:, :), &
                                                             D_occ_exchange(:, :)
-      INTEGER                                            :: first, handle, i, ikp, ispin, j, nAO, &
-                                                            nRI, nstates, rank, row
-      INTEGER, POINTER                                   :: cols(:), rows(:)
+      INTEGER                                            :: first, handle, i, ikp, ispin, nAO, nRI, &
+                                                            nstates, rank
       REAL(KIND=dp)                                      :: CBM, E_F, exchange_norm, &
                                                             transition_norm, VBM, weight
       REAL(KIND=dp), ALLOCATABLE                         :: B_exchange(:, :), B_spin(:, :), &
@@ -1883,7 +1884,6 @@ CONTAINS
       CPASSERT(SIZE(bs_env%cfm_mo_coeff_kp, 1) >= bs_env%nkp_scf_desymm)
       CPASSERT(SIZE(bs_env%eigenval_scf, 2) >= bs_env%nkp_scf_desymm)
 
-      NULLIFY (rows, cols)
       nAO = bs_env%sizes_AO(iatom)
       nRI = bs_env%auto_ri%sizes_ref_RI(iatom)
       nstates = bs_env%n_mo_retained
@@ -1915,18 +1915,8 @@ CONTAINS
          E_F = 0.5_dp*(VBM + CBM)
 
          DO ikp = 1, bs_env%nkp_scf_desymm
-            C_mu_n = z_zero
-            CALL cp_cfm_get_info(bs_env%cfm_mo_coeff_kp(ikp, ispin), &
-                                 row_indices=rows, col_indices=cols)
-            DO i = 1, SIZE(rows)
-               row = rows(i) - first + 1
-               IF (row < 1 .OR. row > nAO) CYCLE
-               DO j = 1, SIZE(cols)
-                  IF (cols(j) > nstates) CYCLE
-                  C_mu_n(row, cols(j)) = bs_env%cfm_mo_coeff_kp(ikp, ispin)%local_data(i, j)
-               END DO
-            END DO
-            CALL bs_env%para_env%sum(C_mu_n, root_rank)
+            CALL cp_cfm_get_submatrix(bs_env%cfm_mo_coeff_kp(ikp, ispin), C_mu_n, &
+                                      start_row=first, n_rows=nAO, n_cols=nstates)
             IF (bs_env%para_env%mepos == root_rank) THEN
                weights(:) = 1.0_dp/ABS(bs_env%eigenval_scf(1:nstates, ikp, ispin) - E_F)
                weight = bs_env%kpoints_scf_desymm%wkp(ikp)
@@ -1936,9 +1926,6 @@ CONTAINS
                   bs_env%auto_ri%occ_energy_window, &
                   D_occ, D_empty, D_occ_exchange, D_frontier)
             END IF
-            ! Bound rank run-ahead while the root accumulates the density matrices.
-            ! Otherwise repeated reductions can retain large MPI shared-memory buffers.
-            IF (MOD(ikp, 32) == 0 .OR. ikp == bs_env%nkp_scf_desymm) CALL bs_env%para_env%sync()
          END DO
          IF (bs_env%para_env%mepos == root_rank) THEN
             CALL contract_B_PQ_density(Int_3c_metric, D_empty, D_occ, B_spin)
@@ -2056,7 +2043,6 @@ CONTAINS
          INTENT(OUT)                                     :: eigenval
 
       CHARACTER(LEN=*), PARAMETER :: routineN = 'solve_AA_eigenproblem_periodic'
-      REAL(KIND=dp), PARAMETER                           :: eps_metric_defect = 1.0E-7_dp
 
       CHARACTER(LEN=256)                                 :: diagnostic
       INTEGER                                            :: handle, i, iortho, j, M_PQ_rank, n, nret

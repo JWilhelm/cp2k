@@ -64,9 +64,7 @@ MODULE gw_utils
    USE gw_auto_ri_generate_RI_basis,    ONLY: generate_auto_ri_basis
    USE gw_auto_ri_types,                ONLY: auto_ri_type
    USE gw_compute_V_and_W,              ONLY: get_V_tr_R
-   USE gw_ri_rs_small_cell_full_kp_utils,ONLY: get_gw_work,&
-                                              gwkp_type,&
-                                              prepare_ri_rs_gamma_correction
+   USE gw_ri_rs_small_cell_full_kp_utils,ONLY: prepare_ri_rs_gamma_correction
    USE gw_utils_compute_integrals,      ONLY: build_3c_integral_block
    USE gw_utils_fm,                     ONLY: cfm_contract_ABA,&
                                               fm_invert,&
@@ -107,7 +105,8 @@ MODULE gw_utils
    USE physcon,                         ONLY: angstrom,&
                                               evolt
    USE post_scf_bandstructure_types,    ONLY: post_scf_bandstructure_type
-   USE post_scf_bandstructure_utils,    ONLY: rsmat_to_kp
+   USE post_scf_bandstructure_utils,    ONLY: gw_flavour_label,&
+                                              rsmat_to_kp
    USE qs_energy_types,                 ONLY: qs_energy_type
    USE qs_environment_types,            ONLY: get_qs_env,&
                                               qs_env_part_release,&
@@ -301,25 +300,6 @@ CONTAINS
       CALL timestop(handle)
 
    END SUBROUTINE allocate_GW_eigenvalues
-
-! **************************************************************************************************
-!> \brief Name of the GW flavour that was requested, for printing
-!> \param bs_env ...
-!> \return ...
-! **************************************************************************************************
-   FUNCTION gw_flavour_label(bs_env) RESULT(label)
-      TYPE(post_scf_bandstructure_type), POINTER         :: bs_env
-      CHARACTER(LEN=default_string_length)               :: label
-
-      SELECT CASE (bs_env%gw_flavour)
-      CASE (evGW0)
-         label = "evGW0"
-      CASE DEFAULT
-         label = "G0W0"
-      END SELECT
-      IF (bs_env%do_static_cohsex) label = "static COHSEX"
-
-   END FUNCTION gw_flavour_label
 
 ! **************************************************************************************************
 !> \brief Store the QS environment parameters needed by GW.
@@ -903,7 +883,8 @@ CONTAINS
       IF (bs_env%input_regularization_RI >= 0.0_dp) THEN
          bs_env%regularization_RI = bs_env%input_regularization_RI
       ELSE IF (bs_env%gw_implementation == ri_rs_small_cell_full_kp) THEN
-         bs_env%regularization_RI = 1.0E-4_dp
+         ! periodic RI-RS: relative eigenvalue cutoff when inverting the RI metric M(q)
+         bs_env%regularization_RI = 1.0E-8_dp
       ELSE
          ! default case:
 
@@ -960,7 +941,12 @@ CONTAINS
             WRITE (u, FMT="(T2,A,ES38.1)") "Regularization parameter of minimax grids", &
                bs_env%regularization_minimax
          END IF
-         IF (bs_env%do_periodic) THEN
+         IF (bs_env%gw_implementation == ri_rs_small_cell_full_kp) THEN
+            WRITE (u, FMT="(T2,A,T72,A9)") "Coulomb matrix V(q) from", "Ewald sum"
+            IF (ALL(bs_env%periodic == [1, 1, 0])) THEN
+               WRITE (u, FMT="(T2,A,I43)") "Lattice sum size for 2D V(q=0) body:", bs_env%size_lattice_sum_V
+            END IF
+         ELSE IF (bs_env%do_periodic) THEN
             WRITE (u, FMT="(T2,A,I53)") "Lattice sum size for V(k):", bs_env%size_lattice_sum_V
          END IF
       END IF
@@ -1101,14 +1087,11 @@ CONTAINS
       TYPE(kpoint_type), POINTER                         :: kpoints_chi_eps_W
 
       CHARACTER(LEN=*), PARAMETER :: routineN = 'setup_kpoints_chi_eps_W'
-      REAL(KIND=dp), PARAMETER                           :: eps_kpoint_mesh = 1.0E-8_dp
 
-      INTEGER                                            :: handle, i_dim, ikp, n_dim, nkp, &
-                                                            nkp_extra, nkp_orig, u
-      INTEGER, DIMENSION(3)                              :: ikp_grid, nkp_grid, nkp_grid_extra, &
-                                                            periodic
-      LOGICAL, ALLOCATABLE                               :: seen_transfer_point(:, :, :)
-      REAL(KIND=dp)                                      :: exp_s_p, n_dim_inv, scaled_q
+      INTEGER                                            :: handle, i_dim, n_dim, nkp, nkp_extra, &
+                                                            nkp_orig, u
+      INTEGER, DIMENSION(3)                              :: nkp_grid, nkp_grid_extra, periodic
+      REAL(KIND=dp)                                      :: exp_s_p, n_dim_inv
 
       CALL timeset(routineN, handle)
 
@@ -1186,22 +1169,6 @@ CONTAINS
          nkp_orig = PRODUCT(nkp_grid)
          nkp_extra = 0
          CPASSERT(nkp_orig == bs_env%nkp_scf_desymm)
-         ! The analytic G=0 channel uses the complete half-shifted SCF quadrature.
-         ALLOCATE (seen_transfer_point(nkp_grid(1), nkp_grid(2), nkp_grid(3)), SOURCE=.FALSE.)
-         DO ikp = 1, nkp_orig
-            DO i_dim = 1, 3
-               scaled_q = bs_env%kpoints_scf_desymm%xkp(i_dim, ikp)*REAL(nkp_grid(i_dim), dp)
-               IF (periodic(i_dim) == 1) scaled_q = scaled_q - 0.5_dp
-               IF (ABS(scaled_q - REAL(NINT(scaled_q), dp)) > eps_kpoint_mesh) THEN
-                  CPABORT("Periodic RI-RS G=0 separation requires half-shifted periodic SCF k points")
-               END IF
-               ikp_grid(i_dim) = MODULO(NINT(scaled_q), nkp_grid(i_dim)) + 1
-            END DO
-            IF (seen_transfer_point(ikp_grid(1), ikp_grid(2), ikp_grid(3))) THEN
-               CPABORT("Periodic RI-RS GW requires unique SCF transfer points for W")
-            END IF
-            seen_transfer_point(ikp_grid(1), ikp_grid(2), ikp_grid(3)) = .TRUE.
-         END DO
       END IF
 
       nkp = nkp_orig + nkp_extra
@@ -3467,7 +3434,6 @@ CONTAINS
                                                             num_time_freq_points, u
       REAL(KIND=dp)                                      :: E_max, E_max_ispin, E_min, E_min_ispin, &
                                                             E_range, max_error_min
-      TYPE(gwkp_type), POINTER                           :: gwkp_env
 
       CALL timeset(routineN, handle)
 
@@ -3497,16 +3463,6 @@ CONTAINS
             E_max_ispin = MAXVAL(bs_env%eigenval_scf(n_top, :, ispin)) - &
                           MINVAL(bs_env%eigenval_scf(1, :, ispin))
          END SELECT
-         IF (bs_env%gw_implementation == ri_rs_small_cell_full_kp) THEN
-            ! The Gamma-correction and screening transitions use the SCF mesh, which need not
-            ! be contained in the requested band path (notably for shifted meshes).
-            CALL get_gw_work(bs_env, gwkp_env)
-            CPASSERT(ALLOCATED(gwkp_env%eigenvalues_G))
-            E_min_ispin = MIN(E_min_ispin, MINVAL(gwkp_env%eigenvalues_G(homo + 1, :, ispin)) - &
-                              MAXVAL(gwkp_env%eigenvalues_G(homo, :, ispin)))
-            E_max_ispin = MAX(E_max_ispin, MAXVAL(gwkp_env%eigenvalues_G(n_top, :, ispin)) - &
-                              MINVAL(gwkp_env%eigenvalues_G(1, :, ispin)))
-         END IF
          E_min = MIN(E_min, E_min_ispin)
          E_max = MAX(E_max, E_max_ispin)
       END DO

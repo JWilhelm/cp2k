@@ -37,6 +37,8 @@ MODULE kpoint_coulomb_2c
                                               twopi,&
                                               z_one,&
                                               z_zero
+   USE mathlib,                         ONLY: gauss_legendre,&
+                                              vector_product
    USE message_passing,                 ONLY: mp_para_env_type
    USE orbital_pointers,                ONLY: indco,&
                                               ncoset
@@ -698,11 +700,11 @@ CONTAINS
 !> \param V_k ...
 !> \param qs_env ...
 !> \param kpoints ...
-!> \param size_lattice_sum ...
+!> \param size_lattice_sum range of the direct lattice sum; not used with use_ewald
 !> \param basis_type ...
 !> \param ikp_start ...
 !> \param ikp_end ...
-!> \param use_ewald ...
+!> \param use_ewald replace the direct lattice sum by an Ewald summation
 ! **************************************************************************************************
    SUBROUTINE build_2c_coulomb_matrix_kp_small_cell(V_k, qs_env, kpoints, size_lattice_sum, &
                                                     basis_type, ikp_start, ikp_end, use_ewald)
@@ -898,7 +900,7 @@ CONTAINS
 !> \param atomic_kind_set ...
 !> \param basis_type ...
 !> \param cell ...
-!> \param ewald_omega ...
+!> \param ewald_omega erfc attenuation of the Ewald real-space sum; 0 for the plain Coulomb kernel
 ! **************************************************************************************************
    SUBROUTINE add_V_L(V_L, vec_L, n_atom, bf_start_from_atom, bf_end_from_atom, &
                       particle_set, qs_kind_set, atomic_kind_set, basis_type, cell, ewald_omega)
@@ -912,7 +914,7 @@ CONTAINS
       TYPE(atomic_kind_type), DIMENSION(:), POINTER      :: atomic_kind_set
       CHARACTER(LEN=*), INTENT(IN)                       :: basis_type
       TYPE(cell_type), POINTER                           :: cell
-      REAL(KIND=dp), INTENT(IN), OPTIONAL                :: ewald_omega
+      REAL(KIND=dp), INTENT(IN)                          :: ewald_omega
 
       CHARACTER(LEN=*), PARAMETER                        :: routineN = 'add_V_L'
 
@@ -957,18 +959,11 @@ CONTAINS
 
             ALLOCATE (V_L_ab(a_2 - a_1 + 1, b_2 - b_1 + 1))
 
-            IF (PRESENT(ewald_omega)) THEN
-               IF (ewald_omega > 0.0_dp) THEN
-                  CALL int_operators_r12_ab_shg(operator_verfc, V_L_ab, rab=rab_L, &
-                                                fba=basis_set_a, fbb=basis_set_b, &
-                                                scona_shg=contr_a, sconb_shg=contr_b, &
-                                                omega=ewald_omega, calculate_forces=.FALSE.)
-               ELSE
-                  CALL int_operators_r12_ab_shg(operator_coulomb, V_L_ab, rab=rab_L, &
-                                                fba=basis_set_a, fbb=basis_set_b, &
-                                                scona_shg=contr_a, sconb_shg=contr_b, &
-                                                calculate_forces=.FALSE.)
-               END IF
+            IF (ewald_omega > 0.0_dp) THEN
+               CALL int_operators_r12_ab_shg(operator_verfc, V_L_ab, rab=rab_L, &
+                                             fba=basis_set_a, fbb=basis_set_b, &
+                                             scona_shg=contr_a, sconb_shg=contr_b, &
+                                             omega=ewald_omega, calculate_forces=.FALSE.)
             ELSE
                CALL int_operators_r12_ab_shg(operator_coulomb, V_L_ab, rab=rab_L, &
                                              fba=basis_set_a, fbb=basis_set_b, &
@@ -1016,14 +1011,13 @@ CONTAINS
       TYPE(gto_basis_set_type), POINTER                  :: basis
 
       alpha_min = HUGE(0.0_dp)
-      lmax = 0
       DO ikind = 1, SIZE(qs_kinds)
          CALL get_qs_kind(qs_kinds(ikind), basis_set=basis, basis_type=basis_type)
          DO iset = 1, basis%nset
             alpha_min = MIN(alpha_min, MINVAL(basis%zet(1:basis%npgf(iset), iset)))
          END DO
-         lmax = MAX(lmax, MAXVAL(basis%lmax))
       END DO
+      lmax = basis_lmax(qs_kinds, basis_type)
       CPASSERT(alpha_min > 0.0_dp)
       omega = ewald_omega_default
       beta = 1.0_dp/(2.0_dp/alpha_min + 1.0_dp/omega**2)
@@ -1064,15 +1058,12 @@ CONTAINS
       INTEGER, INTENT(IN)                                :: bf_start(:), bf_end(:), ikp_start, &
                                                             ikp_end
 
-      REAL(KIND=dp), PARAMETER :: eps_reciprocal_norm_squared = 1.0E-24_dp
-
       COMPLEX(KIND=dp), ALLOCATABLE                      :: fourier_basis(:)
-      INTEGER                                            :: bounds(3), idim, ikind, ikp, ikp_local, &
-                                                            ix, iy, iz, lmax, n_bf
+      INTEGER                                            :: bounds(3), idim, ikp, ikp_local, ix, iy, &
+                                                            iz, n_bf
       REAL(KIND=dp)                                      :: cutoff, p(3), p2, prefactor, q(3), &
                                                             reciprocal(3, 3)
       TYPE(cell_type), POINTER                           :: cell
-      TYPE(gto_basis_set_type), POINTER                  :: basis
       TYPE(mp_para_env_type), POINTER                    :: para_env
       TYPE(particle_type), POINTER                       :: particles(:)
       TYPE(qs_kind_type), POINTER                        :: qs_kinds(:)
@@ -1086,12 +1077,7 @@ CONTAINS
          n_bf = SIZE(V_k, 1)
          ALLOCATE (fourier_basis(n_bf))
          reciprocal = twopi*TRANSPOSE(cell%h_inv)
-         lmax = 0
-         DO ikind = 1, SIZE(qs_kinds)
-            CALL get_qs_kind(qs_kinds(ikind), basis_set=basis, basis_type=basis_type)
-            lmax = MAX(lmax, MAXVAL(basis%lmax))
-         END DO
-         cutoff = 2.0_dp*omega*SQRT(ewald_tail_exponent + ewald_lmax_margin*lmax)
+         cutoff = 2.0_dp*omega*SQRT(ewald_tail_exponent + ewald_lmax_margin*basis_lmax(qs_kinds, basis_type))
          DO ikp = ikp_start, ikp_end
             IF (MODULO(ikp, para_env%num_pe) /= para_env%mepos) CYCLE
             ikp_local = (ikp - para_env%mepos)/para_env%num_pe + 1
@@ -1108,7 +1094,7 @@ CONTAINS
                      IF (p2 > cutoff**2) CYCLE
                      CALL gaussian_basis_fourier(p, particles, qs_kinds, cell, basis_type, &
                                                  bf_start, bf_end, fourier_basis)
-                     IF (p2 < eps_reciprocal_norm_squared) THEN
+                     IF (p2 <= 0.0_dp) THEN
                         prefactor = -pi/(cell%deth*omega**2)
                      ELSE
                         prefactor = fourpi*EXP(-p2/(4.0_dp*omega**2))/(cell%deth*p2)
@@ -1151,15 +1137,13 @@ CONTAINS
       COMPLEX(KIND=dp), ALLOCATABLE                      :: delta_minus(:), delta_plus(:), &
                                                             delta_sum(:), f_minus(:), f_plus(:), &
                                                             f_zero(:)
-      INTEGER                                            :: free_axis, ikind, ikp, ikp_local, inode, &
-                                                            ix, iy, lmax, n_bf, nx, ny, &
-                                                            periodic_axis(2)
+      INTEGER                                            :: free_axis, ikp, ikp_local, inode, ix, &
+                                                            iy, n_bf, nx, ny, periodic_axis(2)
       REAL(KIND=dp)                                      :: a1(3), a2(3), area, b1(3), b2(3), &
                                                             cutoff, factor, kz, nodes(n_kz), &
                                                             normal(3), p(3), pnorm, q(3), weight, &
                                                             weights(n_kz)
       TYPE(cell_type), POINTER                           :: cell
-      TYPE(gto_basis_set_type), POINTER                  :: basis
       TYPE(mp_para_env_type), POINTER                    :: para_env
       TYPE(particle_type), POINTER                       :: particles(:)
       TYPE(qs_kind_type), POINTER                        :: qs_kinds(:)
@@ -1171,34 +1155,26 @@ CONTAINS
       free_axis = FINDLOC(cell%perd, 0, DIM=1)
       a1 = cell%hmat(:, periodic_axis(1))
       a2 = cell%hmat(:, periodic_axis(2))
-      normal = [a1(2)*a2(3) - a1(3)*a2(2), &
-                a1(3)*a2(1) - a1(1)*a2(3), &
-                a1(1)*a2(2) - a1(2)*a2(1)]
+      normal = vector_product(a1, a2)
       area = NORM2(normal)
       CPASSERT(area > 0.0_dp)
       normal = normal/area
-      b1 = twopi*[a2(2)*normal(3) - a2(3)*normal(2), &
-                  a2(3)*normal(1) - a2(1)*normal(3), &
-                  a2(1)*normal(2) - a2(2)*normal(1)]/area
-      b2 = twopi*[normal(2)*a1(3) - normal(3)*a1(2), &
-                  normal(3)*a1(1) - normal(1)*a1(3), &
-                  normal(1)*a1(2) - normal(2)*a1(1)]/area
+      b1 = twopi*vector_product(a2, normal)/area
+      b2 = twopi*vector_product(normal, a1)/area
       n_bf = SIZE(V_k, 1)
       ALLOCATE (f_zero(n_bf), f_plus(n_bf), f_minus(n_bf), &
                 delta_plus(n_bf), delta_minus(n_bf), delta_sum(n_bf))
-      lmax = 0
-      DO ikind = 1, SIZE(qs_kinds)
-         CALL get_qs_kind(qs_kinds(ikind), basis_set=basis, basis_type=basis_type)
-         lmax = MAX(lmax, MAXVAL(basis%lmax))
-      END DO
-      cutoff = 2.0_dp*omega*SQRT(ewald_tail_exponent + ewald_lmax_margin*lmax)
-      CALL gauss_legendre_2d_kz(n_kz, cutoff, nodes, weights)
+      cutoff = 2.0_dp*omega*SQRT(ewald_tail_exponent + ewald_lmax_margin*basis_lmax(qs_kinds, basis_type))
+      ! Legendre nodes and weights on [0, cutoff] for the free momentum.
+      CALL gauss_legendre(n_kz, nodes, weights)
+      nodes(:) = 0.5_dp*cutoff*(nodes + 1.0_dp)
+      weights(:) = 0.5_dp*cutoff*weights
       DO ikp = ikp_start, ikp_end
          IF (MODULO(ikp, para_env%num_pe) /= para_env%mepos) CYCLE
          ikp_local = (ikp - para_env%mepos)/para_env%num_pe + 1
          IF (para_env%mepos == 0) ikp_local = ikp/para_env%num_pe
          q = kpoints%xkp(:, ikp)
-         IF (ABS(q(free_axis)) > 1.0E-10_dp) THEN
+         IF (ABS(q(free_axis)) > 0.0_dp) THEN
             CPABORT('2D reciprocal transfer has a nonzero nonperiodic component')
          END IF
          nx = CEILING(cutoff*NORM2(a1)/twopi + ABS(q(periodic_axis(1))))
@@ -1209,7 +1185,7 @@ CONTAINS
                    b2*(q(periodic_axis(2)) + REAL(iy, dp))
                pnorm = NORM2(p)
                IF (pnorm > cutoff) CYCLE
-               IF (pnorm < 1.0E-12_dp) THEN
+               IF (pnorm <= 0.0_dp) THEN
                   CPABORT('2D Coulomb at Gamma requires charge-channel separation')
                END IF
                CALL gaussian_basis_fourier(p, particles, qs_kinds, cell, basis_type, &
@@ -1249,40 +1225,25 @@ CONTAINS
    END SUBROUTINE add_ewald_reciprocal_2d
 
 ! **************************************************************************************************
-!> \brief Legendre nodes and weights on [0, upper] for the free momentum.
-!> \param n ...
-!> \param upper ...
-!> \param nodes ...
-!> \param weights ...
+!> \brief Largest angular momentum of a basis type over all kinds.
+!> \param qs_kinds ...
+!> \param basis_type ...
+!> \return ...
 ! **************************************************************************************************
-   SUBROUTINE gauss_legendre_2d_kz(n, upper, nodes, weights)
-      INTEGER, INTENT(IN)                                :: n
-      REAL(KIND=dp), INTENT(IN)                          :: upper
-      REAL(KIND=dp), INTENT(OUT)                         :: nodes(n), weights(n)
+   FUNCTION basis_lmax(qs_kinds, basis_type) RESULT(lmax)
+      TYPE(qs_kind_type), POINTER                        :: qs_kinds(:)
+      CHARACTER(LEN=*), INTENT(IN)                       :: basis_type
+      INTEGER                                            :: lmax
 
-      INTEGER                                            :: i, iter, j
-      REAL(KIND=dp)                                      :: delta, derivative, p, previous, root, &
-                                                            value
+      INTEGER                                            :: ikind
+      TYPE(gto_basis_set_type), POINTER                  :: basis
 
-      DO i = 1, n
-         root = COS(pi*(REAL(i, dp) - 0.25_dp)/(REAL(n, dp) + 0.5_dp))
-         DO iter = 1, 30
-            previous = 1.0_dp
-            p = root
-            DO j = 2, n
-               value = ((2*j - 1)*root*p - (j - 1)*previous)/REAL(j, dp)
-               previous = p
-               p = value
-            END DO
-            derivative = n*(root*p - previous)/(root*root - 1.0_dp)
-            delta = p/derivative
-            root = root - delta
-            IF (ABS(delta) < 1.0E-15_dp) EXIT
-         END DO
-         nodes(i) = 0.5_dp*upper*(root + 1.0_dp)
-         weights(i) = upper/((1.0_dp - root*root)*derivative**2)
+      lmax = 0
+      DO ikind = 1, SIZE(qs_kinds)
+         CALL get_qs_kind(qs_kinds(ikind), basis_set=basis, basis_type=basis_type)
+         lmax = MAX(lmax, MAXVAL(basis%lmax))
       END DO
-   END SUBROUTINE gauss_legendre_2d_kz
+   END FUNCTION basis_lmax
 
 ! **************************************************************************************************
 !> \brief ...

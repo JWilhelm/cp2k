@@ -20,7 +20,6 @@ MODULE gw_ri_rs_small_cell_full_kp_utils
                                               cp_blacs_env_type
    USE cp_cfm_basic_linalg,             ONLY: cp_cfm_add_on_diag,&
                                               cp_cfm_column_scale,&
-                                              cp_cfm_norm,&
                                               cp_cfm_scale_and_add,&
                                               cp_cfm_transpose,&
                                               cp_cfm_uplo_to_full
@@ -56,15 +55,13 @@ MODULE gw_ri_rs_small_cell_full_kp_utils
    USE input_constants,                 ONLY: do_potential_coulomb,&
                                               do_potential_short,&
                                               do_potential_truncated,&
-                                              evGW0,&
-                                              ri_rs_small_cell_full_kp
+                                              evGW0
    USE kinds,                           ONLY: dp,&
                                               int_8
    USE kpoint_coulomb_2c,               ONLY: build_2c_coulomb_matrix_kp_small_cell
    USE kpoint_k_r_trafo_simple,         ONLY: rs_to_kp
    USE kpoint_lattice_fft,              ONLY: cell_to_k_grid_fft,&
                                               k_grid_to_cell_execute,&
-                                              k_grid_to_cell_fft,&
                                               k_grid_to_cell_prepare,&
                                               k_grid_to_cell_release,&
                                               k_grid_to_cell_work_type
@@ -84,9 +81,9 @@ MODULE gw_ri_rs_small_cell_full_kp_utils
                                               twopi,&
                                               z_one,&
                                               z_zero
-   USE mathlib,                         ONLY: diag_complex,&
-                                              gemm_square,&
-                                              inv_3x3
+   USE mathlib,                         ONLY: gauss_legendre,&
+                                              inv_3x3,&
+                                              vector_product
    USE message_passing,                 ONLY: mp_comm_type,&
                                               mp_mem_avail_per_rank_GB,&
                                               mp_para_env_release,&
@@ -135,16 +132,14 @@ MODULE gw_ri_rs_small_cell_full_kp_utils
              prepare_ri_rs, prepare_ri_rs_gamma_correction, &
              get_gw_work, release_gw_work
 
-   REAL(KIND=dp), EXTERNAL :: zlange
-
-   ! Relative cutoff shared by the serial and grouped AUTO_RI metric inverses.
-   REAL(KIND=dp), PARAMETER :: eps_auto_ri_metric = 1.0E-12_dp
+   ! Below |a*L| = taylor_switch, radial phase moments use their Taylor series.
+   REAL(KIND=dp), PARAMETER :: taylor_switch = 1.0E-4_dp
 
    ! Blocking limits and named slots in the six existing CP2K matrix workspaces.
    INTEGER, PARAMETER :: column_block_cols = 32
    INTEGER, PARAMETER :: kpoint_batch_size = 8, pair_batch_size = 256
-   INTEGER, PARAMETER :: w_chi = 1, w_metric = 2, w_coulomb = 3, &
-                         w_tmp = 4, w_dielectric = 5, w_output = 6
+   INTEGER, PARAMETER :: w_chi = 1, w_metric = 2, w_tmp = 3, w_dielectric = 4, &
+                         w_output = 5, n_w_matrices = 5
 
    TYPE :: pair_transfer_plan_type
       INTEGER :: first_pair = 1, n_grid = 0, n_local = 0, n_q = 0, owner_offset = 0
@@ -306,9 +301,6 @@ CONTAINS
 
       CALL precompute_ri_rs_radii(bs_env%ri_rs, bs_env%basis_set_AO, bs_env%basis_set_RI, &
                                   bs_env%eps_filter, bs_env%unit_nr)
-      IF (bs_env%auto_ri%enabled) THEN
-         CALL optimize_periodic_auto_ri_metric(qs_env, bs_env)
-      END IF
       CALL setup_ri_rs_grid(bs_env, bs_env%ri_rs%grid_points)
       CALL compute_Z_lP_q(bs_env, bs_env%ri_rs%grid_points, &
                           Z_lP_q=gwkp_env%Z_lP_q, Z_lP_zero=gwkp_env%Z_lP_zero)
@@ -343,7 +335,11 @@ CONTAINS
 
       CALL timeset(routineN, handle)
 
-      CALL prepare_gw_mpi(bs_env, gwkp_env)
+      CPASSERT(.NOT. ASSOCIATED(gwkp_env%group_env))
+      gwkp_env%group_env => bs_env%para_env
+      CALL gwkp_env%group_env%retain()
+      gwkp_env%ngroups = 1
+      gwkp_env%my_group = 0
 
       CALL gamma_point_correction(bs_env, qs_env, gwkp_env)
       CPASSERT(.NOT. ALLOCATED(gwkp_env%band_orbitals))
@@ -366,57 +362,38 @@ CONTAINS
 
       CHARACTER(LEN=*), PARAMETER                        :: routineN = 'compute_W0'
 
-      COMPLEX(KIND=dp), ALLOCATABLE :: chi_k_w(:, :), eps_k_w(:, :), M_inv(:, :, :), &
-         MWM_k_w(:, :), V_sqrt(:, :, :), W_aux_local_q(:, :, :), W_k_w(:, :)
-      INTEGER :: handle, i_batch, i_group_size, i_t, ikp, ikp_local, j_w, max_condition_index(2), &
-         max_metric_chi_index(2), min_dielectric_index(2), my_qgroup, n_batch, n_qgroups, &
-         n_required_q, n_RI, nkp_local, own_q, phase_handle, q_ordinal, q_owner, q_root
+      COMPLEX(KIND=dp), ALLOCATABLE                      :: chi_k_w(:, :), MWM_k_w(:, :)
+      INTEGER :: handle, i_batch, i_group_size, ikp, ikp_local, j_w, my_qgroup, n_batch, &
+         n_qgroups, n_RI, nkp, nkp_local, own_q, phase_handle, q_group, q_owner, q_root
       INTEGER, ALLOCATABLE                               :: q_roots(:)
-      LOGICAL                                            :: grouped_q
-      REAL(KIND=dp) :: available_GB, max_tmp, metric_norm_max, metric_tmp, min_tmp, norm_work(1), &
-         phase_elapsed, phase_start, qnorm, required_bytes, step_start, W_aux_time_norm, Wnorm_tmp
-      REAL(KIND=dp), ALLOCATABLE :: dielectric_condition(:, :), dielectric_max_eigenvalue(:, :), &
-         dielectric_min_eigenvalue(:, :), frequency_elapsed(:), M_inv_norm(:), &
-         metric_chi_norm(:, :), time_weights(:), V_sqrt_norm(:), W_aux_norm(:)
+      REAL(KIND=dp)                                      :: available_GB, phase_elapsed, &
+                                                            phase_start, required_bytes, step_start
+      REAL(KIND=dp), ALLOCATABLE                         :: frequency_elapsed(:), time_weights(:)
       TYPE(cp_blacs_env_type), POINTER                   :: w_blacs
-      TYPE(cp_cfm_type)                                  :: w_matrices(6)
+      TYPE(cp_cfm_type)                                  :: w_matrices(n_w_matrices)
       TYPE(cp_fm_struct_type), POINTER                   :: w_matrix_struct
       TYPE(mp_para_env_type), POINTER                    :: w_group_env
 
       CALL timeset(routineN, handle)
 
-      CALL compute_gaussian_Minv_and_Vsqrt(bs_env, qs_env, gwkp_env%metric_coulomb_factor, M_inv, V_sqrt, metric_norm_max)
+      CALL compute_metric_coulomb_factor(bs_env, qs_env, gwkp_env%metric_coulomb_factor)
       phase_start = m_walltime()
       n_RI = bs_env%n_RI
-      IF (bs_env%nkp_chi_eps_W_orig_plus_extra /= bs_env%nkp_scf_desymm) THEN
+      nkp = bs_env%nkp_scf_desymm
+      IF (bs_env%nkp_chi_eps_W_orig_plus_extra /= nkp) THEN
          CPABORT("Periodic RI-RS GW requires the complete SCF transfer mesh")
       END IF
       IF (ANY(bs_env%nkp_grid_chi_eps_W_orig /= &
               bs_env%kpoints_scf_desymm%nkp_grid)) THEN
          CPABORT("Periodic RI-RS GW requires the SCF mesh dimensions for W")
       END IF
-      nkp_local = COUNT([(MODULO(ikp, bs_env%para_env%num_pe) == &
-                          bs_env%para_env%mepos, ikp=1, bs_env%nkp_scf_desymm)])
-      CPASSERT(SIZE(gwkp_env%chi_q_frequency) == nkp_local)
-      CPASSERT(n_RI == bs_env%n_RI)
-      nkp_local = SIZE(M_inv, 3)
-      CPASSERT(SIZE(gwkp_env%chi_q_frequency) == nkp_local)
-      DO ikp_local = 1, nkp_local
-         CPASSERT(ALLOCATED(gwkp_env%chi_q_frequency(ikp_local)%values))
-         CPASSERT(SIZE(gwkp_env%chi_q_frequency(ikp_local)%values, 1) == n_RI)
-         CPASSERT(SIZE(gwkp_env%chi_q_frequency(ikp_local)%values, 2) == n_RI)
-         IF (.NOT. (SIZE(gwkp_env%chi_q_frequency(ikp_local)%values, 3) == bs_env%num_time_freq_points)) THEN
-            CPABORT("Internal GW array shape mismatch")
-         END IF
-      END DO
-      n_required_q = bs_env%nkp_scf_desymm
-      CPASSERT(n_required_q > 0)
-      ! Six distributed solver matrices plus equal workspace reserve; owner buffers remain local.
+      nkp_local = SIZE(gwkp_env%metric_coulomb_factor, 3)
+      ! Distributed solver matrices plus equal workspace reserve; owner buffers remain local.
       ! Select the smallest feasible divisor, independently of the number of q points.
       CALL mp_mem_avail_per_rank_GB(bs_env%para_env, available_GB)
       DO i_group_size = 1, bs_env%para_env%num_pe
          IF (MODULO(bs_env%para_env%num_pe, i_group_size) /= 0) CYCLE
-         required_bytes = REAL(n_RI, dp)**2*(32.0_dp + 192.0_dp/REAL(i_group_size, dp)) + &
+         required_bytes = REAL(n_RI, dp)**2*(32.0_dp + 32.0_dp*n_w_matrices/REAL(i_group_size, dp)) + &
                           16.0_dp*REAL(n_RI, dp)*32.0_dp
          IF (required_bytes <= 0.5_dp*MAX(0.0_dp, available_GB)*1.0E9_dp) EXIT
       END DO
@@ -424,305 +401,101 @@ CONTAINS
          CPABORT('Insufficient node memory for the distributed GW W(q) solver')
       END IF
       n_qgroups = bs_env%para_env%num_pe/i_group_size
-      grouped_q = i_group_size > 1
-      IF (grouped_q) CALL grouped_w_partition(bs_env%para_env, n_qgroups, my_qgroup, q_roots)
+      CALL grouped_w_partition(bs_env%para_env, n_qgroups, my_qgroup, q_roots)
       IF (bs_env%unit_nr > 0) THEN
          WRITE (bs_env%unit_nr, '(T2,A,T72,I9)') 'GW W(q) MPI ranks per matrix:', i_group_size
       END IF
       ALLOCATE (gwkp_env%W_PQ_tau(nkp_local))
       ALLOCATE (time_weights(bs_env%num_time_freq_points))
-      IF (grouped_q) THEN
-         ALLOCATE (W_aux_local_q(0, 0, 0), eps_k_w(0, 0), W_k_w(0, 0))
-         IF (nkp_local > 0 .OR. bs_env%para_env%mepos == q_roots(my_qgroup + 1)) THEN
-            ALLOCATE (chi_k_w(n_RI, n_RI), MWM_k_w(n_RI, n_RI))
-         ELSE
-            ALLOCATE (chi_k_w(0, 0), MWM_k_w(0, 0))
-         END IF
-      ELSE IF (ALL(bs_env%periodic == [1, 1, 1])) THEN
-         ALLOCATE (W_aux_local_q(0, 0, 0), eps_k_w(0, 0), W_k_w(0, 0))
+      IF (nkp_local > 0 .OR. bs_env%para_env%mepos == q_roots(my_qgroup + 1)) THEN
          ALLOCATE (chi_k_w(n_RI, n_RI), MWM_k_w(n_RI, n_RI))
       ELSE
-         ALLOCATE (W_aux_local_q(n_RI, n_RI, nkp_local), SOURCE=z_zero)
-         ALLOCATE (chi_k_w(n_RI, n_RI), eps_k_w(n_RI, n_RI), &
-                   MWM_k_w(n_RI, n_RI), W_k_w(n_RI, n_RI))
+         ALLOCATE (chi_k_w(0, 0), MWM_k_w(0, 0))
       END IF
-      ALLOCATE (metric_chi_norm(bs_env%nkp_scf_desymm, bs_env%num_time_freq_points), &
-                dielectric_min_eigenvalue(bs_env%nkp_scf_desymm, bs_env%num_time_freq_points), &
-                dielectric_max_eigenvalue(bs_env%nkp_scf_desymm, bs_env%num_time_freq_points))
-      ALLOCATE (M_inv_norm(bs_env%nkp_scf_desymm), &
-                V_sqrt_norm(bs_env%nkp_scf_desymm), &
-                W_aux_norm(bs_env%nkp_scf_desymm))
-      metric_chi_norm = -HUGE(1.0_dp)
-      dielectric_min_eigenvalue = HUGE(1.0_dp)
-      dielectric_max_eigenvalue = -HUGE(1.0_dp)
-      M_inv_norm = 0.0_dp
-      V_sqrt_norm = 0.0_dp
-      W_aux_norm = 0.0_dp
 
-      IF (grouped_q) THEN
-         ALLOCATE (w_group_env)
-         CALL w_group_env%from_split(bs_env%para_env, my_qgroup)
-         CALL grouped_w_create(w_matrices, w_blacs, w_matrix_struct, w_group_env, n_RI)
-         ALLOCATE (frequency_elapsed(bs_env%num_time_freq_points), SOURCE=0.0_dp)
-         ! Each group holds one q at a time, reusing its factors for all frequencies.
-         ! Ordered world transfers also cover incomplete batches and idle groups.
-         DO i_batch = 1, n_required_q, n_qgroups
-            n_batch = MIN(n_qgroups, n_required_q - i_batch + 1)
-            own_q = 0
-            IF (my_qgroup < n_batch) own_q = i_batch + my_qgroup
-            DO q_ordinal = 0, n_batch - 1
-               ikp = i_batch + q_ordinal
-               q_root = q_roots(q_ordinal + 1)
-               q_owner = MODULO(ikp, bs_env%para_env%num_pe)
-               ikp_local = 1 + (ikp - 1)/bs_env%para_env%num_pe
-               DO i_t = 1, 2
-                  IF (bs_env%para_env%mepos == q_owner) THEN
-                     SELECT CASE (i_t)
-                     CASE (1)
-                        CALL grouped_w_copy_matrix(bs_env%para_env, n_RI, q_owner, q_root, &
-                                                   gwkp_env%metric_coulomb_factor(:, :, ikp_local), chi_k_w)
-                     CASE (2)
-                        CALL grouped_w_copy_matrix(bs_env%para_env, n_RI, q_owner, q_root, &
-                                                   V_sqrt(:, :, ikp_local), chi_k_w)
-                     END SELECT
-                  ELSE
-                     CALL grouped_w_copy_matrix(bs_env%para_env, n_RI, q_owner, q_root, MWM_k_w, chi_k_w)
-                  END IF
-                  IF (my_qgroup == q_ordinal) CALL grouped_w_set_factor(w_matrices, w_group_env, n_RI, i_t, chi_k_w)
-               END DO
-               IF (bs_env%para_env%mepos == q_owner) THEN
-                  M_inv_norm(ikp) = zlange('F', n_RI, n_RI, M_inv(:, :, ikp_local), n_RI, norm_work)
-                  V_sqrt_norm(ikp) = zlange('F', n_RI, n_RI, V_sqrt(:, :, ikp_local), n_RI, norm_work)
-                  ALLOCATE (gwkp_env%W_PQ_tau(ikp_local)%values( &
-                            n_RI, n_RI, bs_env%num_time_freq_points), SOURCE=z_zero)
-               END IF
-            END DO
-            DO j_w = 1, bs_env%num_time_freq_points
-               step_start = m_walltime()
-               CALL timeset('W_screening_on_W_KP', phase_handle)
-               time_weights(:) = bs_env%time_frequency_grid%cosine_frequency_to_time(:, j_w)
-               DO q_ordinal = 0, n_batch - 1
-                  ikp = i_batch + q_ordinal
-                  q_owner = MODULO(ikp, bs_env%para_env%num_pe)
-                  ikp_local = 1 + (ikp - 1)/bs_env%para_env%num_pe
-                  IF (bs_env%para_env%mepos == q_owner) THEN
-                     MWM_k_w(:, :) = gwkp_env%chi_q_frequency(ikp_local)%values(:, :, j_w)
-                  END IF
-                  CALL grouped_w_copy_matrix(bs_env%para_env, n_RI, q_owner, q_roots(q_ordinal + 1), MWM_k_w, chi_k_w)
-               END DO
-               IF (own_q > 0) THEN
-                  CALL grouped_w_solve(w_matrices, w_group_env, n_RI, 0, chi_k_w, &
-                                       bs_env%eps_eigval_mat_RI, MWM_k_w, metric_tmp, min_tmp, max_tmp, Wnorm_tmp, &
-                                       compute_screened_norm=j_w == 1)
-                  IF (w_group_env%mepos == 0) THEN
-                     metric_chi_norm(own_q, j_w) = metric_tmp
-                     dielectric_min_eigenvalue(own_q, j_w) = min_tmp
-                     dielectric_max_eigenvalue(own_q, j_w) = max_tmp
-                     IF (j_w == 1) W_aux_norm(own_q) = Wnorm_tmp
-                  END IF
-               END IF
-               DO q_ordinal = 0, n_batch - 1
-                  ikp = i_batch + q_ordinal
-                  q_owner = MODULO(ikp, bs_env%para_env%num_pe)
-                  ikp_local = 1 + (ikp - 1)/bs_env%para_env%num_pe
-                  CALL grouped_w_copy_matrix(bs_env%para_env, n_RI, q_roots(q_ordinal + 1), q_owner, MWM_k_w, chi_k_w)
-                  IF (bs_env%para_env%mepos == q_owner) THEN
-                     CALL accumulate_ri_q_cosine(gwkp_env%W_PQ_tau(ikp_local), chi_k_w, time_weights)
-                     IF (j_w == bs_env%num_time_freq_points) DEALLOCATE (gwkp_env%chi_q_frequency(ikp_local)%values)
-                  END IF
-               END DO
-               CALL timestop(phase_handle)
-               frequency_elapsed(j_w) = frequency_elapsed(j_w) + m_walltime() - step_start
-            END DO
-         END DO
-
-         DEALLOCATE (M_inv, V_sqrt)
-         DO j_w = 1, bs_env%num_time_freq_points
-            CALL bs_env%para_env%max(frequency_elapsed(j_w))
-            IF (bs_env%unit_nr > 0) THEN
-               WRITE (bs_env%unit_nr, '(T2,A,I3,A,I0,T56,A,T70,F10.1,A)') &
-                  'GW W(iω) point ', j_w, ' / ', bs_env%num_time_freq_points, &
-                  'Exec. time:', frequency_elapsed(j_w), ' s'
-               CALL m_flush(bs_env%unit_nr)
+      ALLOCATE (w_group_env)
+      CALL w_group_env%from_split(bs_env%para_env, my_qgroup)
+      CALL grouped_w_create(w_matrices, w_blacs, w_matrix_struct, w_group_env, n_RI)
+      ALLOCATE (frequency_elapsed(bs_env%num_time_freq_points), SOURCE=0.0_dp)
+      ! Each group holds one q at a time, reusing K(q) for all frequencies. Group MODULO(q, n_qgroups)
+      ! handles q, so with one rank per group the owner of q solves it without communication.
+      ! Ordered world transfers also cover incomplete batches and idle groups.
+      DO i_batch = 1, nkp, n_qgroups
+         n_batch = MIN(n_qgroups, nkp - i_batch + 1)
+         own_q = 0
+         DO ikp = i_batch, i_batch + n_batch - 1
+            q_group = MODULO(ikp, n_qgroups)
+            q_root = q_roots(q_group + 1)
+            q_owner = MODULO(ikp, bs_env%para_env%num_pe)
+            ikp_local = 1 + (ikp - 1)/bs_env%para_env%num_pe
+            IF (q_group == my_qgroup) own_q = ikp
+            IF (bs_env%para_env%mepos == q_owner) THEN
+               CALL grouped_w_copy_matrix(bs_env%para_env, n_RI, q_owner, q_root, &
+                                          gwkp_env%metric_coulomb_factor(:, :, ikp_local), chi_k_w)
+               ALLOCATE (gwkp_env%W_PQ_tau(ikp_local)%values( &
+                         n_RI, n_RI, bs_env%num_time_freq_points), SOURCE=z_zero)
+            ELSE
+               CALL grouped_w_copy_matrix(bs_env%para_env, n_RI, q_owner, q_root, MWM_k_w, chi_k_w)
+            END IF
+            IF (q_group == my_qgroup) THEN
+               CALL set_owner_matrix(w_matrices(w_metric), chi_k_w, w_group_env, 0, n_RI)
             END IF
          END DO
-         DEALLOCATE (frequency_elapsed)
-         CALL grouped_w_release(w_matrices, w_matrix_struct, w_blacs)
-         CALL mp_para_env_release(w_group_env)
-      ELSE IF (ALL(bs_env%periodic == [1, 1, 1])) THEN
-         ! One MPI rank per q uses the same filtered dielectric inverse as larger groups.
-         ! Reuse its factors across frequencies; different local q counts need no collective.
-         ALLOCATE (w_group_env)
-         CALL w_group_env%from_split(bs_env%para_env, bs_env%para_env%mepos)
-         CALL grouped_w_create(w_matrices, w_blacs, w_matrix_struct, w_group_env, n_RI)
-         ALLOCATE (frequency_elapsed(bs_env%num_time_freq_points), SOURCE=0.0_dp)
-         ikp_local = 0
-         DO ikp = 1, bs_env%nkp_scf_desymm
-            IF (MODULO(ikp, bs_env%para_env%num_pe) /= bs_env%para_env%mepos) CYCLE
-            ikp_local = ikp_local + 1
-            CALL grouped_w_set_factor(w_matrices, w_group_env, n_RI, 1, gwkp_env%metric_coulomb_factor(:, :, ikp_local))
-            CALL grouped_w_set_factor(w_matrices, w_group_env, n_RI, 2, V_sqrt(:, :, ikp_local))
-            M_inv_norm(ikp) = zlange('F', n_RI, n_RI, M_inv(:, :, ikp_local), n_RI, norm_work)
-            V_sqrt_norm(ikp) = zlange('F', n_RI, n_RI, V_sqrt(:, :, ikp_local), n_RI, norm_work)
-            ALLOCATE (gwkp_env%W_PQ_tau(ikp_local)%values(n_RI, n_RI, bs_env%num_time_freq_points), SOURCE=z_zero)
-            DO j_w = 1, bs_env%num_time_freq_points
-               step_start = m_walltime()
-               CALL timeset('W_screening_on_W_KP', phase_handle)
-               chi_k_w(:, :) = gwkp_env%chi_q_frequency(ikp_local)%values(:, :, j_w)
-               CALL grouped_w_solve(w_matrices, w_group_env, n_RI, 0, chi_k_w, &
-                                    bs_env%eps_eigval_mat_RI, MWM_k_w, metric_tmp, min_tmp, max_tmp, Wnorm_tmp, &
-                                    compute_screened_norm=j_w == 1)
-               metric_chi_norm(ikp, j_w) = metric_tmp
-               dielectric_min_eigenvalue(ikp, j_w) = min_tmp
-               dielectric_max_eigenvalue(ikp, j_w) = max_tmp
-               IF (j_w == 1) W_aux_norm(ikp) = Wnorm_tmp
-               CALL timestop(phase_handle)
-               CALL timeset('W_response_iomega_2_tau', phase_handle)
-               CALL accumulate_ri_q_cosine(gwkp_env%W_PQ_tau(ikp_local), MWM_k_w, &
-                                           bs_env%time_frequency_grid%cosine_frequency_to_time(:, j_w))
-               CALL timestop(phase_handle)
-               frequency_elapsed(j_w) = frequency_elapsed(j_w) + m_walltime() - step_start
-            END DO
-            DEALLOCATE (gwkp_env%chi_q_frequency(ikp_local)%values)
-         END DO
-         CPASSERT(ikp_local == nkp_local)
-         ! Reduce timings only after unequal local q loops have finished on every rank.
-         DO j_w = 1, bs_env%num_time_freq_points
-            CALL bs_env%para_env%max(frequency_elapsed(j_w))
-            IF (bs_env%unit_nr > 0) THEN
-               WRITE (bs_env%unit_nr, '(T2,A,I3,A,I0,T56,A,T70,F10.1,A)') &
-                  'GW W(iω) point ', j_w, ' / ', bs_env%num_time_freq_points, &
-                  'Exec. time:', frequency_elapsed(j_w), ' s'
-               CALL m_flush(bs_env%unit_nr)
-            END IF
-         END DO
-         DEALLOCATE (frequency_elapsed)
-         CALL grouped_w_release(w_matrices, w_matrix_struct, w_blacs)
-         CALL mp_para_env_release(w_group_env)
-      ELSE
          DO j_w = 1, bs_env%num_time_freq_points
             step_start = m_walltime()
-
             CALL timeset('W_screening_on_W_KP', phase_handle)
-            ikp_local = 0
-            DO ikp = 1, bs_env%nkp_scf_desymm
-               IF (MODULO(ikp, bs_env%para_env%num_pe) /= bs_env%para_env%mepos) CYCLE
-               ikp_local = ikp_local + 1
-               chi_k_w(:, :) = gwkp_env%chi_q_frequency(ikp_local)%values(:, :, j_w)
-               CALL power(chi_k_w, 1.0_dp, bs_env%eps_eigval_mat_RI)
-               CALL gemm_square(gwkp_env%metric_coulomb_factor(:, :, ikp_local), 'C', chi_k_w, 'N', &
-                                gwkp_env%metric_coulomb_factor(:, :, ikp_local), 'N', eps_k_w)
-               metric_chi_norm(ikp, j_w) = zlange('F', n_RI, n_RI, eps_k_w, n_RI, norm_work)
-               CALL shift_diagonal(eps_k_w, 1.0_dp)
-               CALL power(eps_k_w, -1.0_dp, 0.0_dp, &
-                          min_ev=dielectric_min_eigenvalue(ikp, j_w), &
-                          max_ev=dielectric_max_eigenvalue(ikp, j_w))
-               CALL shift_diagonal(eps_k_w, -1.0_dp)
-               CALL gemm_square(V_sqrt(:, :, ikp_local), 'N', eps_k_w, 'N', &
-                                V_sqrt(:, :, ikp_local), 'C', W_k_w)
-               W_aux_local_q(:, :, ikp_local) = W_k_w
-               IF (j_w == 1) THEN
-                  M_inv_norm(ikp) = zlange('F', n_RI, n_RI, M_inv(:, :, ikp_local), n_RI, norm_work)
-                  V_sqrt_norm(ikp) = zlange('F', n_RI, n_RI, V_sqrt(:, :, ikp_local), n_RI, norm_work)
-                  W_aux_norm(ikp) = zlange('F', n_RI, n_RI, W_k_w, n_RI, norm_work)
+            time_weights(:) = bs_env%time_frequency_grid%cosine_frequency_to_time(:, j_w)
+            DO ikp = i_batch, i_batch + n_batch - 1
+               q_owner = MODULO(ikp, bs_env%para_env%num_pe)
+               ikp_local = 1 + (ikp - 1)/bs_env%para_env%num_pe
+               IF (bs_env%para_env%mepos == q_owner) THEN
+                  MWM_k_w(:, :) = gwkp_env%chi_q_frequency(ikp_local)%values(:, :, j_w)
+               END IF
+               CALL grouped_w_copy_matrix(bs_env%para_env, n_RI, q_owner, &
+                                          q_roots(MODULO(ikp, n_qgroups) + 1), MWM_k_w, chi_k_w)
+            END DO
+            IF (own_q > 0) THEN
+               CALL grouped_w_solve(w_matrices, w_group_env, n_RI, 0, chi_k_w, &
+                                    bs_env%eps_eigval_mat_RI, MWM_k_w)
+            END IF
+            CALL timestop(phase_handle)
+            CALL timeset('W_response_iomega_2_tau', phase_handle)
+            DO ikp = i_batch, i_batch + n_batch - 1
+               q_owner = MODULO(ikp, bs_env%para_env%num_pe)
+               ikp_local = 1 + (ikp - 1)/bs_env%para_env%num_pe
+               CALL grouped_w_copy_matrix(bs_env%para_env, n_RI, q_roots(MODULO(ikp, n_qgroups) + 1), &
+                                          q_owner, MWM_k_w, chi_k_w)
+               IF (bs_env%para_env%mepos == q_owner) THEN
+                  CALL accumulate_ri_q_cosine(gwkp_env%W_PQ_tau(ikp_local), chi_k_w, time_weights)
+                  IF (j_w == bs_env%num_time_freq_points) DEALLOCATE (gwkp_env%chi_q_frequency(ikp_local)%values)
                END IF
             END DO
-            CPASSERT(ikp_local == nkp_local)
             CALL timestop(phase_handle)
-
-            CALL timeset('W_response_iomega_2_tau', phase_handle)
-            ikp_local = 0
-            DO ikp = 1, bs_env%nkp_scf_desymm
-               IF (MODULO(ikp, bs_env%para_env%num_pe) /= bs_env%para_env%mepos) CYCLE
-               ikp_local = ikp_local + 1
-               CALL gemm_square(M_inv(:, :, ikp_local), 'N', &
-                                W_aux_local_q(:, :, ikp_local), 'N', &
-                                M_inv(:, :, ikp_local), 'N', MWM_k_w)
-               IF (j_w == 1) ALLOCATE (gwkp_env%W_PQ_tau(ikp_local)%values( &
-                                       n_RI, n_RI, bs_env%num_time_freq_points), SOURCE=z_zero)
-               CALL accumulate_ri_q_cosine(gwkp_env%W_PQ_tau(ikp_local), MWM_k_w, &
-                                           bs_env%time_frequency_grid%cosine_frequency_to_time(:, j_w))
-               IF (j_w == bs_env%num_time_freq_points) DEALLOCATE (gwkp_env%chi_q_frequency(ikp_local)%values)
-            END DO
-            CPASSERT(ikp_local == nkp_local)
-            CALL timestop(phase_handle)
-            IF (bs_env%unit_nr > 0) THEN
-               WRITE (bs_env%unit_nr, '(T2,A,I3,A,I3,T53,A,T70,F10.1,A)') &
-                  'GW W(iω) point ', j_w, ' / ', bs_env%num_time_freq_points, &
-                  'Exec. time:', m_walltime() - step_start, ' s'
-               CALL m_flush(bs_env%unit_nr)
-            END IF
+            frequency_elapsed(j_w) = frequency_elapsed(j_w) + m_walltime() - step_start
          END DO
+      END DO
+      DO j_w = 1, bs_env%num_time_freq_points
+         CALL bs_env%para_env%max(frequency_elapsed(j_w))
+         IF (bs_env%unit_nr > 0) THEN
+            WRITE (bs_env%unit_nr, '(T2,A,I3,A,I0,T56,A,T70,F10.1,A)') &
+               'GW W(iω) point ', j_w, ' / ', bs_env%num_time_freq_points, &
+               'Exec. time:', frequency_elapsed(j_w), ' s'
+            CALL m_flush(bs_env%unit_nr)
+         END IF
+      END DO
+      DEALLOCATE (frequency_elapsed)
 
-      END IF
+      CALL grouped_w_release(w_matrices, w_matrix_struct, w_blacs)
+      CALL mp_para_env_release(w_group_env)
 
       ! Release frequency-domain matrices after constructing W(q,tau).
-      DEALLOCATE (chi_k_w, eps_k_w, MWM_k_w, W_aux_local_q, W_k_w)
-      IF (.NOT. grouped_q) DEALLOCATE (M_inv, V_sqrt)
-      W_aux_time_norm = 0.0_dp
-      ikp_local = 0
-      DO ikp = 1, bs_env%nkp_scf_desymm
-         IF (MODULO(ikp, bs_env%para_env%num_pe) /= bs_env%para_env%mepos) CYCLE
-         ikp_local = ikp_local + 1
-         W_aux_time_norm = W_aux_time_norm + &
-                           SUM(ABS(gwkp_env%W_PQ_tau(ikp_local)%values(:, :, 1))**2)
-      END DO
-      CALL bs_env%para_env%sum(W_aux_time_norm)
-      CALL bs_env%para_env%max(metric_chi_norm)
-      CALL bs_env%para_env%min(dielectric_min_eigenvalue)
-      CALL bs_env%para_env%max(dielectric_max_eigenvalue)
-      CALL bs_env%para_env%sum(M_inv_norm)
-      CALL bs_env%para_env%sum(V_sqrt_norm)
-      CALL bs_env%para_env%sum(W_aux_norm)
-      IF (ALL(bs_env%periodic == [1, 1, 0]) .AND. bs_env%unit_nr > 0) THEN
-         DO ikp = 1, bs_env%nkp_scf_desymm
-            qnorm = NORM2(MATMUL(twopi*TRANSPOSE(inv_3x3(bs_env%hmat)), &
-                                 bs_env%kpoints_chi_eps_W%xkp(:, ikp)))
-            WRITE (bs_env%unit_nr, '(T2,A,I5,3ES16.7)') &
-               'GW2D_DIAG_Q_WC ', ikp, qnorm, W_aux_norm(ikp), V_sqrt_norm(ikp)
-         END DO
-      END IF
-      ALLOCATE (dielectric_condition, MOLD=metric_chi_norm)
-      dielectric_condition(:, :) = dielectric_max_eigenvalue/dielectric_min_eigenvalue
-      max_metric_chi_index = MAXLOC(metric_chi_norm)
-      min_dielectric_index = MINLOC(dielectric_min_eigenvalue)
-      max_condition_index = MAXLOC(dielectric_condition)
-      IF (bs_env%unit_nr > 0) THEN
-         WRITE (bs_env%unit_nr, '(T2,A,T73,ES9.1)') &
-            'GW response W_PQ(q,iτ_1) norm', &
-            SQRT(W_aux_time_norm)
-         WRITE (bs_env%unit_nr, '(T2,A,T72,ES9.1)') &
-            'GW maximum M_PQ(q) norm:', metric_norm_max
-         IF (grouped_q .OR. ALL(bs_env%periodic == [1, 1, 1])) THEN
-            WRITE (bs_env%unit_nr, '(T2,A,T74,ES9.1)') &
-               'GW lower bound on eigenvalues of ε_PQ(q,iω):', &
-               dielectric_min_eigenvalue(min_dielectric_index(1), min_dielectric_index(2))
-            WRITE (bs_env%unit_nr, '(T2,A,T74,ES9.1)') &
-               'GW upper bound on condition number of ε_PQ(q,iω):', &
-               dielectric_condition(max_condition_index(1), max_condition_index(2))
-         ELSE
-            WRITE (bs_env%unit_nr, '(T2,A,T74,ES9.1)') &
-               'GW minimum absolute eigenvalue of ε_PQ(q,iω):', &
-               dielectric_min_eigenvalue(min_dielectric_index(1), min_dielectric_index(2))
-            WRITE (bs_env%unit_nr, '(T2,A,T74,ES9.1)') &
-               'GW maximum condition number of ε_PQ(q,iω):', &
-               dielectric_condition(max_condition_index(1), max_condition_index(2))
-         END IF
-         WRITE (bs_env%unit_nr, '(T2,A,T73,ES9.1)') &
-            'GW ||M^-1||_F at maximal transformed χ q:', M_inv_norm(max_metric_chi_index(1))
-         WRITE (bs_env%unit_nr, '(T2,A,T73,ES9.1)') &
-            'GW ||V^1/2||_F at maximal transformed χ q:', V_sqrt_norm(max_metric_chi_index(1))
-         WRITE (bs_env%unit_nr, '(T2,A,T73,ES9.1)') &
-            'GW ||W^c||_F at maximal transformed χ q:', W_aux_norm(max_metric_chi_index(1))
-      END IF
+      DEALLOCATE (chi_k_w, MWM_k_w)
 
       CPASSERT(gwkp_env%ngroups == 1 .AND. gwkp_env%my_group == 0)
       CPASSERT(gwkp_env%group_env%num_pe == bs_env%para_env%num_pe)
       CPASSERT(gwkp_env%group_env%mepos == bs_env%para_env%mepos)
 
-      DEALLOCATE (dielectric_condition, dielectric_max_eigenvalue, &
-                  dielectric_min_eigenvalue, metric_chi_norm, M_inv_norm, &
-                  time_weights, V_sqrt_norm, W_aux_norm)
+      DEALLOCATE (time_weights)
       phase_elapsed = m_walltime() - phase_start
       CALL bs_env%para_env%max(phase_elapsed)
       IF (bs_env%unit_nr > 0) THEN
@@ -759,129 +532,6 @@ CONTAINS
       CALL timestop(handle)
 
    END SUBROUTINE compute_Sigma_x
-
-! **************************************************************************************************
-!> \brief Improve the conditioning of one common atom-local RI representation on all transfer points.
-!> This changes coordinates inside each selected local RI subspace, so its AA fit is unchanged.
-!> \param qs_env ...
-!> \param bs_env ...
-! **************************************************************************************************
-   SUBROUTINE optimize_periodic_auto_ri_metric(qs_env, bs_env)
-      TYPE(qs_environment_type), POINTER                 :: qs_env
-      TYPE(post_scf_bandstructure_type), POINTER         :: bs_env
-
-      CHARACTER(LEN=*), PARAMETER :: routineN = 'optimize_periodic_auto_ri_metric'
-
-      COMPLEX(KIND=dp), ALLOCATABLE                      :: metric_base(:, :, :), &
-                                                            metric_ref(:, :, :), transform(:, :)
-      INTEGER                                            :: handle, iatom, ikp, ilocal, irow, istep, &
-                                                            itrial, jrow, ncol, nopt, nq, &
-                                                            nq_local, nref, nrow
-      INTEGER, ALLOCATABLE                               :: metric_cells(:, :)
-      REAL(KIND=dp)                                      :: best_worst, elapsed, grad_norm, &
-                                                            objective, slope, step, &
-                                                            trial_objective, trial_worst, worst
-      REAL(KIND=dp), ALLOCATABLE                         :: best(:, :), coefficients(:, :), &
-                                                            gradient(:, :), trial(:, :), &
-                                                            trial_gradient(:, :)
-      TYPE(cp_fm_type), ALLOCATABLE                      :: fm_metric(:)
-      TYPE(mp_para_env_type), POINTER                    :: auto_group
-
-      NULLIFY (auto_group)
-
-      CALL timeset(routineN, handle)
-
-      elapsed = m_walltime()
-      IF (.NOT. bs_env%do_periodic) THEN
-         CPABORT('RI metric optimization requires periodic AUTO_RI')
-      END IF
-      IF (.NOT. bs_env%auto_ri%enabled .OR. .NOT. bs_env%auto_ri%ready) THEN
-         CPABORT('RI metric optimization requires initialized AUTO_RI')
-      END IF
-      nq = bs_env%nkp_chi_eps_W_orig_plus_extra
-      nopt = bs_env%n_RI
-      nref = SUM(bs_env%auto_ri%sizes_ref_RI)
-      IF (nq < 1 .OR. nopt < 1 .OR. nref < nopt) THEN
-         CPABORT('Invalid periodic RI metric optimization dimensions')
-      END IF
-      nq_local = COUNT([(MODULO(ikp, bs_env%para_env%num_pe) == &
-                         bs_env%para_env%mepos, ikp=1, nq)])
-      ALLOCATE (metric_ref(nref, nref, nq_local), metric_base(nopt, nopt, nq_local))
-      CALL assemble_AA_contraction(bs_env, transform)
-      CALL build_ri_2c_lattice(fm_metric, metric_cells, bs_env%ri_metric, &
-                               0.0_dp, bs_env, qs_env, .TRUE.)
-      CALL ri_2c_lattice_to_owned_q(fm_metric, metric_cells, &
-                                    bs_env%kpoints_chi_eps_W%xkp(1:3, 1:nq), metric_ref)
-      CALL cp_fm_release(fm_metric)
-      DEALLOCATE (metric_cells)
-      ilocal = 0
-      DO ikp = 1, nq
-         IF (MODULO(ikp, bs_env%para_env%num_pe) /= bs_env%para_env%mepos) CYCLE
-         ilocal = ilocal + 1
-         metric_base(:, :, ilocal) = MATMUL(CONJG(TRANSPOSE(transform)), &
-                                            MATMUL(metric_ref(:, :, ilocal), transform))
-         metric_base(:, :, ilocal) = 0.5_dp*(metric_base(:, :, ilocal) + &
-                                             CONJG(TRANSPOSE(metric_base(:, :, ilocal))))
-      END DO
-      DEALLOCATE (metric_ref)
-
-      CALL prepare_auto_ri_q_group(bs_env, metric_base, auto_group)
-
-      ALLOCATE (coefficients(nopt, nopt), best(nopt, nopt), &
-                trial(nopt, nopt), gradient(nopt, nopt), trial_gradient(nopt, nopt))
-      coefficients(:, :) = 0.0_dp
-      DO irow = 1, nopt
-         coefficients(irow, irow) = 1.0_dp
-      END DO
-      CALL evaluate_auto_ri_condition(bs_env, metric_base, coefficients, &
-                                      objective, worst, gradient, auto_group)
-      best(:, :) = coefficients
-      best_worst = worst
-      DO istep = 1, 30
-         grad_norm = NORM2(gradient)
-         IF (grad_norm < 1.0E-8_dp) EXIT
-         step = 1.0_dp/MAX(1.0_dp, MAXVAL(ABS(gradient)))
-         slope = SUM(gradient*gradient)
-         DO itrial = 1, 12
-            trial(:, :) = coefficients - step*gradient
-            CALL evaluate_auto_ri_condition(bs_env, metric_base, trial, &
-                                            trial_objective, trial_worst, trial_gradient, auto_group)
-            IF (trial_objective <= objective - 1.0E-4_dp*step*slope) EXIT
-            step = 0.5_dp*step
-         END DO
-         IF (itrial > 12) EXIT
-         coefficients(:, :) = trial
-         gradient(:, :) = trial_gradient
-         objective = trial_objective
-         worst = trial_worst
-         IF (worst < best_worst) THEN
-            best_worst = worst
-            best(:, :) = coefficients
-         END IF
-      END DO
-      IF (bs_env%unit_nr > 0) WRITE (bs_env%unit_nr, '(T2,A,T72,ES9.1E2)') &
-         'Completed Auto RI, max. condition number of M_PQ metric matrix:', best_worst
-
-      irow = 1
-      DO iatom = 1, bs_env%n_atom
-         nrow = bs_env%auto_ri%sizes_ref_RI(iatom)
-         ncol = bs_env%auto_ri%sizes_opt_RI(iatom)
-         jrow = bs_env%auto_ri%U_Pp_atom_offset(iatom)
-         bs_env%auto_ri%U_Pp_atom(jrow:jrow + nrow*ncol - 1) = &
-            RESHAPE(MATMUL(RESHAPE(bs_env%auto_ri%U_Pp_atom( &
-                                   jrow:jrow + nrow*ncol - 1), [nrow, ncol]), &
-                           best(irow:irow + ncol - 1, irow:irow + ncol - 1)), [nrow*ncol])
-         irow = irow + ncol
-      END DO
-      elapsed = m_walltime() - elapsed
-      CALL bs_env%para_env%max(elapsed)
-      IF (bs_env%unit_nr > 0) WRITE (bs_env%unit_nr, '(T2,A,T69,F10.1,A)') &
-         'Auto RI metric optimization, exec. time:', elapsed, ' s'
-      IF (ASSOCIATED(auto_group)) CALL mp_para_env_release(auto_group)
-
-      CALL timestop(handle)
-
-   END SUBROUTINE optimize_periodic_auto_ri_metric
 
 ! **************************************************************************************************
 !> \brief Assembles the q-independent, atom-diagonal AA contraction from stored coefficients.
@@ -926,403 +576,6 @@ CONTAINS
    END SUBROUTINE assemble_AA_contraction
 
 ! **************************************************************************************************
-!> \brief Evaluate the smooth scale-invariant metric objective and its local-block gradient.
-!> \param bs_env ...
-!> \param metric_base ...
-!> \param coefficients ...
-!> \param objective ...
-!> \param worst ...
-!> \param gradient ...
-!> \param auto_group ...
-! **************************************************************************************************
-   SUBROUTINE evaluate_auto_ri_condition(bs_env, metric_base, coefficients, &
-                                         objective, worst, gradient, auto_group)
-      TYPE(post_scf_bandstructure_type), POINTER         :: bs_env
-      COMPLEX(KIND=dp), INTENT(IN)                       :: metric_base(:, :, :)
-      REAL(KIND=dp), INTENT(IN)                          :: coefficients(:, :)
-      REAL(KIND=dp), INTENT(OUT)                         :: objective, worst
-      REAL(KIND=dp), CONTIGUOUS, INTENT(OUT)             :: gradient(:, :)
-      TYPE(mp_para_env_type), POINTER                    :: auto_group
-
-      COMPLEX(KIND=dp), ALLOCATABLE                      :: inverse(:, :), projected(:, :), &
-                                                            response(:, :)
-      INTEGER                                            :: handle, iatom, ilocal, jrow, n, &
-                                                            n_singular, ncol, nlocal, nq, &
-                                                            phase_handle
-      LOGICAL                                            :: singular
-      REAL(KIND=dp)                                      :: largest, smallest, trace_h, trace_inverse
-      REAL(KIND=dp), ALLOCATABLE                         :: eigval(:)
-
-      CALL timeset('auto_ri_condition_evaluate', handle)
-
-      n = SIZE(coefficients, 1)
-      nq = bs_env%nkp_chi_eps_W_orig_plus_extra
-      nlocal = SIZE(metric_base, 3)
-      objective = 0.0_dp
-      worst = 0.0_dp
-      gradient(:, :) = 0.0_dp
-      n_singular = 0
-      CALL timeset("auto_ri_local_q_work", phase_handle)
-      IF (ASSOCIATED(auto_group)) THEN
-         CALL evaluate_auto_ri_group(bs_env, auto_group, metric_base, coefficients, &
-                                     objective, worst, gradient, n_singular)
-      ELSE
-         !$OMP PARALLEL DEFAULT(NONE) IF(nlocal > 1) &
-         !$OMP SHARED(bs_env, coefficients, metric_base, n, nlocal, gradient, n_singular, objective, worst) &
-         !$OMP PRIVATE(eigval, ilocal, inverse, jrow, largest, &
-         !$OMP         projected, response, smallest, trace_h, trace_inverse, singular)
-         ALLOCATE (projected(n, n), inverse(n, n), response(n, n), eigval(n))
-         !$OMP DO SCHEDULE(STATIC, 1) ORDERED
-         DO ilocal = 1, nlocal
-            CALL auto_ri_project_atom_blocks(bs_env%auto_ri%sizes_opt_RI, coefficients, &
-                                             metric_base(:, :, ilocal), projected, response)
-            projected(:, :) = 0.5_dp*(projected + CONJG(TRANSPOSE(projected)))
-            CALL auto_ri_metric_inverse(projected, eigval, inverse)
-            largest = MAXVAL(eigval)
-            smallest = MINVAL(eigval)
-            singular = smallest <= eps_auto_ri_metric*largest .OR. largest <= 0.0_dp
-            IF (.NOT. singular) THEN
-               trace_h = SUM(eigval)
-               trace_inverse = SUM(1.0_dp/eigval)
-
-               CALL auto_ri_block_gradient(bs_env, coefficients, projected, inverse, &
-                                           trace_h, trace_inverse, response)
-            END IF
-            ! Keep the q sum independent of thread timing; ill-conditioned metrics
-            ! amplify otherwise tiny reduction-order differences during optimization.
-            !$OMP ORDERED
-            IF (singular) THEN
-               n_singular = n_singular + 1
-            ELSE
-               worst = MAX(worst, largest/smallest)
-               objective = objective + LOG(trace_h*trace_inverse/REAL(n*n, dp))
-               gradient(:, :) = gradient + 2.0_dp*REAL(response, dp)
-            END IF
-            !$OMP END ORDERED
-         END DO
-         !$OMP END DO
-         DEALLOCATE (projected, inverse, response, eigval)
-         !$OMP END PARALLEL
-      END IF
-      CALL timestop(phase_handle)
-      IF (n_singular > 0) THEN
-         objective = HUGE(1.0_dp)
-         worst = HUGE(1.0_dp)
-         gradient(:, :) = 0.0_dp
-      END IF
-      CALL timeset("auto_ri_global_reduction", phase_handle)
-      CALL bs_env%para_env%sum(objective)
-      CALL bs_env%para_env%max(worst)
-      CALL bs_env%para_env%sum(gradient)
-      CALL timestop(phase_handle)
-      objective = objective/REAL(nq, dp)
-      gradient(:, :) = gradient/REAL(nq, dp)
-      jrow = 1
-      DO iatom = 1, bs_env%n_atom
-         ncol = bs_env%auto_ri%sizes_opt_RI(iatom)
-         gradient(jrow:jrow + ncol - 1, :jrow - 1) = 0.0_dp
-         gradient(jrow:jrow + ncol - 1, jrow + ncol:) = 0.0_dp
-         jrow = jrow + ncol
-      END DO
-
-      CALL timestop(handle)
-
-   END SUBROUTINE evaluate_auto_ri_condition
-
-! **************************************************************************************************
-!> \brief Assign all ranks to balanced q groups only when there are fewer q than ranks.
-!> Move each existing M(q) to its group root once; do not replicate it on helpers.
-!> \param bs_env ...
-!> \param metric_base ...
-!> \param group_env ...
-! **************************************************************************************************
-   SUBROUTINE prepare_auto_ri_q_group(bs_env, metric_base, group_env)
-      TYPE(post_scf_bandstructure_type), POINTER         :: bs_env
-      COMPLEX(dp), ALLOCATABLE, INTENT(INOUT)            :: metric_base(:, :, :)
-      TYPE(mp_para_env_type), POINTER                    :: group_env
-
-      COMPLEX(dp), ALLOCATABLE                           :: empty(:, :), owned(:, :, :)
-      INTEGER                                            :: ilocal, iq, mygroup, n, nq, owner
-      INTEGER, ALLOCATABLE                               :: roots(:)
-
-      nq = bs_env%nkp_chi_eps_W_orig_plus_extra
-      NULLIFY (group_env)
-      IF (nq >= bs_env%para_env%num_pe) RETURN
-      n = SIZE(metric_base, 1)
-      CALL grouped_w_partition(bs_env%para_env, nq, mygroup, roots)
-      ALLOCATE (group_env)
-      CALL group_env%from_split(bs_env%para_env, mygroup)
-      ALLOCATE (owned(n, n, MERGE(1, 0, group_env%mepos == 0)), empty(0, 0))
-      DO iq = 1, nq
-         owner = MODULO(iq, bs_env%para_env%num_pe)
-         ilocal = (iq - 1)/bs_env%para_env%num_pe + 1
-         IF (bs_env%para_env%mepos == owner) THEN
-            IF (group_env%mepos == 0) THEN
-               CALL grouped_w_copy_matrix(bs_env%para_env, n, owner, roots(iq), &
-                                          metric_base(:, :, ilocal), owned(:, :, 1))
-            ELSE
-               CALL grouped_w_copy_matrix(bs_env%para_env, n, owner, roots(iq), &
-                                          metric_base(:, :, ilocal), empty)
-            END IF
-         ELSE IF (bs_env%para_env%mepos == roots(iq)) THEN
-            CALL grouped_w_copy_matrix(bs_env%para_env, n, owner, roots(iq), empty, owned(:, :, 1))
-         END IF
-      END DO
-      CALL MOVE_ALLOC(owned, metric_base)
-      IF (bs_env%unit_nr > 0) THEN
-         WRITE (bs_env%unit_nr, '(T2,A,T72,I9)') 'AUTO_RI distributed q groups', nq
-         WRITE (bs_env%unit_nr, '(T2,A,T72,I9)') 'AUTO_RI maximum MPI ranks per q group', &
-            (bs_env%para_env%num_pe + nq - 1)/nq
-         FLUSH (bs_env%unit_nr)
-      END IF
-   END SUBROUTINE prepare_auto_ri_q_group
-
-! **************************************************************************************************
-!> \brief Evaluate one group's q contribution with distributed spectrum and inverse.
-!> The root forms H=C^T M C and its atom-block gradient; helper ranks participate
-!> in the distributed solves but contribute no duplicate objective or gradient.
-!> \param bs_env ...
-!> \param group_env ...
-!> \param metric_base ...
-!> \param coefficients ...
-!> \param objective ...
-!> \param worst ...
-!> \param gradient ...
-!> \param n_singular ...
-! **************************************************************************************************
-   SUBROUTINE evaluate_auto_ri_group(bs_env, group_env, metric_base, coefficients, &
-                                     objective, worst, gradient, n_singular)
-      TYPE(post_scf_bandstructure_type), POINTER         :: bs_env
-      TYPE(mp_para_env_type), POINTER                    :: group_env
-      COMPLEX(dp), INTENT(IN)                            :: metric_base(:, :, :)
-      REAL(dp), INTENT(IN)                               :: coefficients(:, :)
-      REAL(dp), INTENT(OUT)                              :: objective, worst, gradient(:, :)
-      INTEGER, INTENT(OUT)                               :: n_singular
-
-      COMPLEX(dp), ALLOCATABLE                           :: inverse(:, :), projected(:, :), &
-                                                            response(:, :)
-      INTEGER                                            :: n, nowner
-      REAL(dp)                                           :: largest, smallest, trace_h, trace_inverse
-      REAL(dp), ALLOCATABLE                              :: eigenvalues(:)
-
-      n = SIZE(coefficients, 1)
-      nowner = MERGE(n, 0, group_env%mepos == 0)
-      ALLOCATE (projected(nowner, nowner), inverse(nowner, nowner), &
-                response(nowner, nowner), eigenvalues(n))
-      objective = 0.0_dp
-      worst = 0.0_dp
-      gradient(:, :) = 0.0_dp
-      n_singular = 0
-      IF (group_env%mepos == 0) THEN
-         CALL auto_ri_project_atom_blocks(bs_env%auto_ri%sizes_opt_RI, coefficients, &
-                                          metric_base(:, :, 1), projected, response)
-         projected(:, :) = 0.5_dp*(projected + CONJG(TRANSPOSE(projected)))
-      END IF
-      CALL auto_ri_grouped_inverse(group_env, projected, eigenvalues, inverse)
-      IF (group_env%mepos /= 0) RETURN
-      largest = MAXVAL(eigenvalues)
-      smallest = MINVAL(eigenvalues)
-      IF (smallest <= eps_auto_ri_metric*largest .OR. largest <= 0.0_dp) THEN
-         n_singular = 1
-         RETURN
-      END IF
-      trace_h = SUM(eigenvalues)
-      trace_inverse = SUM(1.0_dp/eigenvalues)
-      CALL auto_ri_block_gradient(bs_env, coefficients, projected, inverse, &
-                                  trace_h, trace_inverse, response)
-      worst = largest/smallest
-      objective = LOG(trace_h*trace_inverse/REAL(n*n, dp))
-      gradient(:, :) = 2.0_dp*REAL(response, dp)
-   END SUBROUTINE evaluate_auto_ri_group
-
-! **************************************************************************************************
-!> \brief Form H_AB=C_A^T M_AB C_B using the allowed atom-diagonal coefficient blocks.
-!> C_A transforms the RI functions on atom A. The two block products cost
-!> O(N_RI^2 max_A n_A), instead of multiplying the zero off-atom blocks of C.
-!> The caller supplies one existing complex workspace; only one n_A^2 block is added.
-!> \param sizes ...
-!> \param coefficients ...
-!> \param metric ...
-!> \param projected ...
-!> \param work ...
-! **************************************************************************************************
-   SUBROUTINE auto_ri_project_atom_blocks(sizes, coefficients, metric, projected, work)
-      INTEGER, INTENT(IN)                                :: sizes(:)
-      REAL(dp), INTENT(IN)                               :: coefficients(:, :)
-      COMPLEX(dp), INTENT(IN) :: metric(SIZE(coefficients, 1), SIZE(coefficients, 1))
-      COMPLEX(dp), INTENT(OUT) :: projected(SIZE(coefficients, 1), SIZE(coefficients, 1)), &
-         work(SIZE(coefficients, 1), SIZE(coefficients, 1))
-
-      COMPLEX(dp), ALLOCATABLE                           :: atom_coefficients(:, :)
-      INTEGER                                            :: handle, iatom, ifirst, ilast, n, nblock
-
-      CALL timeset('auto_ri_project_atom_blocks', handle)
-
-      n = SIZE(coefficients, 1)
-      CPASSERT(n > 0 .AND. SIZE(coefficients, 2) == n)
-      CPASSERT(SIZE(sizes) > 0)
-      CPASSERT(ALL(sizes >= 0) .AND. SUM(sizes) == n)
-      CPASSERT(SIZE(metric, 1) == n .AND. SIZE(metric, 2) == n)
-      CPASSERT(SIZE(projected, 1) == n .AND. SIZE(projected, 2) == n)
-      CPASSERT(SIZE(work, 1) == n .AND. SIZE(work, 2) == n)
-      ALLOCATE (atom_coefficients(MAXVAL(sizes), MAXVAL(sizes)))
-      ifirst = 1
-      DO iatom = 1, SIZE(sizes)
-         nblock = sizes(iatom)
-         IF (nblock == 0) CYCLE
-         ilast = ifirst + nblock - 1
-         atom_coefficients(:nblock, :nblock) = CMPLX(coefficients(ifirst:ilast, ifirst:ilast), 0.0_dp, dp)
-         CALL zgemm('N', 'N', n, nblock, nblock, z_one, metric(1, ifirst), n, &
-                    atom_coefficients, SIZE(atom_coefficients, 1), z_zero, work(1, ifirst), n)
-         ifirst = ilast + 1
-      END DO
-      ifirst = 1
-      DO iatom = 1, SIZE(sizes)
-         nblock = sizes(iatom)
-         IF (nblock == 0) CYCLE
-         ilast = ifirst + nblock - 1
-         atom_coefficients(:nblock, :nblock) = CMPLX(coefficients(ifirst:ilast, ifirst:ilast), 0.0_dp, dp)
-         CALL zgemm('T', 'N', nblock, n, nblock, z_one, &
-                    atom_coefficients, SIZE(atom_coefficients, 1), work(ifirst, 1), n, &
-                    z_zero, projected(ifirst, 1), n)
-         ifirst = ilast + 1
-      END DO
-      DEALLOCATE (atom_coefficients)
-
-      CALL timestop(handle)
-
-   END SUBROUTINE auto_ri_project_atom_blocks
-
-! **************************************************************************************************
-!> \brief Compute the spectrum and inverse of H=CᵀMC without constructing eigenvectors.
-!> Keep the existing λ_min > 10^-12 λ_max positivity test. Cholesky computes H^-1
-!> only for accepted matrices; rejected optimizer trials retain the original handling.
-!> \param matrix ...
-!> \param eigenvalues ...
-!> \param inverse ...
-! **************************************************************************************************
-   SUBROUTINE auto_ri_metric_inverse(matrix, eigenvalues, inverse)
-      COMPLEX(dp), INTENT(IN)                            :: matrix(:, :)
-      REAL(dp), INTENT(OUT)                              :: eigenvalues(:)
-      COMPLEX(dp), INTENT(OUT)                           :: inverse(:, :)
-
-      COMPLEX(dp), ALLOCATABLE                           :: work(:)
-      INTEGER                                            :: handle, icol, info, irow, liwork, &
-                                                            lrwork, lwork, n
-      INTEGER, ALLOCATABLE                               :: iwork(:)
-      REAL(dp), ALLOCATABLE                              :: rwork(:)
-
-      n = SIZE(matrix, 1)
-      CPASSERT(n > 0 .AND. SIZE(matrix, 2) == n)
-      CPASSERT(SIZE(eigenvalues) == n)
-      CPASSERT(SIZE(inverse, 1) == n .AND. SIZE(inverse, 2) == n)
-
-      CALL timeset('auto_ri_metric_spectrum', handle)
-
-      ALLOCATE (work(1), rwork(1), iwork(1))
-      inverse = matrix
-      CALL zheevd('N', 'U', n, inverse, n, eigenvalues, work, -1, rwork, -1, iwork, -1, info)
-      IF (info /= 0) CPABORT('AUTO_RI eigenvalue workspace query failed')
-      lwork = CEILING(REAL(work(1), dp))
-      lrwork = CEILING(rwork(1))
-      liwork = iwork(1)
-      DEALLOCATE (work, rwork, iwork)
-      ALLOCATE (work(lwork), rwork(lrwork), iwork(liwork))
-      inverse = matrix
-      CALL zheevd('N', 'U', n, inverse, n, eigenvalues, work, lwork, rwork, lrwork, iwork, liwork, info)
-      IF (info /= 0) CPABORT('AUTO_RI metric eigenvalue calculation failed')
-      DEALLOCATE (work, rwork, iwork)
-
-      CALL timestop(handle)
-
-      inverse = z_zero
-      IF (MAXVAL(eigenvalues) <= 0.0_dp) RETURN
-      IF (MINVAL(eigenvalues) <= eps_auto_ri_metric*MAXVAL(eigenvalues)) RETURN
-      inverse = matrix
-
-      CALL timeset('auto_ri_metric_cholesky', handle)
-
-      CALL zpotrf('U', n, inverse, n, info)
-      IF (info /= 0) CPABORT('AUTO_RI positive metric factorization failed')
-      CALL zpotri('U', n, inverse, n, info)
-      IF (info /= 0) CPABORT('AUTO_RI metric inversion failed')
-      DO icol = 1, n
-         DO irow = icol + 1, n
-            inverse(irow, icol) = CONJG(inverse(icol, irow))
-         END DO
-      END DO
-
-      CALL timestop(handle)
-
-   END SUBROUTINE auto_ri_metric_inverse
-
-! **************************************************************************************************
-!> \brief Differentiate log[tr(H)tr(H^-1)/n²] for the allowed atomwise blocks of C.
-!> With H=CᵀMC, G=2C^-ᵀ Re[H/tr(H)-H^-1/tr(H^-1)]. Solve each block of
-!> CᵀG=2Re[H/tr(H)-H^-1/tr(H^-1)], avoiding H^-2 and cancellation in MC H^-2.
-!> \param bs_env ...
-!> \param coefficients ...
-!> \param matrix ...
-!> \param inverse ...
-!> \param trace_h ...
-!> \param trace_inverse ...
-!> \param response ...
-! **************************************************************************************************
-   SUBROUTINE auto_ri_block_gradient(bs_env, coefficients, matrix, inverse, trace_h, trace_inverse, response)
-      TYPE(post_scf_bandstructure_type), POINTER         :: bs_env
-      REAL(dp), INTENT(IN)                               :: coefficients(:, :)
-      COMPLEX(dp), INTENT(IN)                            :: matrix(:, :), inverse(:, :)
-      REAL(dp), INTENT(IN)                               :: trace_h, trace_inverse
-      COMPLEX(dp), INTENT(OUT)                           :: response(:, :)
-
-      INTEGER                                            :: first, handle, iatom, info, last, n
-      INTEGER, ALLOCATABLE                               :: pivots(:)
-      REAL(dp), ALLOCATABLE                              :: block(:, :), gradient(:, :)
-
-      CALL timeset('auto_ri_atom_gradient', handle)
-
-      response = z_zero
-      first = 1
-      DO iatom = 1, bs_env%n_atom
-         n = bs_env%auto_ri%sizes_opt_RI(iatom)
-         last = first + n - 1
-         CPASSERT(n >= 0 .AND. last <= SIZE(coefficients, 1))
-         IF (n == 0) CYCLE
-         ALLOCATE (block(n, n), gradient(n, n), pivots(n))
-         block(:, :) = TRANSPOSE(coefficients(first:last, first:last))
-         gradient(:, :) = 2.0_dp*REAL(matrix(first:last, first:last)/trace_h - &
-                                      inverse(first:last, first:last)/trace_inverse, dp)
-         CALL dgesv(n, n, block, n, pivots, gradient, n, info)
-         IF (info /= 0) CPABORT('AUTO_RI accepted coefficient block is singular')
-         ! The caller retains its factor of two in accumulating the q gradient.
-         response(first:last, first:last) = CMPLX(0.5_dp*gradient, 0.0_dp, dp)
-         DEALLOCATE (block, gradient, pivots)
-         first = last + 1
-      END DO
-      CPASSERT(first == SIZE(coefficients, 1) + 1)
-
-      CALL timestop(handle)
-
-   END SUBROUTINE auto_ri_block_gradient
-
-! **************************************************************************************************
-!> \brief Start GW with the SCF communicator; time and q groups are chosen at their use sites.
-!> \param bs_env ...
-!> \param gwkp_env ...
-! **************************************************************************************************
-   SUBROUTINE prepare_gw_mpi(bs_env, gwkp_env)
-      TYPE(post_scf_bandstructure_type), POINTER         :: bs_env
-      TYPE(gwkp_type), INTENT(INOUT)                     :: gwkp_env
-
-      CPASSERT(.NOT. ASSOCIATED(gwkp_env%group_env))
-      gwkp_env%group_env => bs_env%para_env
-      CALL gwkp_env%group_env%retain()
-      gwkp_env%ngroups = 1
-      gwkp_env%my_group = 0
-
-   END SUBROUTINE prepare_gw_mpi
-
-! **************************************************************************************************
 !> \brief Retain G orbitals, Z and fixed W in the smallest memory-feasible time groups.
 !>
 !> Each group owns τ = group + 1, group + 1 + ngroups, ... . Within a group,
@@ -1338,12 +591,10 @@ CONTAINS
 
       CHARACTER(LEN=*), PARAMETER :: routineN = 'prepare_self_energy_groups'
 
-      COMPLEX(KIND=dp), ALLOCATABLE                      :: psi_block(:, :, :), &
-                                                            psi_group(:, :, :, :), Z_block(:, :), &
-                                                            Z_group(:, :, :)
-      INTEGER :: handle, i_dest, i_group_size, i_root, i_source, i_tag, ik, ik_local, iq, &
-         iq_local, it, it_local, n_ao, n_aux, n_grid, n_k, n_local_k, n_local_q, n_local_time, &
-         n_spin, n_stored_q, n_threads, n_time, n_world, phase_handle
+      COMPLEX(KIND=dp), ALLOCATABLE                      :: psi_group(:, :, :, :), Z_group(:, :, :)
+      INTEGER :: handle, i_dest, i_group_size, i_root, i_source, i_tag, iq, iq_local, it, &
+         it_local, n_ao, n_aux, n_grid, n_k, n_local_k, n_local_q, n_local_time, n_spin, &
+         n_stored_q, n_threads, n_time, n_world, phase_handle
       REAL(KIND=dp) :: available_GB, block_bytes, budget_bytes, grid_bytes, input_bytes, n_pairs, &
          peak_bytes, persistent_bytes, result_bytes
       TYPE(mp_comm_type)                                 :: column_env
@@ -1378,7 +629,7 @@ CONTAINS
          n_local_k = (n_k + i_group_size - 1)/i_group_size
          n_local_time = (n_time + gwkp_env%ngroups - 1)/gwkp_env%ngroups
          n_stored_q = (n_k + i_group_size - 1)/i_group_size
-         persistent_bytes = 16.0_dp*(REAL(n_local_k*n_grid, dp)*REAL(n_ao*n_spin + n_aux, dp) + &
+         persistent_bytes = 16.0_dp*(REAL(n_local_k, dp)*REAL(n_grid, dp)*REAL(n_ao*n_spin + n_aux, dp) + &
                                      REAL(n_aux, dp)**2*REAL(n_stored_q*n_local_time, dp))
          n_pairs = REAL(CEILING(REAL(n_grid, dp)**2/REAL(i_group_size, dp), KIND=int_8), dp)
          ! G(k), gwkp_env%W_PQ_tau(R), and Σ(R) coexist: 16 + 8 + 8 bytes per pair and mesh point.
@@ -1416,36 +667,21 @@ CONTAINS
          CALL timestop(handle)
          RETURN
       END IF
-      n_local_k = COUNT([(MODULO(ik - 1, i_group_size) == gwkp_env%group_env%mepos, ik=1, n_k)])
       n_local_q = COUNT([(MODULO(iq, i_group_size) == gwkp_env%group_env%mepos, iq=1, n_k)])
       n_local_time = (n_time - gwkp_env%my_group + gwkp_env%ngroups - 1)/gwkp_env%ngroups
-      ALLOCATE (psi_group(n_grid, n_ao, n_local_k, n_spin), &
-                Z_group(n_grid, n_aux, n_local_q), &
-                psi_block(n_grid, n_ao, n_spin), Z_block(n_grid, n_aux))
       ALLOCATE (W_group(n_local_q))
       ! Ranks with the same within-group index need the same k/q slices.
       ! Communicate only along this column, independently of the other columns.
       CALL column_env%from_split(bs_env%para_env, gwkp_env%group_env%mepos)
-      CPASSERT(column_env%mepos == gwkp_env%my_group)
-      CPASSERT(column_env%num_pe == gwkp_env%ngroups)
-      ik_local = 0
-      iq_local = 0
       CALL timeset('Sigma_groups_redistribute_psi', phase_handle)
-      DO ik = gwkp_env%group_env%mepos + 1, n_k, i_group_size
-         i_root = MODULO(ik - 1, n_world)/i_group_size
-         IF (column_env%mepos == i_root) psi_block(:, :, :) = gwkp_env%psi_lm_k(:, :, (ik - 1)/n_world + 1, :)
-         CALL column_env%bcast(psi_block, i_root)
-         ik_local = ik_local + 1
-         psi_group(:, :, ik_local, :) = psi_block
-      END DO
+      CALL gather_group_columns(bs_env, gwkp_env, column_env, i_group_size, gwkp_env%group_env%mepos, &
+                                psi_group, Z_group)
       CALL timestop(phase_handle)
       CALL timeset('Sigma_groups_redistribute_ZW', phase_handle)
+      iq_local = 0
       DO iq = MODULO(gwkp_env%group_env%mepos - 1, i_group_size) + 1, n_k, i_group_size
          i_root = MODULO(iq, n_world)/i_group_size
-         IF (column_env%mepos == i_root) Z_block(:, :) = gwkp_env%Z_lP_q(:, :, (iq - 1)/n_world + 1)
-         CALL column_env%bcast(Z_block, i_root)
          iq_local = iq_local + 1
-         Z_group(:, :, iq_local) = Z_block
          ALLOCATE (W_group(iq_local)%values(n_aux, n_aux, n_local_time))
          DO it = 1, n_time
             i_dest = MODULO(it - 1, gwkp_env%ngroups)
@@ -1470,11 +706,61 @@ CONTAINS
       CALL MOVE_ALLOC(psi_group, gwkp_env%psi_lm_k)
       CALL MOVE_ALLOC(Z_group, gwkp_env%Z_lP_q)
       CALL MOVE_ALLOC(W_group, gwkp_env%W_PQ_tau)
-      DEALLOCATE (psi_block, Z_block)
 
       CALL timestop(handle)
 
    END SUBROUTINE prepare_self_energy_groups
+
+! **************************************************************************************************
+!> \brief Copy the orbitals ψ(k) and Z(q) needed by one rank of a time group from their world owners.
+!> World rank r owns k with MOD(k-1,n_world)=r and q with MOD(q,n_world)=r. Group rank i
+!> receives k with MOD(k-1,g)=i and q with MOD(q,g)=i. column_env connects the ranks with
+!> the same group rank; its rank is the time-group index.
+!> \param bs_env Band-structure settings.
+!> \param gwkp_env World-distributed ψ(k) and Z(q).
+!> \param column_env Ranks with the same within-group index.
+!> \param group_size Ranks per time group g.
+!> \param group_rank Within-group index i.
+!> \param psi_group ψ(k) of this group rank, indexed (grid, AO, local k, spin).
+!> \param Z_group Z(q) of this group rank, indexed (grid, RI, local q).
+! **************************************************************************************************
+   SUBROUTINE gather_group_columns(bs_env, gwkp_env, column_env, group_size, group_rank, psi_group, Z_group)
+      TYPE(post_scf_bandstructure_type), POINTER         :: bs_env
+      TYPE(gwkp_type), INTENT(IN)                        :: gwkp_env
+      TYPE(mp_comm_type), INTENT(IN)                     :: column_env
+      INTEGER, INTENT(IN)                                :: group_size, group_rank
+      COMPLEX(KIND=dp), ALLOCATABLE, INTENT(OUT)         :: psi_group(:, :, :, :), Z_group(:, :, :)
+
+      COMPLEX(KIND=dp), ALLOCATABLE                      :: psi_block(:, :, :), Z_block(:, :)
+      INTEGER                                            :: i_root, ik, ik_local, iq, iq_local, &
+                                                            n_grid, n_k, n_world
+
+      n_world = bs_env%para_env%num_pe
+      n_grid = bs_env%ri_rs%n_grid_points
+      n_k = bs_env%nkp_scf_desymm
+      ALLOCATE (psi_group(n_grid, bs_env%n_ao, COUNT([(MODULO(ik - 1, group_size) == group_rank, ik=1, n_k)]), &
+                          bs_env%n_spin))
+      ALLOCATE (Z_group(n_grid, bs_env%n_RI, COUNT([(MODULO(iq, group_size) == group_rank, iq=1, n_k)])))
+      ALLOCATE (psi_block(n_grid, bs_env%n_ao, bs_env%n_spin), Z_block(n_grid, bs_env%n_RI))
+      ik_local = 0
+      DO ik = group_rank + 1, n_k, group_size
+         i_root = MODULO(ik - 1, n_world)/group_size
+         IF (column_env%mepos == i_root) psi_block(:, :, :) = gwkp_env%psi_lm_k(:, :, (ik - 1)/n_world + 1, :)
+         CALL column_env%bcast(psi_block, i_root)
+         ik_local = ik_local + 1
+         psi_group(:, :, ik_local, :) = psi_block
+      END DO
+      iq_local = 0
+      DO iq = MODULO(group_rank - 1, group_size) + 1, n_k, group_size
+         i_root = MODULO(iq, n_world)/group_size
+         IF (column_env%mepos == i_root) Z_block(:, :) = gwkp_env%Z_lP_q(:, :, (iq - 1)/n_world + 1)
+         CALL column_env%bcast(Z_block, i_root)
+         iq_local = iq_local + 1
+         Z_group(:, :, iq_local) = Z_block
+      END DO
+      DEALLOCATE (psi_block, Z_block)
+
+   END SUBROUTINE gather_group_columns
 
 ! **************************************************************************************************
 !> \brief Compute chi_PQ^R(i tau) through the periodic real-space grid representation.
@@ -1487,14 +773,14 @@ CONTAINS
 
       CHARACTER(LEN=*), PARAMETER                        :: routineN = 'compute_chi'
 
-      COMPLEX(KIND=dp), ALLOCATABLE :: chi_grid_local_q(:, :, :), chi_grid_q(:, :, :), &
-         chi_q(:, :, :), G_grid_k(:, :, :), work(:, :), Z_block(:, :)
+      COMPLEX(KIND=dp), ALLOCATABLE                      :: chi_grid_local_q(:, :, :), &
+                                                            chi_grid_q(:, :, :), chi_q(:, :, :), &
+                                                            G_grid_k(:, :, :), work(:, :)
       COMPLEX(KIND=dp), ALLOCATABLE, TARGET              :: psi_time(:, :, :, :), Z_group(:, :, :)
       COMPLEX(KIND=dp), POINTER                          :: psi_values(:, :, :, :), Z_time(:, :, :)
       INTEGER :: first_row, handle, i_cell, i_group, i_q_world, i_rank, i_root, i_size, i_t, &
          i_time_group, i_time_local, iq, iq_local, ispin, last_row, n_aux, n_cells, n_grid, &
-         n_groups, n_k_local, n_local, n_q_local, n_threads, n_time_local, n_world, nrows_local, &
-         phase_handle
+         n_groups, n_local, n_q_local, n_threads, n_time_local, n_world, nrows_local, phase_handle
       INTEGER, ALLOCATABLE                               :: full_cells(:, :)
       REAL(KIND=dp) :: atom_block_count, available_GB, budget, input_bytes, live_bytes, n_q_max, &
          n_row_max, n_stored_max, peak, q_bytes, rows_bytes, step_elapsed, step_start, tau, &
@@ -1509,14 +795,11 @@ CONTAINS
 
       CPASSERT(gwkp_env%ngroups == 1 .AND. gwkp_env%my_group == 0)
       CALL build_full_cell_grid(bs_env, full_cells)
-      CPASSERT(.NOT. ALLOCATED(gwkp_env%band_orbitals))
       n_grid = bs_env%ri_rs%n_grid_points
       n_aux = bs_env%n_RI
       n_world = gwkp_env%group_env%num_pe
       ALLOCATE (qpoints(3, bs_env%nkp_scf_desymm))
-      DO iq = 1, bs_env%nkp_scf_desymm
-         qpoints(:, iq) = momentum_transfer_point(bs_env, iq)
-      END DO
+      qpoints(:, :) = bs_env%kpoints_chi_eps_W%xkp(:, 1:bs_env%nkp_scf_desymm)
       IF (bs_env%unit_nr > 0) THEN
          WRITE (bs_env%unit_nr, '(T2,A,T72,I9)') 'GW stored response q points:', &
             SIZE(qpoints, 2)
@@ -1532,15 +815,15 @@ CONTAINS
          i_rank = MODULO(gwkp_env%group_env%mepos, i_size)
          i_group = gwkp_env%group_env%mepos/i_size
          n_time_local = (bs_env%num_time_freq_points + n_groups - 1 - i_group)/n_groups
-         n_row_max = REAL(n_grid*(i_rank + 1)/i_size - n_grid*i_rank/i_size, dp)
+         n_row_max = REAL(INT(n_grid, int_8)*(i_rank + 1)/i_size - INT(n_grid, int_8)*i_rank/i_size, dp)
          n_q_max = REAL(COUNT([(MODULO(iq, i_size) == i_rank, &
                                 iq=1, bs_env%nkp_scf_desymm)]), dp)
          n_stored_max = n_q_max
          input_bytes = 0.0_dp
          IF (n_groups > 1) THEN
-            input_bytes = 16.0_dp*REAL(n_grid*n_aux, dp)*n_q_max
+            input_bytes = 16.0_dp*REAL(n_grid, dp)*REAL(n_aux, dp)*n_q_max
             input_bytes = input_bytes + &
-                          16.0_dp*REAL(n_grid*bs_env%n_ao*bs_env%n_spin, dp)* &
+                          16.0_dp*REAL(n_grid, dp)*REAL(bs_env%n_ao*bs_env%n_spin, dp)* &
                           REAL((bs_env%nkp_scf_desymm + i_size - 1 - i_rank)/i_size, dp)
          END IF
          time_bytes = 16.0_dp*REAL(n_aux, dp)**2*n_stored_max*REAL(n_time_local, dp)
@@ -1550,9 +833,9 @@ CONTAINS
                       (16.0_dp*REAL(bs_env%nkp_scf_desymm, dp) + 16.0_dp*REAL(n_cells, dp))
          q_bytes = 16.0_dp*REAL(n_grid, dp)**2*n_q_max
          live_bytes = MAX(rows_bytes + &
-                          16.0_dp*REAL(n_threads*n_grid*bs_env%n_ao, dp), &
-                          16.0_dp*n_row_max*REAL(n_grid*bs_env%nkp_scf_desymm, dp) + q_bytes, &
-                          q_bytes + 16.0_dp*REAL(n_grid*n_aux, dp)*MAX(1.0_dp, MIN(REAL(n_threads, dp), n_q_max)))
+                          16.0_dp*REAL(n_threads, dp)*REAL(n_grid, dp)*REAL(bs_env%n_ao, dp), &
+                          16.0_dp*n_row_max*REAL(n_grid, dp)*REAL(bs_env%nkp_scf_desymm, dp) + q_bytes, &
+                          q_bytes + 16.0_dp*REAL(n_grid, dp)*REAL(n_aux, dp)*MAX(1.0_dp, MIN(REAL(n_threads, dp), n_q_max)))
          peak = input_bytes + time_bytes + 16.0_dp*REAL(n_aux, dp)**2*n_q_max + &
                 MAX(live_bytes, 16.0_dp*REAL(n_aux, dp)**2*REAL(bs_env%num_time_freq_points, dp)) + &
                 32.0_dp*REAL(n_threads*bs_env%nkp_scf_desymm, dp) + 256.0_dp*1024.0_dp**2
@@ -1567,39 +850,13 @@ CONTAINS
       ALLOCATE (chi_env)
       CALL chi_env%from_split(gwkp_env%group_env, i_group)
       CALL column_env%from_split(gwkp_env%group_env, chi_env%mepos)
-      Z_time => gwkp_env%Z_lP_q
       IF (n_groups > 1) THEN
-         n_local = COUNT([(MODULO(iq, i_size) == chi_env%mepos, iq=1, bs_env%nkp_scf_desymm)])
-         ALLOCATE (Z_group(n_grid, n_aux, n_local), Z_block(n_grid, n_aux))
-         iq_local = 0
-         DO iq = MODULO(chi_env%mepos - 1, i_size) + 1, bs_env%nkp_scf_desymm, i_size
-            i_root = MODULO(iq, n_world)/i_size
-            IF (column_env%mepos == i_root) Z_block(:, :) = gwkp_env%Z_lP_q(:, :, (iq - 1)/n_world + 1)
-            CALL column_env%bcast(Z_block, i_root)
-            iq_local = iq_local + 1
-            Z_group(:, :, iq_local) = Z_block
-         END DO
-         DEALLOCATE (Z_block)
-         Z_time => Z_group
-      END IF
-      IF (n_groups > 1) THEN
-         n_k_local = (bs_env%nkp_scf_desymm + i_size - 1 - chi_env%mepos)/i_size
-         ALLOCATE (psi_time(n_grid, bs_env%n_ao, n_k_local, bs_env%n_spin))
-         ALLOCATE (Z_block(n_grid, bs_env%n_ao))
-         DO ispin = 1, bs_env%n_spin
-            iq_local = 0
-            DO iq = chi_env%mepos + 1, bs_env%nkp_scf_desymm, i_size
-               i_root = MODULO(iq - 1, n_world)/i_size
-               IF (column_env%mepos == i_root) Z_block(:, :) = gwkp_env%psi_lm_k(:, :, (iq - 1)/n_world + 1, ispin)
-               CALL column_env%bcast(Z_block, i_root)
-               iq_local = iq_local + 1
-               psi_time(:, :, iq_local, ispin) = Z_block
-            END DO
-         END DO
-         DEALLOCATE (Z_block)
+         CALL gather_group_columns(bs_env, gwkp_env, column_env, i_size, chi_env%mepos, psi_time, Z_group)
          psi_values => psi_time
+         Z_time => Z_group
       ELSE
          psi_values => gwkp_env%psi_lm_k
+         Z_time => gwkp_env%Z_lP_q
       END IF
       n_time_local = (bs_env%num_time_freq_points + n_groups - 1 - i_group)/n_groups
       IF (bs_env%unit_nr > 0) THEN
@@ -1635,14 +892,12 @@ CONTAINS
             ALLOCATE (G_occ_R(nrows_local, n_grid, SIZE(full_cells, 2)))
             ALLOCATE (chi_grid_R, MOLD=G_occ_R)
             CALL build_green_grid_k_rows(bs_env, psi_values(:, :, :, ispin), &
-                                         chi_env, tau, ispin, &
-                                         .TRUE., first_row, last_row, G_grid_k)
+                                         chi_env, tau, ispin, .TRUE., G_grid_k)
             CALL gw_k_grid_to_real_cells(G_grid_k, bs_env%kpoints_scf_desymm%xkp, &
                                          bs_env%kpoints_scf_desymm%nkp_grid, full_cells, &
                                          G_occ_R)
             CALL build_green_grid_k_rows(bs_env, psi_values(:, :, :, ispin), &
-                                         chi_env, tau, ispin, &
-                                         .FALSE., first_row, last_row, G_grid_k)
+                                         chi_env, tau, ispin, .FALSE., G_grid_k)
             CALL gw_k_grid_to_real_cells(G_grid_k, bs_env%kpoints_scf_desymm%xkp, &
                                          bs_env%kpoints_scf_desymm%nkp_grid, full_cells, &
                                          chi_grid_R)
@@ -1775,14 +1030,15 @@ CONTAINS
       COMPLEX(KIND=dp), ALLOCATABLE :: dipole(:, :, :, :, :), eps_P_cartesian(:, :), &
          F_external(:, :), F_response_cartesian(:, :), F_zero(:, :), head_freq(:, :), &
          metric_zero(:, :), pi_cartesian(:, :), response_cartesian(:, :), schur_cartesian(:, :), &
-         U_Pp_zero(:, :), V_sqrt_zero(:, :), wing_cartesian(:, :), wing_freq(:, :, :), &
-         wing_local(:)
+         V_sqrt_zero(:, :), wing_cartesian(:, :), wing_freq(:, :, :)
       INTEGER :: a, detail_handle, handle, i_cartesian, i_direction, i_t, ikp, j_cartesian, j_w, &
          n_angular, n_directions, n_near, n_w_kpoints
-      INTEGER, ALLOCATABLE                               :: metric_cells(:, :), nmo_spin(:)
-      LOGICAL                                            :: is_slab, valid_layout
-      REAL(KIND=dp) :: frequency, near_q(3, 8), phase_elapsed, phase_start, q_cart(3), &
-         q_direction(3), qnorm, reciprocal(3, 3), scaled(3), tau, volume, weight
+      INTEGER, ALLOCATABLE                               :: metric_cells(:, :)
+      LOGICAL                                            :: is_slab
+      REAL(KIND=dp)                                      :: near_q(3, 8), phase_elapsed, &
+                                                            phase_start, q_cart(3), &
+                                                            q_direction(3), qnorm, &
+                                                            reciprocal(3, 3), volume, weight
       REAL(KIND=dp), ALLOCATABLE                         :: angular_directions(:, :), &
                                                             angular_radii(:), angular_weights(:), &
                                                             V_zero_real(:, :)
@@ -1793,13 +1049,8 @@ CONTAINS
 
       phase_start = m_walltime()
       is_slab = ALL(bs_env%periodic == [1, 1, 0])
-      valid_layout = ALL(SHAPE(gwkp_env%Z_lP_zero) == [bs_env%ri_rs%n_grid_points, bs_env%n_RI + 1, 1])
-      CPASSERT(valid_layout)
-
       volume = bs_env%ri_rs%cell%deth
-      CPASSERT(volume > 0.0_dp)
       n_w_kpoints = PRODUCT(bs_env%nkp_grid_chi_eps_W_orig)
-      CPASSERT(n_w_kpoints > 0)
       reciprocal = twopi*TRANSPOSE(inv_3x3(bs_env%hmat))
       IF (is_slab) THEN
          CALL slab_reciprocal_vectors(bs_env, reciprocal(:, 1:2), volume)
@@ -1818,11 +1069,10 @@ CONTAINS
       DO ikp = 1, n_w_kpoints
          q_direction = bs_env%kpoints_chi_eps_W%xkp(1:3, ikp) - &
                        ANINT(bs_env%kpoints_chi_eps_W%xkp(1:3, ikp))
-         scaled = ABS(q_direction)*REAL(bs_env%nkp_grid_chi_eps_W_orig, dp)
          IF (is_slab) THEN
-            IF (MAXVAL(ABS(scaled(1:2) - 0.5_dp)) >= 1.0E-9_dp) CYCLE
+            IF (.NOT. is_gamma_neighbor(q_direction(1:2), bs_env%nkp_grid_chi_eps_W_orig(1:2))) CYCLE
          ELSE
-            IF (MAXVAL(ABS(scaled - 0.5_dp)) >= 1.0E-9_dp) CYCLE
+            IF (.NOT. is_gamma_neighbor(q_direction, bs_env%nkp_grid_chi_eps_W_orig)) CYCLE
          END IF
          a = a + 1
          IF (a > n_near) CPABORT('Too many Gamma-neighbor transfer points')
@@ -1863,11 +1113,9 @@ CONTAINS
       CALL timestop(detail_handle)
       IF (is_slab) THEN
          CALL slab_gamma_factors(qs_env, bs_env, metric_zero, F_zero, F_external)
-         IF (ALLOCATED(U_Pp_zero)) DEALLOCATE (U_Pp_zero)
       ELSE
          CALL timeset('gamma_ri_coulomb_zero', detail_handle)
          CALL gamma_ri_coulomb_g0(qs_env, bs_env%auto_ri, V_zero_real)
-         CPASSERT(SIZE(V_zero_real, 1) == bs_env%n_RI)
          V_sqrt_zero(:, :) = CMPLX(V_zero_real, 0.0_dp, dp)
          DEALLOCATE (V_zero_real)
          CALL timestop(detail_handle)
@@ -1877,51 +1125,40 @@ CONTAINS
          CALL timestop(detail_handle)
       END IF
       DEALLOCATE (metric_zero, V_sqrt_zero)
+      ! In 3D the external-potential map equals the density map.
+      IF (.NOT. is_slab) ALLOCATE (F_external, SOURCE=F_zero)
 
       ! Gamma-correction matrix elements in the actual SCF MO gauge.  q_x cancels analytically against
       ! the 1/q and 1/q^2 factors, so q_x=1 is used after the limit has been taken.
       CALL gw_gamma_transition_moments(bs_env, gwkp_env, bs_env%kpoints_scf_desymm, &
                                        bs_env%cfm_mo_coeff_kp(1:bs_env%nkp_scf_desymm, :), gwkp_env%eigenvalues_G, &
-                                       bs_env%n_occ(1:bs_env%n_spin), dipole, nmo_spin)
-      CPASSERT(SIZE(dipole, 2) == SIZE(gwkp_env%psi_lm_k, 3))
-      CPASSERT(ALL(nmo_spin >= bs_env%n_ao))
+                                       bs_env%n_occ(1:bs_env%n_spin), dipole)
 
       ALLOCATE (eps_P_cartesian(bs_env%n_RI, 3), pi_cartesian(3, 3), &
                 response_cartesian(bs_env%n_RI, 3), schur_cartesian(3, 3), &
                 wing_cartesian(bs_env%ri_rs%n_grid_points, 3), &
-                F_response_cartesian(bs_env%n_RI, 3), wing_local(bs_env%n_RI))
+                F_response_cartesian(bs_env%n_RI, 3))
       IF (is_slab) ALLOCATE (gwkp_env%gamma_correction%slab_wing_cartesian(bs_env%ri_rs%n_grid_points, 3, &
                                                                            bs_env%num_time_freq_points), SOURCE=z_zero)
       head_freq = z_zero
       wing_freq = z_zero
       CALL gamma_ao_time_prepare(bs_env, gwkp_env%psi_lm_k, dipole, volume, gamma_time_state)
       DO j_w = 1, bs_env%num_time_freq_points
-         frequency = bs_env%time_frequency_grid%frequency(j_w)
-         CPASSERT(bs_env%eps_eigval_mat_RI == 0.0_dp)
-         CALL gamma_ao_time_response(bs_env, gamma_time_state, gwkp_env%Z_lP_zero(:, 2:, 1), F_zero, frequency, &
+         CALL gamma_ao_time_response(bs_env, gamma_time_state, gwkp_env%Z_lP_zero(:, 2:, 1), F_zero, j_w, &
                                      eps_P_cartesian, pi_cartesian, response_cartesian)
          CALL timeset('gamma_headwing_apply', detail_handle)
          CALL zgemm('C', 'N', 3, 3, bs_env%n_RI, CMPLX(fourpi, 0.0_dp, dp), &
                     eps_P_cartesian, bs_env%n_RI, response_cartesian, bs_env%n_RI, &
                     z_zero, schur_cartesian, 3)
-         IF (is_slab) THEN
-            CALL zgemm('N', 'N', bs_env%n_RI, 3, bs_env%n_RI, z_one, &
-                       F_external, bs_env%n_RI, response_cartesian, bs_env%n_RI, &
-                       z_zero, F_response_cartesian, bs_env%n_RI)
-            CALL zgemm('N', 'N', bs_env%ri_rs%n_grid_points, 3, bs_env%n_RI, &
-                       CMPLX(twopi/ri_metric_head_zero(bs_env), 0.0_dp, dp), &
-                       gwkp_env%Z_lP_zero(:, 2:, 1), bs_env%ri_rs%n_grid_points, F_response_cartesian, bs_env%n_RI, &
-                       z_zero, wing_cartesian, bs_env%ri_rs%n_grid_points)
-            gwkp_env%gamma_correction%slab_wing_cartesian(:, :, j_w) = -wing_cartesian
-         ELSE
-            CALL zgemm('N', 'N', bs_env%n_RI, 3, bs_env%n_RI, z_one, &
-                       F_zero, bs_env%n_RI, response_cartesian, bs_env%n_RI, &
-                       z_zero, F_response_cartesian, bs_env%n_RI)
-            CALL zgemm('N', 'N', bs_env%ri_rs%n_grid_points, 3, bs_env%n_RI, &
-                       CMPLX(fourpi/ri_metric_head_zero(bs_env), 0.0_dp, dp), &
-                       gwkp_env%Z_lP_zero(:, 2:, 1), bs_env%ri_rs%n_grid_points, F_response_cartesian, bs_env%n_RI, &
-                       z_zero, wing_cartesian, bs_env%ri_rs%n_grid_points)
-         END IF
+         ! The 2D Coulomb kernel is 2π/q, the 3D one 4π/q².
+         CALL zgemm('N', 'N', bs_env%n_RI, 3, bs_env%n_RI, z_one, &
+                    F_external, bs_env%n_RI, response_cartesian, bs_env%n_RI, &
+                    z_zero, F_response_cartesian, bs_env%n_RI)
+         CALL zgemm('N', 'N', bs_env%ri_rs%n_grid_points, 3, bs_env%n_RI, &
+                    CMPLX(MERGE(twopi, fourpi, is_slab)/ri_metric_head_zero(bs_env), 0.0_dp, dp), &
+                    gwkp_env%Z_lP_zero(:, 2:, 1), bs_env%ri_rs%n_grid_points, F_response_cartesian, bs_env%n_RI, &
+                    z_zero, wing_cartesian, bs_env%ri_rs%n_grid_points)
+         IF (is_slab) gwkp_env%gamma_correction%slab_wing_cartesian(:, :, j_w) = -wing_cartesian
          DO i_direction = 1, n_directions
             q_direction_complex(:) = CMPLX(gwkp_env%gamma_correction%directions(:, i_direction), 0.0_dp, dp)
             pi_q(:) = MATMUL(pi_cartesian, q_direction_complex)
@@ -1938,18 +1175,13 @@ CONTAINS
             IF (is_slab) THEN
                ! A(d,ω) = d†[α - E† B⁻¹ E]d is the screened 2D polarizability.
                head_freq(i_direction, j_w) = pi_00 - schur_contribution/fourpi
-               IF (REAL(head_freq(i_direction, j_w), dp) < -1.0E-10_dp .OR. &
-                   ABS(AIMAG(head_freq(i_direction, j_w))) > 1.0E-8_dp) THEN
-                  CPABORT('2D Gamma polarizability is not positive real')
-               END IF
                head_freq(i_direction, j_w) = &
                   CMPLX(MAX(0.0_dp, REAL(head_freq(i_direction, j_w), dp)), 0.0_dp, dp)
                CYCLE
             END IF
             schur_denom = eps_00 - schur_contribution
-            IF (REAL(schur_denom, dp) <= 0.0_dp .OR. &
-                ABS(AIMAG(schur_denom)) > 1.0E-8_dp*MAX(ABS(schur_denom), 1.0_dp)) THEN
-               CPABORT("Gamma dielectric Schur complement is not positive real")
+            IF (REAL(schur_denom, dp) <= 0.0_dp) THEN
+               CPABORT("Gamma dielectric Schur complement is not positive")
             END IF
             eps_inv_00 = z_one/schur_denom
             head_freq(i_direction, j_w) = eps_inv_00 - z_one
@@ -1969,9 +1201,7 @@ CONTAINS
       gwkp_env%gamma_correction%head_tau = z_zero
       gwkp_env%gamma_correction%wing_tau = z_zero
       DO i_t = 1, bs_env%num_time_freq_points
-         tau = bs_env%time_frequency_grid%imaginary_time(i_t)
          DO j_w = 1, bs_env%num_time_freq_points
-            frequency = bs_env%time_frequency_grid%frequency(j_w)
             weight = bs_env%time_frequency_grid%cosine_frequency_to_time(i_t, j_w)
             gwkp_env%gamma_correction%head_tau(:, i_t) = gwkp_env%gamma_correction%head_tau(:, i_t) + weight*head_freq(:, j_w)
             gwkp_env%gamma_correction%wing_tau(:, :, i_t) = &
@@ -1981,12 +1211,12 @@ CONTAINS
       CALL timestop(detail_handle)
       DEALLOCATE (head_freq, wing_freq)
       CALL gamma_ao_time_release(gamma_time_state)
-      IF (ALLOCATED(F_external)) DEALLOCATE (F_external)
+      DEALLOCATE (F_external)
 
       DEALLOCATE (dipole, &
-                  eps_P_cartesian, F_zero, nmo_spin, &
+                  eps_P_cartesian, F_zero, &
                   pi_cartesian, response_cartesian, schur_cartesian, &
-                  F_response_cartesian, wing_cartesian, wing_local)
+                  F_response_cartesian, wing_cartesian)
       phase_elapsed = m_walltime() - phase_start
       CALL bs_env%para_env%max(phase_elapsed)
       IF (bs_env%unit_nr > 0) THEN
@@ -2019,7 +1249,6 @@ CONTAINS
          n_ref, nimages_old, nsgf, opt_first, ref_first, u_first
       INTEGER, ALLOCATABLE                               :: kind_of(:)
       LOGICAL                                            :: created_gpw_kpoints
-      REAL(KIND=dp)                                      :: progression
       REAL(KIND=dp), ALLOCATABLE                         :: projected(:, :), reference(:, :), &
                                                             U_atom(:, :)
       TYPE(atomic_kind_type), POINTER                    :: atomic_kinds(:)
@@ -2054,21 +1283,6 @@ CONTAINS
       CPASSERT(n_ref > 0 .AND. n_opt > 0)
       ALLOCATE (V_zero(n_opt, n_opt), SOURCE=0.0_dp)
 
-      ! prepare_gpw uses half the WFC_GPW cutoffs. Match the unchanged DFT grid exactly;
-      ! reject a non-geometric grid rather than silently changing this calculation.
-      progression = dft_control%qs_control%progression_factor
-      CPASSERT(progression > 0.0_dp)
-      IF (ABS(dft_control%qs_control%e_cutoff(1) - dft_control%qs_control%cutoff) > &
-          1.0E-10_dp*dft_control%qs_control%cutoff) THEN
-         CPABORT('Gamma GPW Coulomb requires matching first DFT multigrid cutoff')
-      END IF
-      DO i_col = 2, SIZE(dft_control%qs_control%e_cutoff)
-         IF (ABS(dft_control%qs_control%e_cutoff(i_col) - &
-                 dft_control%qs_control%e_cutoff(i_col - 1)/progression) > &
-             1.0E-10_dp*dft_control%qs_control%e_cutoff(i_col)) THEN
-            CPABORT('Gamma GPW Coulomb requires geometric DFT multigrid cutoffs')
-         END IF
-      END DO
       coulomb%potential_type = do_potential_coulomb
       coulomb%cutoff_radius = -1.0_dp
       coulomb%omega = 0.0_dp
@@ -2161,35 +1375,28 @@ CONTAINS
    END SUBROUTINE gamma_ri_coulomb_g0
 
 ! **************************************************************************************************
-!> \brief Build the full Gaussian RI metric and bare Coulomb operators.
+!> \brief Build K(q) = M(q)^-1 V(q)^1/2 from the Gaussian RI metric M and the Ewald Coulomb matrix V.
 !> The Gamma-cell head is corrected separately from these operators.
 !> \param bs_env ...
 !> \param qs_env ...
-!> \param M_inv_V_sqrt ...
-!> \param M_inv ...
-!> \param V_sqrt ...
-!> \param metric_norm_max ...
+!> \param K K(q) for the q points owned by this rank
 ! **************************************************************************************************
-   SUBROUTINE compute_gaussian_Minv_and_Vsqrt(bs_env, qs_env, M_inv_V_sqrt, M_inv, V_sqrt, metric_norm_max)
+   SUBROUTINE compute_metric_coulomb_factor(bs_env, qs_env, K)
       TYPE(post_scf_bandstructure_type), POINTER         :: bs_env
       TYPE(qs_environment_type), POINTER                 :: qs_env
-      COMPLEX(KIND=dp), ALLOCATABLE, INTENT(OUT)         :: M_inv_V_sqrt(:, :, :), M_inv(:, :, :), &
-                                                            V_sqrt(:, :, :)
-      REAL(KIND=dp), INTENT(OUT)                         :: metric_norm_max
+      COMPLEX(KIND=dp), ALLOCATABLE, INTENT(OUT)         :: K(:, :, :)
 
-      CHARACTER(LEN=*), PARAMETER :: routineN = 'compute_gaussian_Minv_and_Vsqrt'
+      CHARACTER(LEN=*), PARAMETER :: routineN = 'compute_metric_coulomb_factor'
 
-      COMPLEX(KIND=dp), ALLOCATABLE                      :: M_ref(:, :, :), U_Pp_q(:, :), &
-                                                            V_ref(:, :, :)
+      COMPLEX(KIND=dp), ALLOCATABLE                      :: M_inv(:, :), M_ref(:, :, :), U_Pp(:, :), &
+                                                            V_ref(:, :, :), V_sqrt(:, :)
       INTEGER                                            :: handle, ikp, ilocal, n_ref, n_RI, nkp, &
                                                             nkp_local
       INTEGER, ALLOCATABLE                               :: metric_cells(:, :)
-      REAL(KIND=dp)                                      :: norm_work(1)
       TYPE(cp_fm_type), ALLOCATABLE                      :: fm_metric(:)
 
       CALL timeset(routineN, handle)
 
-      CPASSERT(bs_env%gw_implementation == ri_rs_small_cell_full_kp)
       n_RI = bs_env%n_RI
       n_ref = n_RI
       IF (bs_env%auto_ri%enabled) n_ref = SUM(bs_env%auto_ri%sizes_ref_RI)
@@ -2197,14 +1404,10 @@ CONTAINS
       CPASSERT(bs_env%nkp_chi_eps_W_orig == nkp)
       nkp_local = COUNT([(MODULO(ikp, bs_env%para_env%num_pe) == &
                           bs_env%para_env%mepos, ikp=1, nkp)])
-      ALLOCATE (M_ref(n_ref, n_ref, nkp_local), V_ref(n_ref, n_ref, nkp_local))
-      ALLOCATE (M_inv_V_sqrt(n_RI, n_RI, nkp_local), M_inv(n_RI, n_RI, nkp_local), &
-                V_sqrt(n_RI, n_RI, nkp_local))
-      M_ref = z_zero
-      V_ref = z_zero
+      ALLOCATE (M_ref(n_ref, n_ref, nkp_local), V_ref(n_ref, n_ref, nkp_local), source=z_zero)
+      ALLOCATE (K(n_RI, n_RI, nkp_local), M_inv(n_RI, n_RI), V_sqrt(n_RI, n_RI))
       ! The full Ewald Coulomb matrix is finite on the shifted 2D/3D q mesh. No
       ! G=0 auxiliary channel is removed at each transfer point.
-      bs_env%kpoints_chi_eps_W%nkp_grid = bs_env%nkp_grid_chi_eps_W_orig
       CALL build_2c_coulomb_matrix_kp_small_cell(V_ref, qs_env, bs_env%kpoints_chi_eps_W, &
                                                  bs_env%size_lattice_sum_V, basis_type='RI_AUX', &
                                                  ikp_start=1, ikp_end=nkp, use_ewald=.TRUE.)
@@ -2214,89 +1417,25 @@ CONTAINS
                                     bs_env%kpoints_chi_eps_W%xkp(1:3, 1:nkp), M_ref)
       CALL cp_fm_release(fm_metric)
       DEALLOCATE (metric_cells)
-      metric_norm_max = 0.0_dp
-      ilocal = 0
-      DO ikp = 1, nkp
-         IF (MODULO(ikp, bs_env%para_env%num_pe) /= bs_env%para_env%mepos) CYCLE
-         ilocal = ilocal + 1
+      IF (bs_env%auto_ri%enabled) CALL assemble_AA_contraction(bs_env, U_Pp)
+      DO ilocal = 1, nkp_local
          IF (bs_env%auto_ri%enabled) THEN
-            CALL assemble_AA_contraction(bs_env, U_Pp_q)
-            M_inv(:, :, ilocal) = MATMUL(CONJG(TRANSPOSE(U_Pp_q)), &
-                                         MATMUL(M_ref(:, :, ilocal), U_Pp_q))
-            V_sqrt(:, :, ilocal) = MATMUL(CONJG(TRANSPOSE(U_Pp_q)), &
-                                          MATMUL(V_ref(:, :, ilocal), U_Pp_q))
-            DEALLOCATE (U_Pp_q)
+            M_inv(:, :) = MATMUL(CONJG(TRANSPOSE(U_Pp)), MATMUL(M_ref(:, :, ilocal), U_Pp))
+            V_sqrt(:, :) = MATMUL(CONJG(TRANSPOSE(U_Pp)), MATMUL(V_ref(:, :, ilocal), U_Pp))
          ELSE
-            M_inv(:, :, ilocal) = M_ref(:, :, ilocal)
-            V_sqrt(:, :, ilocal) = V_ref(:, :, ilocal)
+            M_inv(:, :) = M_ref(:, :, ilocal)
+            V_sqrt(:, :) = V_ref(:, :, ilocal)
          END IF
-         metric_norm_max = MAX(metric_norm_max, zlange('F', n_RI, n_RI, M_inv(:, :, ilocal), n_RI, norm_work))
-         CALL power(M_inv(:, :, ilocal), -1.0_dp, 0.0_dp, &
-                    relative_eps=bs_env%regularization_RI)
-         CALL power(V_sqrt(:, :, ilocal), 0.5_dp, 0.0_dp)
-         M_inv_V_sqrt(:, :, ilocal) = MATMUL(M_inv(:, :, ilocal), V_sqrt(:, :, ilocal))
+         CALL local_complex_power(M_inv, -1.0_dp, 0.0_dp, relative_eps=bs_env%regularization_RI)
+         CALL local_complex_power(V_sqrt, 0.5_dp, 0.0_dp)
+         K(:, :, ilocal) = MATMUL(M_inv, V_sqrt)
       END DO
-      CALL bs_env%para_env%max(metric_norm_max)
-      DEALLOCATE (M_ref, V_ref)
+      DEALLOCATE (M_ref, V_ref, M_inv, V_sqrt)
+      IF (ALLOCATED(U_Pp)) DEALLOCATE (U_Pp)
 
       CALL timestop(handle)
 
-   END SUBROUTINE compute_gaussian_Minv_and_Vsqrt
-
-! **************************************************************************************************
-!> \brief Shift every diagonal element of a complex square matrix.
-!> \param matrix ...
-!> \param shift ...
-! **************************************************************************************************
-   SUBROUTINE shift_diagonal(matrix, shift)
-      COMPLEX(KIND=dp), DIMENSION(:, :), INTENT(INOUT)   :: matrix
-      REAL(KIND=dp), INTENT(IN)                          :: shift
-
-      INTEGER                                            :: i
-
-      CPASSERT(SIZE(matrix, 1) == SIZE(matrix, 2))
-      DO i = 1, SIZE(matrix, 1)
-         matrix(i, i) = matrix(i, i) + shift
-      END DO
-
-   END SUBROUTINE shift_diagonal
-
-! **************************************************************************************************
-!> \brief Gauss-Legendre nodes and weights on [-1,1].
-!> \param n ...
-!> \param nodes ...
-!> \param weights ...
-! **************************************************************************************************
-   SUBROUTINE gauss_legendre_cell_rule(n, nodes, weights)
-      INTEGER, INTENT(IN)                                :: n
-      REAL(KIND=dp), ALLOCATABLE, INTENT(OUT)            :: nodes(:), weights(:)
-
-      INTEGER                                            :: i, iter, j
-      REAL(KIND=dp)                                      :: derivative, p0, p1, p2, z, z_next
-
-      ALLOCATE (nodes(n), weights(n))
-      DO i = 1, (n + 1)/2
-         z = COS(pi*(REAL(i, dp) - 0.25_dp)/(REAL(n, dp) + 0.5_dp))
-         DO iter = 1, 50
-            p0 = 1.0_dp
-            p1 = 0.0_dp
-            DO j = 1, n
-               p2 = p1
-               p1 = p0
-               p0 = ((2*j - 1)*z*p1 - (j - 1)*p2)/REAL(j, dp)
-            END DO
-            derivative = REAL(n, dp)*(z*p0 - p1)/(z*z - 1.0_dp)
-            z_next = z - p0/derivative
-            IF (ABS(z_next - z) < 1.0E-15_dp) EXIT
-            z = z_next
-         END DO
-         IF (iter > 50) CPABORT('Gauss-Legendre face quadrature did not converge')
-         nodes(i) = -z_next
-         nodes(n + 1 - i) = z_next
-         weights(i) = 2.0_dp/((1.0_dp - z_next*z_next)*derivative**2)
-         weights(n + 1 - i) = weights(i)
-      END DO
-   END SUBROUTINE gauss_legendre_cell_rule
+   END SUBROUTINE compute_metric_coulomb_factor
 
 ! **************************************************************************************************
 !> \brief Angular cubature over the cells adjacent to Gamma.
@@ -2318,18 +1457,17 @@ CONTAINS
       INTEGER                                            :: face, i, ia, ib, j, k, n_angular, nk, &
                                                             sign_index
       REAL(KIND=dp)                                      :: bmat(3, 3), jacobian_scale, q(3), &
-                                                            qfrac(3), region_volume, vol_check, &
-                                                            volume
+                                                            qfrac(3), volume
       REAL(KIND=dp), ALLOCATABLE                         :: nodes(:), rule_weights(:)
 
       ! Six faces with a 6-by-6 Gauss-Legendre rule give 216 angular points.
       n_angular = 6*n*n
       nk = PRODUCT(bs_env%nkp_grid_chi_eps_W_orig)
       jacobian_scale = REAL(PRODUCT(MIN(2, bs_env%nkp_grid_chi_eps_W_orig)), dp)/8.0_dp
-      region_volume = 8.0_dp*jacobian_scale/REAL(nk, dp)
       volume = bs_env%ri_rs%cell%deth
       bmat = twopi*TRANSPOSE(inv_3x3(bs_env%hmat))
-      CALL gauss_legendre_cell_rule(n, nodes, rule_weights)
+      ALLOCATE (nodes(n), rule_weights(n))
+      CALL gauss_legendre(n, nodes, rule_weights)
       ALLOCATE (directions(3, n_angular), weights(n_angular), radii(n_angular))
       face = 0
       DO i = 1, 3
@@ -2352,18 +1490,60 @@ CONTAINS
          END DO
       END DO
       CPASSERT(face == n_angular)
-      vol_check = volume*fourpi/(3.0_dp*twopi**3)*SUM(weights*radii**3)
-      IF (ABS(vol_check - region_volume) > 1.0E-11_dp/REAL(nk, dp)) THEN
-         CPABORT('Gamma-cell angular quadrature failed its exact volume check')
-      END IF
       DEALLOCATE (nodes, rule_weights)
    END SUBROUTINE gamma_cell_face_directions
 
 ! **************************************************************************************************
-!> \brief Integrate 1/q**2 over the distinct shifted-mesh cells around Gamma.
+!> \brief Whether a point of the half-shifted q mesh is one of the transfer points next to Gamma.
+!> On a half-shifted mesh, 2*|q_i|*N_i is an odd integer; it equals one next to Gamma.
+!> \param xkp fractional q point
+!> \param nkp_grid q mesh along the same directions
+!> \return ...
+! **************************************************************************************************
+   PURE FUNCTION is_gamma_neighbor(xkp, nkp_grid) RESULT(neighbor)
+      REAL(KIND=dp), INTENT(IN)                          :: xkp(:)
+      INTEGER, INTENT(IN)                                :: nkp_grid(:)
+      LOGICAL                                            :: neighbor
+
+      neighbor = ALL(NINT(2.0_dp*ABS(xkp - ANINT(xkp))*REAL(nkp_grid, dp)) == 1)
+
+   END FUNCTION is_gamma_neighbor
+
+! **************************************************************************************************
+!> \brief Radial moments f0 = int_0^L exp(-i a q) dq and f1 = int_0^L q exp(-i a q) dq.
+!> A Taylor series replaces the closed forms where they cancel for small |a L|.
+!> \param a ...
+!> \param L ...
+!> \param f0 ...
+!> \param f1 ...
+! **************************************************************************************************
+   PURE SUBROUTINE radial_phase_moments(a, L, f0, f1)
+      REAL(KIND=dp), INTENT(IN)                          :: a, L
+      COMPLEX(KIND=dp), INTENT(OUT)                      :: f0
+      COMPLEX(KIND=dp), INTENT(OUT), OPTIONAL            :: f1
+
+      COMPLEX(KIND=dp)                                   :: phase
+
+      IF (ABS(a*L) < taylor_switch) THEN
+         f0 = CMPLX(L - a*a*L**3/6.0_dp + a**4*L**5/120.0_dp, &
+                    -a*L*L/2.0_dp + a**3*L**4/24.0_dp, dp)
+         IF (PRESENT(f1)) f1 = CMPLX(L*L/2.0_dp - a*a*L**4/8.0_dp, &
+                                     -a*L**3/3.0_dp + a**3*L**5/30.0_dp, dp)
+      ELSE
+         phase = EXP(-gaussi*a*L)
+         f0 = (z_one - phase)/(gaussi*a)
+         IF (PRESENT(f1)) f1 = (phase*(z_one + gaussi*a*L) - z_one)/(a*a)
+      END IF
+
+   END SUBROUTINE radial_phase_moments
+
+! **************************************************************************************************
+!> \brief Integrate 1/q**2 (3D) or 1/|q| (2D slab) over the distinct shifted-mesh cells around Gamma.
 !> The regular mesh sum already contains the near-Gamma model samples, which are
-!> subtracted here.  The returned coefficient multiplies the factored head
-!> density 4*pi*Z_l0(0)*conjg(Z_l'0(0))/M_0(0)**2.
+!> subtracted here.  In 3D the returned coefficient multiplies the factored head
+!> density 4*pi*Z_l0(0)*conjg(Z_l'0(0))/M_0(0)**2; in 2D it has units of inverse
+!> in-plane momentum.  The face-to-polar Jacobian resolves the integrable singularity
+!> without sampling q=0.
 !> \param bs_env ...
 !> \param cells ...
 !> \param factors ...
@@ -2373,157 +1553,46 @@ CONTAINS
       INTEGER, INTENT(IN)                                :: cells(:, :)
       COMPLEX(KIND=dp), ALLOCATABLE, INTENT(OUT)         :: factors(:)
 
-      COMPLEX(KIND=dp)                                   :: f0, phase
-      INTEGER                                            :: icell, idir, iq, n_near, nk
-      REAL(KIND=dp)                                      :: a, L, q(3), qcart(3), qnorm, rcart(3), &
-                                                            scaled(3), volume
+      COMPLEX(KIND=dp)                                   :: f0
+      INTEGER                                            :: icell, idir, iq, n_dim, nk
+      REAL(KIND=dp)                                      :: area, bmat(3, 3), q(3), qnorm, rcart(3), &
+                                                            scale
       REAL(KIND=dp), ALLOCATABLE                         :: directions(:, :), radii(:), weights(:)
 
-      IF (ALL(bs_env%periodic == [1, 1, 0])) THEN
-         CALL singular_head_cell_factors_2d(bs_env, cells, factors)
-         RETURN
-      END IF
       nk = PRODUCT(bs_env%nkp_grid_chi_eps_W_orig)
-      CALL gamma_cell_face_directions(bs_env, directions, weights, radii)
-      volume = bs_env%ri_rs%cell%deth
-      ALLOCATE (factors(SIZE(cells, 2)))
-      n_near = 0
-      DO iq = 1, nk
-         q = bs_env%kpoints_chi_eps_W%xkp(1:3, iq) - &
-             ANINT(bs_env%kpoints_chi_eps_W%xkp(1:3, iq))
-         scaled = ABS(q)*REAL(bs_env%nkp_grid_chi_eps_W_orig, dp)
-         IF (MAXVAL(ABS(scaled - 0.5_dp)) < 1.0E-9_dp) n_near = n_near + 1
-      END DO
-      IF (n_near /= PRODUCT(MIN(2, bs_env%nkp_grid_chi_eps_W_orig))) THEN
-         CPABORT('Inconsistent number of distinct Gamma-neighbor cells')
+      IF (ALL(bs_env%periodic == [1, 1, 0])) THEN
+         n_dim = 2
+         CALL slab_cell_face_directions(bs_env, directions, weights, radii)
+         bmat(:, 3) = 0.0_dp
+         CALL slab_reciprocal_vectors(bs_env, bmat(:, 1:2), area)
+         scale = area/twopi**2
+      ELSE
+         n_dim = 3
+         CALL gamma_cell_face_directions(bs_env, directions, weights, radii)
+         bmat = twopi*TRANSPOSE(inv_3x3(bs_env%hmat))
+         scale = bs_env%ri_rs%cell%deth*fourpi/(twopi**3)
       END IF
+      ALLOCATE (factors(SIZE(cells, 2)))
       DO icell = 1, SIZE(cells, 2)
          rcart = MATMUL(bs_env%hmat, REAL(cells(:, icell), dp))
          factors(icell) = z_zero
          DO idir = 1, SIZE(weights)
-            L = radii(idir)
-            a = DOT_PRODUCT(directions(:, idir), rcart)
-            IF (ABS(a*L) < 1.0E-4_dp) THEN
-               f0 = CMPLX(L - a*a*L**3/6.0_dp + a**4*L**5/120.0_dp, &
-                          -a*L*L/2.0_dp + a**3*L**4/24.0_dp, dp)
-            ELSE
-               phase = EXP(-gaussi*a*L)
-               f0 = (z_one - phase)/(gaussi*a)
-            END IF
+            CALL radial_phase_moments(DOT_PRODUCT(directions(:, idir), rcart), radii(idir), f0)
             factors(icell) = factors(icell) + weights(idir)*f0
          END DO
-         factors(icell) = factors(icell)*volume*fourpi/(twopi**3)
+         factors(icell) = factors(icell)*scale
          DO iq = 1, nk
-            q = bs_env%kpoints_chi_eps_W%xkp(1:3, iq) - &
-                ANINT(bs_env%kpoints_chi_eps_W%xkp(1:3, iq))
-            scaled = ABS(q)*REAL(bs_env%nkp_grid_chi_eps_W_orig, dp)
-            IF (MAXVAL(ABS(scaled - 0.5_dp)) >= 1.0E-9_dp) CYCLE
-            qcart = MATMUL(twopi*TRANSPOSE(inv_3x3(bs_env%hmat)), q)
-            qnorm = NORM2(qcart)
-            phase = EXP(-gaussi*DOT_PRODUCT(qcart, rcart))
-            factors(icell) = factors(icell) - phase/(REAL(nk, dp)*qnorm*qnorm)
+            IF (.NOT. is_gamma_neighbor(bs_env%kpoints_chi_eps_W%xkp(1:n_dim, iq), &
+                                        bs_env%nkp_grid_chi_eps_W_orig(1:n_dim))) CYCLE
+            q = MATMUL(bmat, bs_env%kpoints_chi_eps_W%xkp(1:3, iq) - &
+                       ANINT(bs_env%kpoints_chi_eps_W%xkp(1:3, iq)))
+            qnorm = NORM2(q)
+            factors(icell) = factors(icell) - EXP(-gaussi*DOT_PRODUCT(q, rcart))/ &
+                             (REAL(nk, dp)*qnorm**(n_dim - 1))
          END DO
       END DO
       DEALLOCATE (directions, weights, radii)
    END SUBROUTINE singular_head_cell_factors
-
-! **************************************************************************************************
-!> \brief Replace the four shifted XY transfer samples by their 2D cell integral
-!> of 1/|q|. The face-to-polar Jacobian resolves the integrable singularity
-!> without sampling q=0. The result has units of inverse in-plane momentum.
-!> \param bs_env ...
-!> \param cells ...
-!> \param factors ...
-! **************************************************************************************************
-   SUBROUTINE singular_head_cell_factors_2d(bs_env, cells, factors)
-      TYPE(post_scf_bandstructure_type), POINTER         :: bs_env
-      INTEGER, INTENT(IN)                                :: cells(:, :)
-      COMPLEX(KIND=dp), ALLOCATABLE, INTENT(OUT)         :: factors(:)
-
-      INTEGER, PARAMETER                                 :: n_face = 24
-
-      COMPLEX(KIND=dp)                                   :: phase, radial
-      INTEGER                                            :: axis, icell, iq, it, j, n_near, nk, &
-                                                            sign_index
-      REAL(KIND=dp) :: a1(3), a2(3), area, area_bz, b(3, 2), cross_product(3), dq(3), jacobian, &
-         length, normal(3), qcart(3), qfrac(3), rcart(3), scaled(2), t
-      REAL(KIND=dp), ALLOCATABLE                         :: nodes(:), rule_weights(:)
-
-      IF (.NOT. ALL(bs_env%periodic == [1, 1, 0])) THEN
-         CPABORT('2D Coulomb cell correction requires PERIODIC XY')
-      END IF
-      nk = PRODUCT(bs_env%nkp_grid_chi_eps_W_orig)
-      a1 = bs_env%hmat(:, 1)
-      a2 = bs_env%hmat(:, 2)
-      normal = [a1(2)*a2(3) - a1(3)*a2(2), &
-                a1(3)*a2(1) - a1(1)*a2(3), &
-                a1(1)*a2(2) - a1(2)*a2(1)]
-      area = NORM2(normal)
-      CPASSERT(area > 0.0_dp)
-      normal = normal/area
-      b(:, 1) = twopi*[a2(2)*normal(3) - a2(3)*normal(2), &
-                       a2(3)*normal(1) - a2(1)*normal(3), &
-                       a2(1)*normal(2) - a2(2)*normal(1)]/area
-      b(:, 2) = twopi*[normal(2)*a1(3) - normal(3)*a1(2), &
-                       normal(3)*a1(1) - normal(1)*a1(3), &
-                       normal(1)*a1(2) - normal(2)*a1(1)]/area
-      area_bz = twopi**2/area
-      CALL gauss_legendre_cell_rule(n_face, nodes, rule_weights)
-      ALLOCATE (factors(SIZE(cells, 2)))
-      n_near = 0
-      DO iq = 1, nk
-         qfrac = bs_env%kpoints_chi_eps_W%xkp(:, iq) - &
-                 ANINT(bs_env%kpoints_chi_eps_W%xkp(:, iq))
-         scaled = ABS(qfrac(1:2))*REAL(bs_env%nkp_grid_chi_eps_W_orig(1:2), dp)
-         IF (MAXVAL(ABS(scaled - 0.5_dp)) < 1.0E-9_dp) n_near = n_near + 1
-      END DO
-      IF (n_near /= PRODUCT(MIN(2, bs_env%nkp_grid_chi_eps_W_orig(1:2)))) THEN
-         CPABORT('Inconsistent number of 2D Gamma-neighbor cells')
-      END IF
-      DO icell = 1, SIZE(cells, 2)
-         rcart = MATMUL(bs_env%hmat, REAL(cells(:, icell), dp))
-         factors(icell) = z_zero
-         DO axis = 1, 2
-            j = 3 - axis
-            dq = b(:, j)/REAL(MAX(2, bs_env%nkp_grid_chi_eps_W_orig(j)), dp)
-            DO sign_index = -1, 1, 2
-               DO it = 1, n_face
-                  t = nodes(it)
-                  qfrac = 0.0_dp
-                  qfrac(axis) = REAL(sign_index, dp)/ &
-                                REAL(MAX(2, bs_env%nkp_grid_chi_eps_W_orig(axis)), dp)
-                  qfrac(j) = t/REAL(MAX(2, bs_env%nkp_grid_chi_eps_W_orig(j)), dp)
-                  qcart = b(:, 1)*qfrac(1) + b(:, 2)*qfrac(2)
-                  length = NORM2(qcart)
-                  cross_product = [qcart(2)*dq(3) - qcart(3)*dq(2), &
-                                   qcart(3)*dq(1) - qcart(1)*dq(3), &
-                                   qcart(1)*dq(2) - qcart(2)*dq(1)]
-                  jacobian = ABS(DOT_PRODUCT(normal, cross_product))/length**2
-                  t = DOT_PRODUCT(qcart, rcart)/length
-                  IF (ABS(t*length) < 1.0E-4_dp) THEN
-                     radial = CMPLX(length - t*t*length**3/6.0_dp, &
-                                    -t*length**2/2.0_dp + t**3*length**4/24.0_dp, dp)
-                  ELSE
-                     radial = (z_one - EXP(-gaussi*t*length))/(gaussi*t)
-                  END IF
-                  factors(icell) = factors(icell) + &
-                                   rule_weights(it)*jacobian*radial/area_bz
-               END DO
-            END DO
-         END DO
-         DO iq = 1, nk
-            qfrac = bs_env%kpoints_chi_eps_W%xkp(:, iq) - &
-                    ANINT(bs_env%kpoints_chi_eps_W%xkp(:, iq))
-            scaled = ABS(qfrac(1:2))*REAL(bs_env%nkp_grid_chi_eps_W_orig(1:2), dp)
-            IF (MAXVAL(ABS(scaled - 0.5_dp)) >= 1.0E-9_dp) CYCLE
-            qcart = b(:, 1)*qfrac(1) + b(:, 2)*qfrac(2)
-            length = NORM2(qcart)
-            phase = EXP(-gaussi*DOT_PRODUCT(qcart, rcart))
-            factors(icell) = factors(icell) - phase/(REAL(nk, dp)*length)
-         END DO
-      END DO
-      DEALLOCATE (nodes, rule_weights)
-   END SUBROUTINE singular_head_cell_factors_2d
 
 ! **************************************************************************************************
 !> \brief Separate the 2D charge mode and factor the neutral Γ Coulomb body.
@@ -2595,9 +1664,9 @@ CONTAINS
       END DO
       body_sqrt(:, :) = MATMUL(projector, MATMUL(V_regular, projector))
       body_inverse(:, :) = body_sqrt
-      CALL power(body_sqrt, 0.5_dp, 0.0_dp, relative_eps=bs_env%regularization_RI)
-      CALL power(body_inverse, -0.5_dp, 0.0_dp, relative_eps=bs_env%regularization_RI)
-      CALL power(metric, -1.0_dp, 0.0_dp, relative_eps=bs_env%regularization_RI)
+      CALL local_complex_power(body_sqrt, 0.5_dp, 0.0_dp, relative_eps=bs_env%regularization_RI)
+      CALL local_complex_power(body_inverse, -0.5_dp, 0.0_dp, relative_eps=bs_env%regularization_RI)
+      CALL local_complex_power(metric, -1.0_dp, 0.0_dp, relative_eps=bs_env%regularization_RI)
       F_density = MATMUL(metric, MATMUL(projector, body_sqrt))
       ALLOCATE (F_external(n_ri, n_ri))
       F_external(:, :) = MATMUL(metric, MATMUL(V_regular, MATMUL(projector, body_inverse)))
@@ -2617,26 +1686,20 @@ CONTAINS
       TYPE(post_scf_bandstructure_type), POINTER         :: bs_env
       REAL(KIND=dp), INTENT(OUT)                         :: b(3, 2), area
 
-      REAL(KIND=dp)                                      :: a1(3), a2(3), normal(3)
+      REAL(KIND=dp)                                      :: normal(3)
 
-      a1 = bs_env%hmat(:, 1)
-      a2 = bs_env%hmat(:, 2)
-      normal = [a1(2)*a2(3) - a1(3)*a2(2), a1(3)*a2(1) - a1(1)*a2(3), &
-                a1(1)*a2(2) - a1(2)*a2(1)]
+      normal = vector_product(bs_env%hmat(:, 1), bs_env%hmat(:, 2))
       area = NORM2(normal)
       CPASSERT(area > 0.0_dp)
       normal = normal/area
-      b(:, 1) = twopi*[a2(2)*normal(3) - a2(3)*normal(2), &
-                       a2(3)*normal(1) - a2(1)*normal(3), &
-                       a2(1)*normal(2) - a2(2)*normal(1)]/area
-      b(:, 2) = twopi*[normal(2)*a1(3) - normal(3)*a1(2), &
-                       normal(3)*a1(1) - normal(1)*a1(3), &
-                       normal(1)*a1(2) - normal(2)*a1(1)]/area
+      b(:, 1) = twopi*vector_product(bs_env%hmat(:, 2), normal)/area
+      b(:, 2) = twopi*vector_product(normal, bs_env%hmat(:, 1))/area
    END SUBROUTINE slab_reciprocal_vectors
 
 ! **************************************************************************************************
 !> \brief Polar boundary quadrature of the four shifted Γ-neighbor cells.
 !> Directions d, radii L and weights approximate dθ on the bounding parallelogram.
+!> As in 3D, the fractional half-widths are min(1/n_i,1/2).
 !> \param bs_env ...
 !> \param directions ...
 !> \param weights ...
@@ -2650,35 +1713,28 @@ CONTAINS
 
       INTEGER                                            :: i_axis, i_direction, i_node, i_sign, &
                                                             j_axis
-      REAL(KIND=dp)                                      :: area, b(3, 2), cross(3), dq(3), q(3), &
-                                                            volume_check
+      REAL(KIND=dp)                                      :: area, b(3, 2), dq(3), q(3)
       REAL(KIND=dp), ALLOCATABLE                         :: nodes(:), rule(:)
 
       CALL slab_reciprocal_vectors(bs_env, b, area)
-      CALL gauss_legendre_cell_rule(n_face, nodes, rule)
+      ALLOCATE (nodes(n_face), rule(n_face))
+      CALL gauss_legendre(n_face, nodes, rule)
       ALLOCATE (directions(3, 4*n_face), weights(4*n_face), radii(4*n_face))
       i_direction = 0
       DO i_axis = 1, 2
          j_axis = 3 - i_axis
-         dq = b(:, j_axis)/REAL(bs_env%nkp_grid_chi_eps_W_orig(j_axis), dp)
+         dq = b(:, j_axis)/REAL(MAX(2, bs_env%nkp_grid_chi_eps_W_orig(j_axis)), dp)
          DO i_sign = -1, 1, 2
             DO i_node = 1, n_face
                i_direction = i_direction + 1
-               q = REAL(i_sign, dp)*b(:, i_axis)/REAL(bs_env%nkp_grid_chi_eps_W_orig(i_axis), dp) &
+               q = REAL(i_sign, dp)*b(:, i_axis)/REAL(MAX(2, bs_env%nkp_grid_chi_eps_W_orig(i_axis)), dp) &
                    + nodes(i_node)*dq
                radii(i_direction) = NORM2(q)
                directions(:, i_direction) = q/radii(i_direction)
-               cross = [q(2)*dq(3) - q(3)*dq(2), q(3)*dq(1) - q(1)*dq(3), &
-                        q(1)*dq(2) - q(2)*dq(1)]
-               weights(i_direction) = rule(i_node)*NORM2(cross)/SUM(q*q)
+               weights(i_direction) = rule(i_node)*NORM2(vector_product(q, dq))/SUM(q*q)
             END DO
          END DO
       END DO
-      volume_check = SUM(weights*radii**2)/2.0_dp
-      IF (ABS(volume_check/(4.0_dp*twopi**2/area/ &
-                            REAL(PRODUCT(bs_env%nkp_grid_chi_eps_W_orig), dp)) - 1.0_dp) > 1.0E-8_dp) THEN
-         CPABORT('2D Gamma cell quadrature failed its area check')
-      END IF
       DEALLOCATE (nodes, rule)
    END SUBROUTINE slab_cell_face_directions
 
@@ -2727,7 +1783,8 @@ CONTAINS
       n_frequency = bs_env%num_time_freq_points
       ALLOCATE (head_frequency(n_cells, n_frequency), SOURCE=z_zero)
       ALLOCATE (model%slab_wing_cell_frequency(3, n_frequency, n_cells), SOURCE=z_zero)
-      CALL gauss_legendre_cell_rule(n_radial, nodes, rule)
+      ALLOCATE (nodes(n_radial), rule(n_radial))
+      CALL gauss_legendre(n_radial, nodes, rule)
       DO i_cell = bs_env%para_env%mepos + 1, n_cells, bs_env%para_env%num_pe
          rcart = MATMUL(bs_env%hmat, REAL(cells(:, i_cell), dp))
          DO i_direction = 1, SIZE(model%radii)
@@ -2778,24 +1835,23 @@ CONTAINS
    END SUBROUTINE slab_gamma_corr_cell_integrals
 
 ! **************************************************************************************************
-!> \brief Apply the integrated 2D head and wings to local grid rows or pairs.
+!> \brief Apply the integrated 2D head and wings to local grid pairs.
 !> \param bs_env ...
 !> \param cells ...
 !> \param model ...
 !> \param i_t ...
 !> \param Z_zero_q ...
-!> \param first_row ...
 !> \param first_pair ...
 !> \param W_grid_R ...
 ! **************************************************************************************************
    SUBROUTINE add_slab_gamma_corr_cell_correction(bs_env, cells, model, i_t, Z_zero_q, &
-                                                  first_row, first_pair, W_grid_R)
+                                                  first_pair, W_grid_R)
       TYPE(post_scf_bandstructure_type), POINTER         :: bs_env
       INTEGER, INTENT(IN)                                :: cells(:, :)
       TYPE(gamma_correction_type), INTENT(IN)            :: model
       INTEGER, INTENT(IN)                                :: i_t
       COMPLEX(KIND=dp), INTENT(IN)                       :: Z_zero_q(:, :, :)
-      INTEGER, INTENT(IN)                                :: first_row, first_pair
+      INTEGER, INTENT(IN)                                :: first_pair
       REAL(KIND=dp), INTENT(INOUT)                       :: W_grid_R(:, :, :)
 
       CHARACTER(LEN=*), PARAMETER :: routineN = 'add_slab_gamma_corr_cell_correction'
@@ -2807,7 +1863,6 @@ CONTAINS
       CALL timeset(routineN, handle)
 
       n_grid = bs_env%ri_rs%n_grid_points
-      CPASSERT(SIZE(cells, 2) == SIZE(model%slab_head_cell_tau, 1))
       ALLOCATE (wing_left(n_grid), wing_right(n_grid))
       DO i_cell = 1, SIZE(cells, 2)
          wing_left(:) = z_zero
@@ -2820,7 +1875,7 @@ CONTAINS
                             + MATMUL(CONJG(model%slab_wing_cartesian(:, :, i_frequency)), coefficient)
          END DO
          CALL add_gamma_corr_pair_cell(bs_env, cells, i_cell, model%slab_head_cell_tau(i_cell, i_t), &
-                                       Z_zero_q(:, 1, 1), first_row, first_pair, W_grid_R, &
+                                       Z_zero_q(:, 1, 1), first_pair, W_grid_R, &
                                        wing_left, wing_right)
       END DO
       DEALLOCATE (wing_left, wing_right)
@@ -2838,25 +1893,24 @@ CONTAINS
 !> \param model ...
 !> \param i_t ...
 !> \param Z_zero_q ...
-!> \param first_row ...
 !> \param first_pair ...
 !> \param W_grid_R ...
 ! **************************************************************************************************
    SUBROUTINE add_gamma_corr_cell_correction(bs_env, cells, model, i_t, Z_zero_q, &
-                                             first_row, first_pair, W_grid_R)
+                                             first_pair, W_grid_R)
       TYPE(post_scf_bandstructure_type), POINTER         :: bs_env
       INTEGER, INTENT(IN)                                :: cells(:, :)
       TYPE(gamma_correction_type), INTENT(IN)            :: model
       INTEGER, INTENT(IN)                                :: i_t
       COMPLEX(KIND=dp), INTENT(IN)                       :: Z_zero_q(:, :, :)
-      INTEGER, INTENT(IN)                                :: first_row, first_pair
+      INTEGER, INTENT(IN)                                :: first_pair
       REAL(KIND=dp), INTENT(INOUT)                       :: W_grid_R(:, :, :)
 
       COMPLEX(KIND=dp)                                   :: f0, f1, head_scalar, kernel_h, kernel_w, &
                                                             phase
       COMPLEX(KIND=dp), ALLOCATABLE                      :: wing_left(:), wing_right(:)
       INTEGER                                            :: icell, idir, n_grid, nk
-      REAL(KIND=dp)                                      :: a, L, qcart(3), qnorm, rcart(3), volume
+      REAL(KIND=dp)                                      :: qcart(3), qnorm, rcart(3), volume
 
       n_grid = bs_env%ri_rs%n_grid_points
       nk = PRODUCT(bs_env%nkp_grid_chi_eps_W_orig)
@@ -2869,18 +1923,8 @@ CONTAINS
          wing_right(:) = z_zero
          DO idir = 1, SIZE(model%weights)
             IF (idir <= model%n_angular) THEN
-               L = model%radii(idir)
-               a = DOT_PRODUCT(model%directions(:, idir), rcart)
-               IF (ABS(a*L) < 1.0E-4_dp) THEN
-                  f0 = CMPLX(L - a*a*L**3/6.0_dp + a**4*L**5/120.0_dp, &
-                             -a*L*L/2.0_dp + a**3*L**4/24.0_dp, dp)
-                  f1 = CMPLX(L*L/2.0_dp - a*a*L**4/8.0_dp, &
-                             -a*L**3/3.0_dp + a**3*L**5/30.0_dp, dp)
-               ELSE
-                  phase = EXP(-gaussi*a*L)
-                  f0 = (z_one - phase)/(gaussi*a)
-                  f1 = (phase*(z_one + gaussi*a*L) - z_one)/(a*a)
-               END IF
+               CALL radial_phase_moments(DOT_PRODUCT(model%directions(:, idir), rcart), &
+                                         model%radii(idir), f0, f1)
                kernel_h = volume*fourpi/(twopi**3)*model%weights(idir)*f0
                kernel_w = volume*fourpi/(twopi**3)*model%weights(idir)*f1
             ELSE
@@ -2898,7 +1942,7 @@ CONTAINS
          head_scalar = head_scalar*fourpi/ &
                        ri_metric_head_zero(bs_env)**2
          CALL add_gamma_corr_pair_cell(bs_env, cells, icell, head_scalar, Z_zero_q(:, 1, 1), &
-                                       first_row, first_pair, W_grid_R, wing_left, wing_right)
+                                       first_pair, W_grid_R, wing_left, wing_right)
       END DO
       DEALLOCATE (wing_left, wing_right)
    END SUBROUTINE add_gamma_corr_cell_correction
@@ -2914,31 +1958,31 @@ CONTAINS
 
       CHARACTER(LEN=*), PARAMETER :: routineN = 'compute_Sigma_x_from_V'
 
-      COMPLEX(KIND=dp), ALLOCATABLE :: D_grid_k(:, :, :), D_grid_R_complex(:, :, :), &
-         head_cell_factor(:), interaction_q(:, :, :), Sigma_grid_k(:, :, :), V_grid_q(:, :, :), &
-         V_grid_R_complex(:, :, :)
-      INTEGER                                            :: first_row, handle, i_cell, i_col, i_row, &
-                                                            iq, iq_local, ispin, last_row, n_grid, &
-                                                            n_q_local, nrows_local, phase_handle
+      COMPLEX(KIND=dp), ALLOCATABLE                      :: G_grid_k(:, :, :), head_cell_factor(:), &
+                                                            interaction_q(:, :, :), &
+                                                            q_matrices(:, :, :)
+      COMPLEX(KIND=dp), POINTER                          :: scf_values(:, :, :, :)
+      INTEGER                                            :: handle, iq, iq_local, ispin, n_grid, &
+                                                            n_q_local, phase_handle
       INTEGER, ALLOCATABLE                               :: full_cells(:, :)
       REAL(KIND=dp)                                      :: head_metric_zero
       REAL(KIND=dp), ALLOCATABLE                         :: qpoints(:, :), Sigma_grid_R(:, :, :), &
                                                             V_grid_R(:, :, :)
+      TYPE(pair_transfer_plan_type)                      :: green_plan, V_plan
 
       CALL timeset(routineN, handle)
 
       ALLOCATE (gwkp_env%sigma_x_bands(bs_env%n_ao, bs_env%nkp_bs_and_DOS, bs_env%n_spin))
       n_grid = bs_env%ri_rs%n_grid_points
-      CALL local_grid_row_range(n_grid, bs_env%para_env, first_row, last_row, nrows_local)
-      ALLOCATE (V_grid_q(nrows_local, n_grid, bs_env%nkp_scf_desymm))
+      ! Same grid-pair distribution as Σc: q owners MOD(q,P), k owners MOD(k-1,P).
+      CALL initialize_pair_transfer(V_plan, n_grid, bs_env%nkp_scf_desymm, 0, bs_env%para_env)
+      CALL initialize_pair_transfer(green_plan, n_grid, bs_env%nkp_scf_desymm, -1, bs_env%para_env)
       n_q_local = SIZE(gwkp_env%Z_lP_q, 3)
       IF (SIZE(gwkp_env%Z_lP_zero, 2) /= bs_env%n_RI + 1 .OR. SIZE(gwkp_env%Z_lP_zero, 3) /= 1) THEN
          CPABORT("Periodic RI-RS GW requires the direct Gamma auxiliary fit")
       END IF
       ALLOCATE (qpoints(3, bs_env%nkp_scf_desymm))
-      DO iq = 1, bs_env%nkp_scf_desymm
-         qpoints(:, iq) = momentum_transfer_point(bs_env, iq)
-      END DO
+      qpoints(:, :) = bs_env%kpoints_chi_eps_W%xkp(:, 1:bs_env%nkp_scf_desymm)
       CPASSERT(SIZE(gwkp_env%Z_lP_q, 2) == bs_env%n_RI)
       CPASSERT(ALLOCATED(gwkp_env%metric_coulomb_factor))
       ALLOCATE (interaction_q(bs_env%n_RI, bs_env%n_RI, n_q_local))
@@ -2952,77 +1996,63 @@ CONTAINS
          WRITE (bs_env%unit_nr, '(T2,A)') 'GW exchange: projecting bare Coulomb onto RI-RS grid'
          CALL m_flush(bs_env%unit_nr)
       END IF
-      CALL project_auxiliary_interaction_q_to_fft_rows(gwkp_env%Z_lP_q, interaction_q, &
-                                                       bs_env%nkp_scf_desymm, bs_env%para_env, &
-                                                       V_grid_q)
+      ALLOCATE (q_matrices(n_grid, n_grid, n_q_local))
+      !$OMP PARALLEL DO DEFAULT(NONE) SCHEDULE(STATIC) &
+      !$OMP SHARED(gwkp_env, interaction_q, q_matrices, n_q_local) PRIVATE(iq_local)
+      DO iq_local = 1, n_q_local
+         CALL contract_auxiliary_interaction_q(gwkp_env%Z_lP_q(:, :, iq_local), &
+                                               interaction_q(:, :, iq_local), &
+                                               q_matrices(:, :, iq_local))
+      END DO
+      !$OMP END PARALLEL DO
+      DEALLOCATE (interaction_q)
+      ALLOCATE (G_grid_k(V_plan%n_local, 1, bs_env%nkp_scf_desymm))
+      CALL q_matrices_to_fft_pairs(q_matrices, bs_env%para_env, V_plan, G_grid_k)
+      DEALLOCATE (q_matrices)
       CALL timestop(phase_handle)
       IF (bs_env%unit_nr > 0) THEN
          WRITE (bs_env%unit_nr, '(T2,A)') 'GW exchange: bare-Coulomb grid projection complete'
          CALL m_flush(bs_env%unit_nr)
       END IF
-      DEALLOCATE (interaction_q)
       CALL build_full_cell_grid(bs_env, full_cells)
-      ALLOCATE (V_grid_R_complex(nrows_local, n_grid, SIZE(full_cells, 2)))
-
-      CALL k_grid_to_cell_fft(V_grid_q, qpoints, bs_env%kpoints_scf_desymm%nkp_grid, &
-                              full_cells, V_grid_R_complex)
-      DEALLOCATE (V_grid_q)
+      ALLOCATE (V_grid_R(V_plan%n_local, 1, SIZE(full_cells, 2)))
+      CALL gw_k_grid_to_real_cells(G_grid_k, qpoints, bs_env%kpoints_scf_desymm%nkp_grid, &
+                                   full_cells, V_grid_R)
       CALL singular_head_cell_factors(bs_env, full_cells, head_cell_factor)
       head_metric_zero = ri_metric_head_zero(bs_env)
-      ALLOCATE (V_grid_R(nrows_local, n_grid, SIZE(full_cells, 2)))
-      V_grid_R(:, :, :) = REAL(V_grid_R_complex, KIND=dp)
-      DEALLOCATE (V_grid_R_complex)
       DO iq = 1, SIZE(full_cells, 2)
          IF (ALL(bs_env%periodic == [1, 1, 0])) THEN
             CALL add_gamma_corr_pair_cell(bs_env, full_cells, iq, &
                                           twopi/head_metric_zero**2*head_cell_factor(iq), &
-                                          gwkp_env%Z_lP_zero(:, 1, 1), first_row, 0, V_grid_R)
+                                          gwkp_env%Z_lP_zero(:, 1, 1), V_plan%first_pair, V_grid_R)
          ELSE
             CALL add_gamma_corr_pair_cell(bs_env, full_cells, iq, &
                                           fourpi/head_metric_zero**2*head_cell_factor(iq), &
-                                          gwkp_env%Z_lP_zero(:, 1, 1), first_row, 0, V_grid_R)
+                                          gwkp_env%Z_lP_zero(:, 1, 1), V_plan%first_pair, V_grid_R)
          END IF
       END DO
       DEALLOCATE (head_cell_factor)
+      NULLIFY (scf_values)
+      IF (orbitals_cover_scf(bs_env, gwkp_env%band_orbitals)) scf_values => gwkp_env%band_orbitals
 
+      ALLOCATE (Sigma_grid_R, MOLD=V_grid_R)
       DO ispin = 1, bs_env%n_spin
          CALL timeset('Sigma_x_density_grid', phase_handle)
-         ALLOCATE (D_grid_k(nrows_local, n_grid, bs_env%nkp_scf_desymm))
-         CALL build_green_grid_k_rows(bs_env, gwkp_env%psi_lm_k(:, :, :, ispin), &
-                                      bs_env%para_env, 0.0_dp, ispin, .TRUE., &
-                                      first_row, last_row, D_grid_k)
-         ALLOCATE (D_grid_R_complex(nrows_local, n_grid, SIZE(full_cells, 2)))
-         CALL k_grid_to_cell_fft(D_grid_k, bs_env%kpoints_scf_desymm%xkp, &
-                                 bs_env%kpoints_scf_desymm%nkp_grid, full_cells, D_grid_R_complex)
-         DEALLOCATE (D_grid_k)
-         ALLOCATE (Sigma_grid_R(nrows_local, n_grid, SIZE(full_cells, 2)))
-         !$OMP PARALLEL DO COLLAPSE(2) DEFAULT(NONE) SCHEDULE(STATIC) &
-         !$OMP SHARED(D_grid_R_complex, V_grid_R, Sigma_grid_R, nrows_local, n_grid, full_cells) &
-         !$OMP PRIVATE(i_cell, i_col, i_row)
-         DO i_cell = 1, SIZE(full_cells, 2)
-            DO i_col = 1, n_grid
-               DO i_row = 1, nrows_local
-                  Sigma_grid_R(i_row, i_col, i_cell) = &
-                     -REAL(D_grid_R_complex(i_row, i_col, i_cell), KIND=dp)*V_grid_R(i_row, i_col, i_cell)
-               END DO
-            END DO
-         END DO
-         !$OMP END PARALLEL DO
-         DEALLOCATE (D_grid_R_complex)
-         IF (ispin == bs_env%n_spin) DEALLOCATE (V_grid_R)
-         ALLOCATE (Sigma_grid_k(nrows_local, n_grid, bs_env%nkp_scf_desymm))
+         CALL build_green_grid_k_pairs(bs_env, gwkp_env%psi_lm_k(:, :, :, ispin), bs_env%para_env, &
+                                       green_plan, 0.0_dp, ispin, .TRUE., G_grid_k, scf_values)
+         CALL gw_k_grid_to_real_cells(G_grid_k, bs_env%kpoints_scf_desymm%xkp, &
+                                      bs_env%kpoints_scf_desymm%nkp_grid, full_cells, Sigma_grid_R)
+         Sigma_grid_R(:, :, :) = -Sigma_grid_R*V_grid_R
          CALL product_to_k_pair_centered(bs_env, full_cells, bs_env%kpoints_scf_desymm%xkp, &
-                                         Sigma_grid_R, Sigma_grid_k, first_row, 0)
-         DEALLOCATE (Sigma_grid_R)
+                                         Sigma_grid_R, G_grid_k, 0, V_plan%first_pair)
          CALL timestop(phase_handle)
 
-         CALL self_energy_RS_to_Bloch(bs_env, Sigma_grid_k, first_row, last_row, ispin, &
-                                      gwkp_env%sigma_x_bands(:, :, ispin), gwkp_env%interpolation, &
-                                      gwkp_env%band_orbitals)
-         DEALLOCATE (Sigma_grid_k)
+         CALL self_energy_pairs_to_Bloch(bs_env, G_grid_k, V_plan%first_pair, ispin, &
+                                         gwkp_env%sigma_x_bands(:, :, ispin), bs_env%para_env, &
+                                         gwkp_env%interpolation, gwkp_env%band_orbitals)
       END DO
 
-      DEALLOCATE (full_cells, qpoints)
+      DEALLOCATE (full_cells, G_grid_k, qpoints, Sigma_grid_R, V_grid_R)
 
       CALL timestop(handle)
 
@@ -3042,11 +2072,10 @@ CONTAINS
       COMPLEX(dp), ALLOCATABLE, TARGET                   :: scf_orbitals(:, :, :, :)
       COMPLEX(KIND=dp), ALLOCATABLE                      :: G_grid_k(:, :, :)
       COMPLEX(KIND=dp), POINTER                          :: scf_values(:, :, :, :)
-      INTEGER                                            :: handle, i_group, i_t, iq, ispin, n_grid, &
-                                                            n_group_times, n_pairs_local, &
-                                                            phase_handle, shared_ranks
+      INTEGER                                            :: handle, i_group, i_t, ispin, n_grid, &
+                                                            n_pairs_local, phase_handle, &
+                                                            shared_ranks
       INTEGER, ALLOCATABLE                               :: full_cells(:, :)
-      LOGICAL                                            :: valid_layout
       REAL(KIND=dp)                                      :: step_elapsed, step_start, tau
       REAL(KIND=dp), ALLOCATABLE :: qpoints(:, :), sigma_band(:, :), Sigma_grid_R(:, :, :), &
          sigma_points(:, :), sigma_result_buffer(:), step_times(:), W_grid_R(:, :, :)
@@ -3063,24 +2092,13 @@ CONTAINS
       n_pairs_local = W_plan%n_local
       CPASSERT(green_plan%first_pair == W_plan%first_pair)
       CPASSERT(green_plan%n_local == n_pairs_local)
-      n_group_times = (bs_env%num_time_freq_points - gwkp_env%my_group + gwkp_env%ngroups - 1)/gwkp_env%ngroups
-      DO iq = 1, SIZE(gwkp_env%W_PQ_tau)
-         CPASSERT(ALLOCATED(gwkp_env%W_PQ_tau(iq)%values))
-         IF (.NOT. (SIZE(gwkp_env%W_PQ_tau(iq)%values, 1) == bs_env%n_RI)) THEN
-            CPABORT("Internal GW array shape mismatch")
-         END IF
-         valid_layout = SIZE(gwkp_env%W_PQ_tau(iq)%values, 3) == n_group_times
-         CPASSERT(valid_layout)
-      END DO
       ALLOCATE (G_grid_k(n_pairs_local, 1, bs_env%nkp_scf_desymm))
       ALLOCATE (W_grid_R(n_pairs_local, 1, SIZE(full_cells, 2)))
       ALLOCATE (Sigma_grid_R, MOLD=W_grid_R)
       ALLOCATE (qpoints(3, bs_env%nkp_scf_desymm))
       ALLOCATE (sigma_points(3, bs_env%nkp_scf_desymm))
-      DO iq = 1, bs_env%nkp_scf_desymm
-         qpoints(:, iq) = momentum_transfer_point(bs_env, iq)
-         sigma_points(:, iq) = bs_env%kpoints_scf_desymm%xkp(:, iq)
-      END DO
+      qpoints(:, :) = bs_env%kpoints_chi_eps_W%xkp(:, 1:bs_env%nkp_scf_desymm)
+      sigma_points(:, :) = bs_env%kpoints_scf_desymm%xkp(:, 1:bs_env%nkp_scf_desymm)
       ALLOCATE (sigma_band(bs_env%n_ao, bs_env%nkp_bs_and_DOS))
       ALLOCATE (gwkp_env%sigma_c_bands(bs_env%n_ao, bs_env%nkp_bs_and_DOS, &
                                        bs_env%num_time_freq_points, 2, bs_env%n_spin))
@@ -3117,10 +2135,10 @@ CONTAINS
          CALL timestop(phase_handle)
          IF (ALL(bs_env%periodic == [1, 1, 0])) THEN
             CALL add_slab_gamma_corr_cell_correction(bs_env, full_cells, gwkp_env%gamma_correction, i_t, &
-                                                     gwkp_env%Z_lP_zero, 0, W_plan%first_pair, W_grid_R)
+                                                     gwkp_env%Z_lP_zero, W_plan%first_pair, W_grid_R)
          ELSE
             CALL add_gamma_corr_cell_correction(bs_env, full_cells, gwkp_env%gamma_correction, i_t, &
-                                                gwkp_env%Z_lP_zero, 0, W_plan%first_pair, W_grid_R)
+                                                gwkp_env%Z_lP_zero, W_plan%first_pair, W_grid_R)
          END IF
          CALL truncate_grid_W_by_pair_distance_pairs(bs_env, full_cells, W_plan, W_grid_R)
          tau = bs_env%time_frequency_grid%imaginary_time(i_t)
@@ -3279,17 +2297,13 @@ CONTAINS
 
       COMPLEX(KIND=dp), ALLOCATABLE                      :: plane(:, :)
       INTEGER                                            :: handle, i_local, i_progress, i_root, &
-                                                            ikp, ispin, n_done, n_grid, n_owned, &
-                                                            n_total, ready
+                                                            ikp, ispin, n_done, n_grid, n_total, &
+                                                            ready
       REAL(KIND=dp)                                      :: available_GB, required_bytes, started
 
       CALL timeset('collect_scf_grid_orbitals', handle)
 
       n_grid = bs_env%ri_rs%n_grid_points
-      CPASSERT(n_grid > 0 .AND. SIZE(psi, 2) == bs_env%n_ao)
-      CPASSERT(SIZE(psi, 4) == bs_env%n_spin)
-      n_owned = (bs_env%nkp_scf_desymm + para_env%num_pe - 1 - para_env%mepos)/para_env%num_pe
-      CPASSERT(SIZE(psi, 3) == n_owned)
       required_bytes = 16.0_dp*REAL(n_grid, dp)*REAL(bs_env%n_ao, dp)* &
                        (REAL(bs_env%nkp_scf_desymm, dp)*REAL(bs_env%n_spin, dp) + &
                         REAL(1 + omp_get_max_threads(), dp))
@@ -3379,19 +2393,15 @@ CONTAINS
 !> \param tau ...
 !> \param ispin ...
 !> \param occupied ...
-!> \param first_row ...
-!> \param last_row ...
 !> \param G_grid_k ...
 ! **************************************************************************************************
-   SUBROUTINE build_green_grid_k_rows(bs_env, psi_lm_k, group_env, tau, ispin, occupied, first_row, &
-                                      last_row, G_grid_k)
+   SUBROUTINE build_green_grid_k_rows(bs_env, psi_lm_k, group_env, tau, ispin, occupied, G_grid_k)
       TYPE(post_scf_bandstructure_type), POINTER         :: bs_env
       COMPLEX(KIND=dp), DIMENSION(:, :, :), INTENT(IN)   :: psi_lm_k
       TYPE(mp_para_env_type), POINTER                    :: group_env
       REAL(KIND=dp), INTENT(IN)                          :: tau
       INTEGER, INTENT(IN)                                :: ispin
       LOGICAL, INTENT(IN)                                :: occupied
-      INTEGER, INTENT(IN)                                :: first_row, last_row
       COMPLEX(KIND=dp), DIMENSION(:, :, :), INTENT(OUT)  :: G_grid_k
 
       CHARACTER(LEN=*), PARAMETER :: routineN = 'build_green_grid_k_rows'
@@ -3445,11 +2455,9 @@ CONTAINS
             END DO
             DO i_dest = 0, group_env%num_pe - 1
                CALL pack_product_row_block(transfer, i_dest, scaled_coeff(:, 1:n_bands), &
-                                           scaled_coeff(:, 1:n_bands), bs_env%ri_rs%n_grid_points, n_bands, ikp_local, max_rows)
+                                           bs_env%ri_rs%n_grid_points, n_bands, ikp_local, max_rows)
             END DO
          END DO
-         CPASSERT(ikp_local <= SIZE(psi_lm_k, 3))
-         CPASSERT(SIZE(G_grid_k, 1) == MAX(0, last_row - first_row + 1))
          CALL timestop(phase_handle)
          CALL timeset('chi_green_redistribute', phase_handle)
          CALL exchange_transfer_block(transfer, group_env)
@@ -3488,7 +2496,6 @@ CONTAINS
       INTEGER                                            :: first_band, first_col, handle, i_band, &
                                                             i_col, i_pair, i_row, ikp, last_col, &
                                                             n_bands, n_columns, n_grid, n_local
-      LOGICAL                                            :: valid_layout
       REAL(KIND=dp)                                      :: tau_E
       TYPE(gwkp_type), POINTER                           :: gwkp_env
 
@@ -3498,13 +2505,6 @@ CONTAINS
 
       n_grid = bs_env%ri_rs%n_grid_points
       n_local = SIZE(G_pairs, 1)
-      CPASSERT(n_grid > 0 .AND. SIZE(orbitals, 2) == bs_env%n_ao)
-      CPASSERT(SIZE(orbitals, 3) >= bs_env%nkp_scf_desymm)
-      IF (.NOT. (SIZE(G_pairs, 2) == 1 .AND. SIZE(G_pairs, 3) == bs_env%nkp_scf_desymm)) THEN
-         CPABORT("Internal GW array shape mismatch")
-      END IF
-      valid_layout = first_pair >= 1 .AND. first_pair + n_local - 1 <= n_grid*n_grid
-      CPASSERT(valid_layout)
       first_band = 1
       n_bands = bs_env%n_occ(ispin)
       IF (.NOT. occupied) THEN
@@ -3805,22 +2805,6 @@ CONTAINS
       END DO
 
    END SUBROUTINE build_full_cell_grid
-
-! **************************************************************************************************
-!> \brief Return the shifted transfer quadrature in SCF-point ordering.
-!> \param bs_env ...
-!> \param iq ...
-!> \return ...
-! **************************************************************************************************
-   PURE FUNCTION momentum_transfer_point(bs_env, iq) RESULT(qpoint)
-      TYPE(post_scf_bandstructure_type), INTENT(IN), &
-         POINTER                                         :: bs_env
-      INTEGER, INTENT(IN)                                :: iq
-      REAL(KIND=dp)                                      :: qpoint(3)
-
-      qpoint = bs_env%kpoints_chi_eps_W%xkp(:, iq)
-
-   END FUNCTION momentum_transfer_point
 
 ! **************************************************************************************************
 !> \brief Zero-wave-vector Fourier value of the selected RI metric kernel.
@@ -4215,64 +3199,6 @@ CONTAINS
    END SUBROUTINE ri_2c_lattice_to_owned_q
 
 ! **************************************************************************************************
-!> \brief Compute the spectrum and inverse of H=C^T M(q) C on one MPI q group.
-!> H is Hermitian. The root supplies H in bounded column blocks; eigensolver,
-!> Cholesky factorization and inversion use block-cyclic distributed matrices.
-!> Preserve the local path's rejection rule lambda_min <= 1e-12 lambda_max.
-!> Only the root receives H^-1 for the existing atom-block objective gradient.
-!> \param group_env ...
-!> \param matrix ...
-!> \param eigenvalues ...
-!> \param inverse ...
-! **************************************************************************************************
-   SUBROUTINE auto_ri_grouped_inverse(group_env, matrix, eigenvalues, inverse)
-      TYPE(mp_para_env_type), POINTER                    :: group_env
-      COMPLEX(dp), INTENT(IN)                            :: matrix(:, :)
-      REAL(dp), INTENT(OUT)                              :: eigenvalues(:)
-      COMPLEX(dp), INTENT(OUT)                           :: inverse(:, :)
-
-      INTEGER                                            :: handle, info, n, phase_handle
-      TYPE(cp_blacs_env_type), POINTER                   :: blacs
-      TYPE(cp_cfm_type)                                  :: distributed, scratch
-      TYPE(cp_fm_struct_type), POINTER                   :: structure
-
-      NULLIFY (blacs, structure)
-
-      CALL timeset('auto_ri_grouped_inverse', handle)
-
-      n = SIZE(eigenvalues)
-      CALL cp_blacs_env_create(blacs, group_env)
-      CALL cp_fm_struct_create(structure, context=blacs, nrow_global=n, ncol_global=n)
-      CALL cp_cfm_create(distributed, structure)
-      CALL cp_cfm_create(scratch, structure)
-      CALL set_owner_matrix(distributed, matrix, group_env, 0, n)
-      CALL timeset('auto_ri_grouped_spectrum', phase_handle)
-      CALL cp_cfm_heevd(distributed, scratch, eigenvalues)
-      CALL timestop(phase_handle)
-      IF (MAXVAL(eigenvalues) > 0.0_dp .AND. &
-          MINVAL(eigenvalues) > eps_auto_ri_metric*MAXVAL(eigenvalues)) THEN
-         CALL set_owner_matrix(distributed, matrix, group_env, 0, n)
-         CALL timeset('auto_ri_grouped_cholesky', phase_handle)
-         CALL cp_cfm_cholesky_decompose(distributed, info_out=info)
-         IF (info /= 0) CPABORT('Distributed AUTO_RI metric factorization failed')
-         CALL cp_cfm_cholesky_invert(distributed, info_out=info)
-         IF (info /= 0) CPABORT('Distributed AUTO_RI metric inversion failed')
-         CALL cp_cfm_uplo_to_full(distributed, scratch, uplo='U')
-         CALL timestop(phase_handle)
-         CALL get_owner_matrix(distributed, inverse, group_env, 0, n)
-      ELSE
-         inverse = CMPLX(0.0_dp, 0.0_dp, dp)
-      END IF
-      CALL cp_cfm_release(scratch)
-      CALL cp_cfm_release(distributed)
-      CALL cp_fm_struct_release(structure)
-      CALL cp_blacs_env_release(blacs)
-
-      CALL timestop(handle)
-
-   END SUBROUTINE auto_ri_grouped_inverse
-
-! **************************************************************************************************
 !> \brief Cache Gamma-correction response in imaginary time, distributed by RI-RS grid rows.
 !>
 !> Let psi_li=sum_mu phi_mu(r_l) C_mu,i(k), and let m be the midpoint
@@ -4306,7 +3232,6 @@ CONTAINS
 
       CALL timeset('gamma_ao_time_prepare', handle)
 
-      CALL gamma_ao_time_release(state)
       CALL initialize_time_state(bs_env, bs_env%ri_rs%n_grid_points, state)
       CALL validate_time_transform(bs_env)
       CALL accumulate_time_state(bs_env, psi, dipole, volume, state)
@@ -4323,28 +3248,41 @@ CONTAINS
 !> \param state ...
 !> \param Z ...
 !> \param F ...
-!> \param frequency ...
+!> \param j_w Frequency index.
 !> \param E ...
 !> \param P ...
 !> \param X ...
 ! **************************************************************************************************
-   SUBROUTINE gamma_ao_time_response(bs_env, state, Z, F, frequency, E, P, X)
+   SUBROUTINE gamma_ao_time_response(bs_env, state, Z, F, j_w, E, P, X)
       TYPE(post_scf_bandstructure_type), POINTER         :: bs_env
       TYPE(gamma_ao_time_state_type), INTENT(INOUT)      :: state
       COMPLEX(KIND=dp), INTENT(IN)                       :: Z(:, :), F(:, :)
-      REAL(KIND=dp), INTENT(IN)                          :: frequency
+      INTEGER, INTENT(IN)                                :: j_w
       COMPLEX(KIND=dp), INTENT(OUT)                      :: E(:, :), P(:, :), X(:, :)
 
-      COMPLEX(KIND=dp)                                   :: head_frequency(3, 3)
       COMPLEX(KIND=dp), ALLOCATABLE                      :: chi_frequency(:, :), wing_frequency(:, :)
-      INTEGER                                            :: handle
+      INTEGER                                            :: handle, nr, t
 
       CALL timeset('gamma_ao_time_response', handle)
 
-      CALL transform_time_state(bs_env, state, frequency, chi_frequency, wing_frequency, head_frequency)
+      ! Apply the existing cosine coefficients to the local cache, without rebuilding Green matrices.
+      nr = SIZE(state%chi_tau, 1)
+      ALLOCATE (chi_frequency(nr, SIZE(state%chi_tau, 2)), wing_frequency(nr, 3), SOURCE=z_zero)
+      P = z_zero
+      DO t = 1, bs_env%num_time_freq_points
+         chi_frequency(:, :) = chi_frequency + &
+                               bs_env%time_frequency_grid%cosine_time_to_frequency(j_w, t)*state%chi_tau(:, :, t)
+         wing_frequency(:, :) = wing_frequency + &
+                                bs_env%time_frequency_grid%cosine_time_to_frequency(j_w, t)*state%wing_tau(:, :, t)
+         P = P + bs_env%time_frequency_grid%cosine_time_to_frequency(j_w, t)*state%head_tau(:, :, t)
+      END DO
       CALL initialize_metric_grid_rows(state, Z, F)
-      CALL project_gamma_corr_wing(bs_env, wing_frequency, head_frequency, state%metric_rows, E, P)
-      CALL solve_gamma_corr_responses(bs_env, state%metric_rows, chi_frequency, state%first_row, E, X)
+      ! Project the wing as E_Qc = sum_l conjg(T_lQ) E_lc over disjoint rows.
+      E = z_zero
+      IF (nr > 0) CALL zgemm('C', 'N', SIZE(state%metric_rows, 2), 3, nr, z_one, state%metric_rows, nr, &
+                             wing_frequency, nr, z_zero, E, SIZE(E, 1))
+      CALL bs_env%para_env%sum(E)
+      CALL solve_gamma_corr_body(bs_env, state%metric_rows, chi_frequency, state%first_row, E, X)
 
       CALL timestop(handle)
 
@@ -4582,40 +3520,6 @@ CONTAINS
    END SUBROUTINE accumulate_k_time_rows
 
 ! **************************************************************************************************
-!> \brief Apply the existing cosine coefficients to the local cache, without rebuilding Green matrices.
-!> \param bs_env ...
-!> \param state ...
-!> \param frequency ...
-!> \param chi_frequency ...
-!> \param wing_frequency ...
-!> \param head_frequency ...
-! **************************************************************************************************
-   SUBROUTINE transform_time_state(bs_env, state, frequency, chi_frequency, wing_frequency, head_frequency)
-      TYPE(post_scf_bandstructure_type), POINTER         :: bs_env
-      TYPE(gamma_ao_time_state_type), INTENT(IN)         :: state
-      REAL(KIND=dp), INTENT(IN)                          :: frequency
-      COMPLEX(KIND=dp), ALLOCATABLE, INTENT(OUT)         :: chi_frequency(:, :), wing_frequency(:, :)
-      COMPLEX(KIND=dp), INTENT(OUT)                      :: head_frequency(3, 3)
-
-      INTEGER                                            :: t, w
-      REAL(KIND=dp)                                      :: coefficient
-
-      CPASSERT(ALLOCATED(state%chi_tau))
-      w = MINLOC(ABS(bs_env%time_frequency_grid%frequency - frequency), DIM=1)
-      coefficient = ABS(bs_env%time_frequency_grid%frequency(w) - frequency)
-      CPASSERT(coefficient < 1.0E-12_dp)
-      ALLOCATE (chi_frequency(SIZE(state%chi_tau, 1), SIZE(state%chi_tau, 2)), SOURCE=z_zero)
-      ALLOCATE (wing_frequency(SIZE(state%wing_tau, 1), 3), SOURCE=z_zero)
-      head_frequency = z_zero
-      DO t = 1, bs_env%num_time_freq_points
-         coefficient = bs_env%time_frequency_grid%cosine_time_to_frequency(w, t)
-         chi_frequency(:, :) = chi_frequency + coefficient*state%chi_tau(:, :, t)
-         wing_frequency(:, :) = wing_frequency + coefficient*state%wing_tau(:, :, t)
-         head_frequency = head_frequency + coefficient*state%head_tau(:, :, t)
-      END DO
-   END SUBROUTINE transform_time_state
-
-! **************************************************************************************************
 !> \brief Form T_lQ = sum_P Z_lP F_PQ once on the owned grid rows.
 !> The same T is reused for all frequencies; no replicated grid-by-RI map is formed.
 !> \param state ...
@@ -4647,31 +3551,6 @@ CONTAINS
       CALL timestop(handle)
 
    END SUBROUTINE initialize_metric_grid_rows
-
-! **************************************************************************************************
-!> \brief Project the wing as E_Qc = sum_l conjg(T_lQ) E_lc over disjoint rows.
-!> \param bs_env ...
-!> \param wing_frequency ...
-!> \param head_frequency ...
-!> \param T_rows ...
-!> \param E ...
-!> \param P ...
-! **************************************************************************************************
-   SUBROUTINE project_gamma_corr_wing(bs_env, wing_frequency, head_frequency, T_rows, E, P)
-      TYPE(post_scf_bandstructure_type), POINTER         :: bs_env
-      COMPLEX(KIND=dp), INTENT(IN)                       :: wing_frequency(:, :), &
-                                                            head_frequency(3, 3), T_rows(:, :)
-      COMPLEX(KIND=dp), INTENT(OUT)                      :: E(:, :), P(:, :)
-
-      INTEGER                                            :: nr
-
-      nr = SIZE(wing_frequency, 1)
-      E = z_zero
-      IF (nr > 0) CALL zgemm('C', 'N', SIZE(T_rows, 2), 3, nr, z_one, T_rows, nr, &
-                             wing_frequency, nr, z_zero, E, SIZE(E, 1))
-      CALL bs_env%para_env%sum(E)
-      P = head_frequency
-   END SUBROUTINE project_gamma_corr_wing
 
 ! **************************************************************************************************
 !> \brief Apply T^H chi T with distributed rows and reductions of three-column vectors.
@@ -4718,32 +3597,6 @@ CONTAINS
    END SUBROUTINE apply_gamma_corr_body
 
 ! **************************************************************************************************
-!> \brief Solve and verify all three Gamma-correction right sides.
-!> \param bs_env ...
-!> \param T_rows ...
-!> \param chi ...
-!> \param first_row ...
-!> \param E ...
-!> \param X ...
-! **************************************************************************************************
-   SUBROUTINE solve_gamma_corr_responses(bs_env, T_rows, chi, first_row, E, X)
-      TYPE(post_scf_bandstructure_type), POINTER         :: bs_env
-      COMPLEX(KIND=dp), INTENT(IN)                       :: T_rows(:, :), chi(:, :)
-      INTEGER, INTENT(IN)                                :: first_row
-      COMPLEX(KIND=dp), INTENT(IN)                       :: E(:, :)
-      COMPLEX(KIND=dp), INTENT(OUT)                      :: X(:, :)
-
-      INTEGER                                            :: worst_iterations
-      REAL(KIND=dp)                                      :: worst_residual
-
-      CALL solve_gamma_corr_body(bs_env, T_rows, chi, first_row, E, X, worst_iterations, worst_residual)
-      IF (bs_env%unit_nr > 0) THEN
-         WRITE (bs_env%unit_nr, '(T2,A,T69,I12)') 'Gamma time response maximum iterations:', worst_iterations
-         WRITE (bs_env%unit_nr, '(T2,A,T61,ES20.12)') 'Gamma time response true relative residual:', worst_residual
-      END IF
-   END SUBROUTINE solve_gamma_corr_responses
-
-! **************************************************************************************************
 !> \brief Independent conjugate gradients for three directions, sharing matrix actions and reductions.
 !> Each column c retains its own alpha_c, beta_c and convergence test; columns are not coupled.
 !> Before accepting a column, recompute b_c-(I+F^H Z^H chi Z F)x_c independently.
@@ -4753,17 +3606,13 @@ CONTAINS
 !> \param first_row ...
 !> \param b ...
 !> \param x ...
-!> \param iterations ...
-!> \param residual ...
 ! **************************************************************************************************
-   SUBROUTINE solve_gamma_corr_body(bs_env, T_rows, chi, first_row, b, x, iterations, residual)
+   SUBROUTINE solve_gamma_corr_body(bs_env, T_rows, chi, first_row, b, x)
       TYPE(post_scf_bandstructure_type), POINTER         :: bs_env
       COMPLEX(KIND=dp), INTENT(IN)                       :: T_rows(:, :), chi(:, :)
       INTEGER, INTENT(IN)                                :: first_row
       COMPLEX(KIND=dp), INTENT(IN)                       :: b(:, :)
       COMPLEX(KIND=dp), INTENT(OUT)                      :: x(:, :)
-      INTEGER, INTENT(OUT)                               :: iterations
-      REAL(KIND=dp), INTENT(OUT)                         :: residual
 
       REAL(KIND=dp), PARAMETER                           :: tolerance = 1.0E-12_dp
 
@@ -4771,11 +3620,12 @@ CONTAINS
       COMPLEX(KIND=dp), ALLOCATABLE                      :: aux_y(:, :), direction(:, :), &
                                                             grid_x(:, :), grid_y(:, :), &
                                                             PRODUCT(:, :), r(:, :), true_r(:, :)
-      INTEGER                                            :: handle, i_c, i_iter, nc
+      INTEGER                                            :: handle, i_c, i_iter, iterations, nc
       LOGICAL                                            :: active(SIZE(b, 2)), &
                                                             check_column(SIZE(b, 2))
       REAL(KIND=dp)                                      :: alpha, norm_b(SIZE(b, 2)), relative_r, &
-                                                            rr(SIZE(b, 2)), rr_new(SIZE(b, 2))
+                                                            residual, rr(SIZE(b, 2)), &
+                                                            rr_new(SIZE(b, 2))
 
       CALL timeset('gamma_body_iterative_solve', handle)
 
@@ -4800,9 +3650,8 @@ CONTAINS
          DO i_c = 1, nc
             IF (.NOT. active(i_c)) CYCLE
             denominator = DOT_PRODUCT(direction(:, i_c), PRODUCT(:, i_c))
-            IF (REAL(denominator, dp) <= 0.0_dp .OR. &
-                ABS(AIMAG(denominator)) > 1.0E-10_dp*ABS(denominator)) THEN
-               CPABORT('Gamma body action is not positive Hermitian')
+            IF (REAL(denominator, dp) <= 0.0_dp) THEN
+               CPABORT('Gamma body action is not positive')
             END IF
             alpha = rr(i_c)/REAL(denominator, dp)
             x(:, i_c) = x(:, i_c) + alpha*direction(:, i_c)
@@ -4835,6 +3684,10 @@ CONTAINS
          END DO
       END DO
       IF (ANY(active)) CPABORT('Matrix-free Gamma body solve did not converge')
+      IF (bs_env%unit_nr > 0) THEN
+         WRITE (bs_env%unit_nr, '(T2,A,T69,I12)') 'Gamma time response maximum iterations:', iterations
+         WRITE (bs_env%unit_nr, '(T2,A,T61,ES20.12)') 'Gamma time response true relative residual:', residual
+      END IF
 
       CALL timestop(handle)
 
@@ -5073,10 +3926,6 @@ CONTAINS
       CALL timeset('gamma_metric_factor_distributed', handle)
 
       n = SIZE(metric, 1)
-      CPASSERT(n > 0 .AND. relative_cutoff >= 0.0_dp)
-      CPASSERT(ALL(SHAPE(metric) == [n, n]))
-      CPASSERT(ALL(SHAPE(coulomb) == [n, n]))
-      CPASSERT(ALL(SHAPE(factor) == [n, n]))
       CALL cp_blacs_env_create(blacs, para_env)
       CALL cp_fm_struct_create(structure, context=blacs, nrow_global=n, ncol_global=n)
       CALL cp_cfm_create(metric_d, structure)
@@ -5170,10 +4019,9 @@ CONTAINS
 !> \param eigenvalues ...
 !> \param nocc_spin ...
 !> \param dipole ...
-!> \param nmo_spin ...
 ! **************************************************************************************************
    SUBROUTINE gw_gamma_transition_moments(bs_env, gwkp_env, kpoints, mo_coeff, eigenvalues, nocc_spin, &
-                                          dipole, nmo_spin)
+                                          dipole)
       TYPE(post_scf_bandstructure_type), POINTER         :: bs_env
       TYPE(gwkp_type), INTENT(INOUT)                     :: gwkp_env
       TYPE(kpoint_type), INTENT(IN), POINTER             :: kpoints
@@ -5182,17 +4030,17 @@ CONTAINS
       INTEGER, DIMENSION(:), INTENT(IN)                  :: nocc_spin
       COMPLEX(KIND=dp), ALLOCATABLE, &
          DIMENSION(:, :, :, :, :), INTENT(OUT)           :: dipole
-      INTEGER, ALLOCATABLE, DIMENSION(:), INTENT(OUT)    :: nmo_spin
 
       REAL(KIND=dp), PARAMETER                           :: eps_degenerate = 1.0E-10_dp
 
       COMPLEX(KIND=dp), ALLOCATABLE :: coeff_dense(:, :), d_k(:, :), dh_k(:, :), ds_k(:, :), &
          projected_d(:, :), projected_h(:, :), projected_s(:, :)
-      INTEGER :: handle, i_col, i_dir, i_k, i_k_local, i_mo_a, i_mo_i, i_row, i_spin, n_ao, &
-         n_col_local, n_img, n_k, n_k_local, n_mo, n_mo_matrix, n_row_local, n_row_matrix, n_spin
-      INTEGER, ALLOCATABLE                               :: local_kpoints(:)
+      INTEGER                                            :: handle, i_dir, i_k, i_k_local, i_mo_a, &
+                                                            i_mo_i, i_spin, n_ao, n_img, n_k, &
+                                                            n_k_local, n_mo, n_mo_matrix, &
+                                                            n_row_matrix, n_spin
+      INTEGER, ALLOCATABLE                               :: nmo_spin(:)
       INTEGER, DIMENSION(3)                              :: periodic
-      INTEGER, DIMENSION(:), POINTER                     :: col_indices, row_indices
       INTEGER, DIMENSION(:, :), POINTER                  :: index_to_cell
       INTEGER, DIMENSION(:, :, :), POINTER               :: cell_to_index
       LOGICAL                                            :: valid_layout
@@ -5239,28 +4087,15 @@ CONTAINS
       gwkp_env%gamma_corr_scf_plan = kp_transform_plan_type()
 
       n_k_local = (n_k + para_env%num_pe - 1 - para_env%mepos)/para_env%num_pe
-      ALLOCATE (local_kpoints(n_k_local))
-      DO i_k_local = 1, n_k_local
-         local_kpoints(i_k_local) = para_env%mepos + 1 + (i_k_local - 1)*para_env%num_pe
-      END DO
       ALLOCATE (dipole(n_spin, n_k_local, 3, MAXVAL(nocc_spin), MAXVAL(nmo_spin - nocc_spin)), source=z_zero)
       ALLOCATE (dh_k(n_ao, n_ao), ds_k(n_ao, n_ao), d_k(n_ao, n_ao))
       DO i_k = 1, n_k
          DO i_spin = 1, n_spin
             n_mo = nmo_spin(i_spin)
-            ALLOCATE (coeff_dense(n_ao, n_mo), source=z_zero)
-            CALL cp_cfm_get_info(mo_coeff(i_k, i_spin), nrow_local=n_row_local, &
-                                 ncol_local=n_col_local, row_indices=row_indices, col_indices=col_indices)
-            DO i_col = 1, n_col_local
-               DO i_row = 1, n_row_local
-                  coeff_dense(row_indices(i_row), col_indices(i_col)) = &
-                     mo_coeff(i_k, i_spin)%local_data(i_row, i_col)
-               END DO
-            END DO
-            CALL para_env%sum(coeff_dense, root=MODULO(i_k - 1, para_env%num_pe))
+            ALLOCATE (coeff_dense(n_ao, n_mo))
+            CALL cp_cfm_get_submatrix(mo_coeff(i_k, i_spin), coeff_dense)
             IF (MODULO(i_k - 1, para_env%num_pe) == para_env%mepos) THEN
                i_k_local = (i_k - 1)/para_env%num_pe + 1
-               CPASSERT(local_kpoints(i_k_local) == i_k)
                IF (nocc_spin(i_spin) > 0 .AND. n_mo > nocc_spin(i_spin)) THEN
                   ALLOCATE (projected_h(n_mo - nocc_spin(i_spin), nocc_spin(i_spin)), &
                             projected_s(n_mo - nocc_spin(i_spin), nocc_spin(i_spin)), &
@@ -5296,7 +4131,7 @@ CONTAINS
             DEALLOCATE (coeff_dense)
          END DO
       END DO
-      DEALLOCATE (dh_k, ds_k, d_k, h_rs, s_rs, d_rs, local_kpoints)
+      DEALLOCATE (dh_k, ds_k, d_k, h_rs, s_rs, d_rs, nmo_spin)
       DEALLOCATE (gwkp_env%gamma_corr_index_to_cell, gwkp_env%gamma_corr_cell_to_index)
       NULLIFY (gwkp_env%gamma_corr_index_to_cell, gwkp_env%gamma_corr_cell_to_index)
 
@@ -5310,69 +4145,42 @@ CONTAINS
 !> R-s is wrapped into the finite FFT cell with its transfer-mesh Bloch twist. Half-cell
 !> ties average adjacent integer images, retaining Hermiticity and cell-wrapping covariance.
 !> The mirrored conjugate-transpose contribution enforces reciprocity also on Nyquist faces.
-!> No grid-pair angular tensor is formed. first_pair>0 selects flattened column-major pairs;
-!> otherwise values_R owns rows beginning at first_row and all grid columns.
+!> No grid-pair angular tensor is formed. values_R holds flattened column-major pairs
+!> beginning at first_pair.
 !> \param bs_env ...
 !> \param cells ...
 !> \param icell ...
 !> \param head_scalar ...
 !> \param head_vector ...
-!> \param first_row ...
 !> \param first_pair ...
 !> \param values_R ...
 !> \param wing_left ...
 !> \param wing_right ...
 ! **************************************************************************************************
    SUBROUTINE add_gamma_corr_pair_cell(bs_env, cells, icell, head_scalar, head_vector, &
-                                       first_row, first_pair, values_R, wing_left, wing_right)
+                                       first_pair, values_R, wing_left, wing_right)
       TYPE(post_scf_bandstructure_type), POINTER         :: bs_env
       INTEGER, INTENT(IN)                                :: cells(:, :), icell
       COMPLEX(KIND=dp), INTENT(IN)                       :: head_scalar, head_vector(:)
-      INTEGER, INTENT(IN)                                :: first_row, first_pair
+      INTEGER, INTENT(IN)                                :: first_pair
       REAL(KIND=dp), INTENT(INOUT)                       :: values_R(:, :, :)
       COMPLEX(KIND=dp), INTENT(IN), OPTIONAL             :: wing_left(:), wing_right(:)
 
       COMPLEX(KIND=dp)                                   :: amplitude(2), twist(27, 2)
       INTEGER :: destination(27, 2), high(3), idir, iimage, il, ilocal, ilp, imirror, ipair, ix, &
          iy, iz, jlocal, low(3), lower(3), ngrid, nmesh(3), shift(3), translated(3), wrapped(3)
-      LOGICAL                                            :: valid_layout
       REAL(KIND=dp)                                      :: delta(3), half_boundary, qoffset(3), &
                                                             tolerance, weight
       REAL(KIND=dp), ALLOCATABLE                         :: fractional_grid(:, :)
 
-      CPASSERT(PRESENT(wing_left) .EQV. PRESENT(wing_right))
       ngrid = bs_env%ri_rs%n_grid_points
-      CPASSERT(ngrid > 0)
-      CPASSERT(ALLOCATED(bs_env%ri_rs%grid_points))
-      CPASSERT(ASSOCIATED(bs_env%ri_rs%cell))
-      CPASSERT(SIZE(bs_env%ri_rs%grid_points, 1) == 3)
-      CPASSERT(SIZE(bs_env%ri_rs%grid_points, 2) == ngrid)
-      valid_layout = SIZE(cells, 1) == 3 .AND. icell >= 1 .AND. icell <= SIZE(cells, 2)
-      CPASSERT(valid_layout)
-      IF (PRESENT(wing_left)) THEN
-         CPASSERT(SIZE(wing_left) == ngrid .AND. SIZE(wing_right) == ngrid)
-      END IF
-      IF (first_pair > 0) THEN
-         CPASSERT(ngrid <= HUGE(1)/ngrid)
-         CPASSERT(SIZE(values_R, 2) == 1)
-         CPASSERT(first_pair + SIZE(values_R, 1) - 1 <= ngrid*ngrid)
-      ELSE
-         valid_layout = first_row >= 1 .AND. first_row + SIZE(values_R, 1) - 1 <= ngrid
-         CPASSERT(valid_layout)
-         CPASSERT(SIZE(values_R, 2) == ngrid)
-      END IF
       nmesh = bs_env%kpoints_scf_desymm%nkp_grid
-      CPASSERT(ALL(nmesh > 0))
       lower = -nmesh/2
-      CPASSERT(SIZE(cells, 2) == PRODUCT(nmesh))
-      CPASSERT(SIZE(values_R, 3) == SIZE(cells, 2))
       qoffset = bs_env%kpoints_chi_eps_W%xkp(1:3, 1)
       ALLOCATE (fractional_grid(3, ngrid))
       fractional_grid(:, :) = MATMUL(bs_env%ri_rs%cell%h_inv, bs_env%ri_rs%grid_points)
       DO idir = 1, 3
          IF (bs_env%periodic(idir) == 0) fractional_grid(idir, :) = 0.0_dp
-         valid_layout = MAXVAL(ABS(fractional_grid(idir, :))) <= 0.5_dp + 1.0E-10_dp
-         CPASSERT(valid_layout)
       END DO
       DO iz = -1, 1
          DO iy = -1, 1
@@ -5384,8 +4192,6 @@ CONTAINS
                   wrapped = MODULO(translated - lower, nmesh) + lower
                   destination(iimage, imirror) = 1 + (wrapped(3) - lower(3)) + &
                                                  nmesh(3)*(wrapped(2) - lower(2) + nmesh(2)*(wrapped(1) - lower(1)))
-                  valid_layout = ALL(cells(:, destination(iimage, imirror)) == wrapped)
-                  CPASSERT(valid_layout)
                   twist(iimage, imirror) = EXP(CMPLX(0.0_dp, &
                                                      twopi*DOT_PRODUCT(qoffset, REAL(translated - wrapped, dp)), dp))
                END DO
@@ -5394,14 +4200,9 @@ CONTAINS
       END DO
       DO jlocal = 1, SIZE(values_R, 2)
          DO ilocal = 1, SIZE(values_R, 1)
-            IF (first_pair > 0) THEN
-               ipair = first_pair + ilocal - 1
-               il = MODULO(ipair - 1, ngrid) + 1
-               ilp = (ipair - 1)/ngrid + 1
-            ELSE
-               il = first_row + ilocal - 1
-               ilp = jlocal
-            END IF
+            ipair = first_pair + ilocal - 1
+            il = MODULO(ipair - 1, ngrid) + 1
+            ilp = (ipair - 1)/ngrid + 1
             delta = fractional_grid(:, il) - fractional_grid(:, ilp)
             low = NINT(delta)
             high = low
@@ -5567,114 +4368,22 @@ CONTAINS
 
       CHARACTER(LEN=*), PARAMETER :: routineN = 'collect_band_mo_coefficients'
 
-      INTEGER                                            :: handle, i_col, i_kp_eval, i_row, ispin, &
-                                                            ncol_local, nrow_local
-      INTEGER, POINTER                                   :: col_indices(:), row_indices(:)
+      INTEGER                                            :: handle, i_kp_eval, ispin
 
       CALL timeset(routineN, handle)
 
       ALLOCATE (band_coefficients(bs_env%n_ao, bs_env%n_ao, &
                                   bs_env%nkp_bs_and_DOS, bs_env%n_spin))
-      band_coefficients = z_zero
       DO ispin = 1, bs_env%n_spin
          DO i_kp_eval = 1, bs_env%nkp_bs_and_DOS
-            CALL cp_cfm_get_info(bs_env%cfm_mo_coeff_kp(i_kp_eval, ispin), &
-                                 nrow_local=nrow_local, ncol_local=ncol_local, &
-                                 row_indices=row_indices, col_indices=col_indices)
-            DO i_col = 1, ncol_local
-               DO i_row = 1, nrow_local
-                  band_coefficients(row_indices(i_row), col_indices(i_col), i_kp_eval, ispin) = &
-                     bs_env%cfm_mo_coeff_kp(i_kp_eval, ispin)%local_data(i_row, i_col)
-               END DO
-            END DO
+            CALL cp_cfm_get_submatrix(bs_env%cfm_mo_coeff_kp(i_kp_eval, ispin), &
+                                      band_coefficients(:, :, i_kp_eval, ispin))
          END DO
       END DO
-      CALL bs_env%para_env%sum(band_coefficients)
 
       CALL timestop(handle)
 
    END SUBROUTINE collect_band_mo_coefficients
-
-! **************************************************************************************************
-!> \brief Interpolate Σx_ll′(k) and project onto band Bloch orbitals, Eqs. (10)-(12).
-!> Σx_nn(k) = Σ_ll′ ψ_nk(r_l)* Σx_ll′(k) ψ_nk(r_l′).
-!> Native mesh points use their existing matrix; off-mesh points use the
-!> pair-centred cardinal interpolation prepared for the requested bands.
-!> \param bs_env ...
-!> \param sigma_grid ...
-!> \param first_row ...
-!> \param last_row ...
-!> \param ispin ...
-!> \param sigma_band ...
-!> \param interpolation ...
-!> \param band_orbitals ...
-! **************************************************************************************************
-   SUBROUTINE self_energy_RS_to_Bloch(bs_env, sigma_grid, first_row, last_row, ispin, sigma_band, &
-                                      interpolation, band_orbitals)
-      TYPE(post_scf_bandstructure_type), POINTER         :: bs_env
-      COMPLEX(dp), INTENT(IN)                            :: sigma_grid(:, :, :)
-      INTEGER, INTENT(IN)                                :: first_row, last_row, ispin
-      REAL(dp), INTENT(OUT)                              :: sigma_band(:, :)
-      TYPE(projection_interpolation_type), INTENT(IN)    :: interpolation
-      COMPLEX(dp), INTENT(IN)                            :: band_orbitals(:, :, :, :)
-
-      CHARACTER(LEN=*), PARAMETER :: routineN = 'self_energy_RS_to_Bloch'
-
-      COMPLEX(dp), ALLOCATABLE                           :: psi(:, :), sigma_k(:, :), work(:, :)
-      INTEGER                                            :: handle, i_band, i_batch, i_first, &
-                                                            i_kp_eval, i_last, n_batch, n_grid, &
-                                                            native_iq, nrows, phase_handle
-      LOGICAL                                            :: valid_layout
-
-      CALL timeset(routineN, handle)
-
-      n_grid = bs_env%ri_rs%n_grid_points
-      nrows = last_row - first_row + 1
-      CPASSERT(first_row >= 1 .AND. last_row <= n_grid .AND. nrows >= 0)
-      valid_layout = SIZE(sigma_grid, 1) == nrows .AND. SIZE(sigma_grid, 2) == n_grid
-      CPASSERT(valid_layout)
-      CPASSERT(SIZE(sigma_grid, 3) == bs_env%nkp_scf_desymm)
-      CPASSERT(SIZE(band_orbitals, 2) == bs_env%n_ao)
-      CPASSERT(SIZE(band_orbitals, 3) == bs_env%nkp_bs_and_DOS)
-      CPASSERT(SIZE(band_orbitals, 4) == bs_env%n_spin)
-      CPASSERT(SIZE(sigma_band, 1) == bs_env%n_ao)
-      CPASSERT(SIZE(sigma_band, 2) == bs_env%nkp_bs_and_DOS)
-      n_batch = MIN(16, bs_env%n_ao)
-      ALLOCATE (sigma_k(nrows, n_grid), psi(n_grid, n_batch), work(nrows, n_batch))
-      sigma_band = 0.0_dp
-      DO i_kp_eval = 1, bs_env%nkp_bs_and_DOS
-         CALL timeset(routineN//'_q_interpolation', phase_handle)
-         native_iq = interpolation%native_iq(i_kp_eval)
-         IF (native_iq > 0) THEN
-            sigma_k(:, :) = sigma_grid(:, :, native_iq)
-         ELSE
-            CALL interpolate_self_energy_rows(bs_env, sigma_grid, first_row, i_kp_eval, sigma_k, interpolation)
-         END IF
-         CALL timestop(phase_handle)
-         DO i_first = 1, bs_env%n_ao, n_batch
-            i_last = MIN(i_first + n_batch - 1, bs_env%n_ao)
-            psi = z_zero
-            psi(:, 1:i_last - i_first + 1) = band_orbitals(:, i_first:i_last, i_kp_eval, ispin)
-            CALL timeset(routineN//'_apply_sigma', phase_handle)
-            IF (nrows > 0) CALL zgemm('N', 'N', nrows, n_batch, n_grid, z_one, &
-                                      sigma_k, nrows, psi, n_grid, z_zero, work, nrows)
-            CALL timestop(phase_handle)
-            CALL timeset(routineN//'_band_contraction', phase_handle)
-            DO i_band = i_first, i_last
-               i_batch = i_band - i_first + 1
-               sigma_band(i_band, i_kp_eval) = REAL(SUM(CONJG(psi(first_row:last_row, i_batch))*work(:, i_batch)), dp)
-            END DO
-            CALL timestop(phase_handle)
-         END DO
-      END DO
-      CALL timeset(routineN//'_final_reduction', phase_handle)
-      CALL bs_env%para_env%sum(sigma_band)
-      CALL timestop(phase_handle)
-      DEALLOCATE (sigma_k, psi, work)
-
-      CALL timestop(handle)
-
-   END SUBROUTINE self_energy_RS_to_Bloch
 
 ! **************************************************************************************************
 !> \brief Project ordered local Σ(l,l') pairs with cached band Bloch orbitals.
@@ -5709,24 +4418,11 @@ CONTAINS
          i_local, i_lp, image_offset(126), last_col, last_kp_eval, last_pair, local_kp_eval, &
          n_batch, n_grid, n_local, phase_handle
       INTEGER, ALLOCATABLE                               :: pair_order(:)
-      LOGICAL                                            :: valid_layout
 
       CALL timeset(routineN, handle)
 
-      CPASSERT(ALLOCATED(band_orbitals))
       n_grid = bs_env%ri_rs%n_grid_points
       n_local = SIZE(sigma_pairs, 1)
-      CPASSERT(SIZE(sigma_pairs, 2) == 1)
-      CPASSERT(SIZE(sigma_pairs, 3) == bs_env%nkp_scf_desymm)
-      CPASSERT(SIZE(band_orbitals, 2) == bs_env%n_ao)
-      valid_layout = SIZE(band_orbitals, 3) >= bs_env%nkp_bs_and_DOS
-      CPASSERT(valid_layout)
-      CPASSERT(SIZE(band_orbitals, 4) == bs_env%n_spin)
-      valid_layout = first_pair >= 1 .AND. first_pair + n_local - 1 <= n_grid*n_grid
-      CPASSERT(valid_layout)
-      CPASSERT(SIZE(sigma_band, 1) == bs_env%n_ao)
-      CPASSERT(SIZE(sigma_band, 2) == bs_env%nkp_bs_and_DOS)
-      CPASSERT(SIZE(interpolation%native_iq) == bs_env%nkp_bs_and_DOS)
       sigma_band = 0.0_dp
       IF (n_local > 0) THEN
          last_pair = first_pair + n_local - 1
@@ -5827,7 +4523,6 @@ CONTAINS
          OPTIONAL                                        :: interpolation
 
       INTEGER                                            :: idir, iq
-      LOGICAL                                            :: valid_layout
       REAL(KIND=dp)                                      :: delta_k(3), weight
 
       CPASSERT(ALLOCATED(bs_env%ri_rs%grid_points))
@@ -5836,8 +4531,6 @@ CONTAINS
       fractional_grid(:, :) = MATMUL(bs_env%ri_rs%cell%h_inv, bs_env%ri_rs%grid_points)
       DO idir = 1, 3
          IF (bs_env%periodic(idir) == 0) fractional_grid(idir, :) = 0.0_dp
-         valid_layout = MAXVAL(ABS(fractional_grid(idir, :))) <= 0.5_dp + 1.0E-10_dp
-         CPASSERT(valid_layout)
       END DO
       ALLOCATE (factors(125, bs_env%nkp_scf_desymm))
       DO iq = 1, bs_env%nkp_scf_desymm
@@ -5912,42 +4605,6 @@ CONTAINS
    END FUNCTION interpolation_pair_image
 
 ! **************************************************************************************************
-!> \brief Apply Eq. (1) to distributed rows, reusing the image labels of one grid column.
-!> \param bs_env ...
-!> \param sigma_grid ...
-!> \param first_row ...
-!> \param i_kp_eval ...
-!> \param sigma_k ...
-!> \param interpolation ...
-! **************************************************************************************************
-   SUBROUTINE interpolate_self_energy_rows(bs_env, sigma_grid, first_row, i_kp_eval, sigma_k, interpolation)
-      TYPE(post_scf_bandstructure_type), POINTER         :: bs_env
-      COMPLEX(KIND=dp), INTENT(IN)                       :: sigma_grid(:, :, :)
-      INTEGER, INTENT(IN)                                :: first_row, i_kp_eval
-      COMPLEX(KIND=dp), INTENT(OUT)                      :: sigma_k(:, :)
-      TYPE(projection_interpolation_type), INTENT(IN), &
-         OPTIONAL                                        :: interpolation
-
-      COMPLEX(KIND=dp), ALLOCATABLE                      :: factors(:, :)
-      INTEGER                                            :: icol, iq, irow
-      INTEGER, ALLOCATABLE                               :: pair_image(:)
-      REAL(KIND=dp), ALLOCATABLE                         :: fractional_grid(:, :)
-
-      CALL interpolation_pair_factors(bs_env, i_kp_eval, factors, fractional_grid, interpolation)
-      ALLOCATE (pair_image(SIZE(sigma_grid, 1)))
-      sigma_k = z_zero
-      DO icol = 1, SIZE(sigma_grid, 2)
-         DO irow = 1, SIZE(sigma_grid, 1)
-            pair_image(irow) = interpolation_pair_image( &
-                               fractional_grid(:, first_row + irow - 1) - fractional_grid(:, icol))
-         END DO
-         DO iq = 1, SIZE(sigma_grid, 3)
-            sigma_k(:, icol) = sigma_k(:, icol) + factors(pair_image, iq)*sigma_grid(:, icol, iq)
-         END DO
-      END DO
-   END SUBROUTINE interpolate_self_energy_rows
-
-! **************************************************************************************************
 !> \brief Bound simultaneous band interpolation and band-projection storage in bytes.
 !> Shared image labels and thread-private packed Σ, factors and output blocks are included.
 !> \param n_grid ...
@@ -5986,7 +4643,6 @@ CONTAINS
 
       INTEGER                                            :: counts(125), cursor(125), i_class, i_l, &
                                                             i_local, i_lp, idir, n_grid
-      LOGICAL                                            :: valid_layout
       REAL(dp), ALLOCATABLE                              :: fractional_grid(:, :)
 
       CPASSERT(ALLOCATED(bs_env%ri_rs%grid_points))
@@ -5996,8 +4652,6 @@ CONTAINS
       fractional_grid(:, :) = MATMUL(bs_env%ri_rs%cell%h_inv, bs_env%ri_rs%grid_points)
       DO idir = 1, 3
          IF (bs_env%periodic(idir) == 0) fractional_grid(idir, :) = 0.0_dp
-         valid_layout = MAXVAL(ABS(fractional_grid(idir, :))) <= 0.5_dp + 1.0E-10_dp
-         CPASSERT(valid_layout)
       END DO
       counts = 0
       DO i_local = 1, n_local
@@ -6125,43 +4779,17 @@ CONTAINS
                                                             isource, jlocal, lower(3), ngrid, &
                                                             nmesh(3), phase_handle, shift(3), &
                                                             wrapped(3)
-      LOGICAL                                            :: tie(3), valid_layout
-      REAL(KIND=dp)                                      :: delta(3), endpoint(3), weight
+      LOGICAL                                            :: tie(3)
+      REAL(KIND=dp)                                      :: endpoint(3), weight
       REAL(KIND=dp), ALLOCATABLE                         :: fractional_grid(:, :), scratch(:)
 
       CALL timeset(routineN, handle)
 
       CALL timeset("product_pair_centered_prepare", phase_handle)
-      CPASSERT(ALLOCATED(bs_env%ri_rs%grid_points))
-      CPASSERT(ASSOCIATED(bs_env%ri_rs%cell))
-      CPASSERT(SIZE(bs_env%ri_rs%grid_points, 1) == 3)
-      CPASSERT(SIZE(bs_env%ri_rs%grid_points, 2) > 0)
-      CPASSERT(SIZE(xkp, 1) >= 3 .AND. SIZE(xkp, 2) > 0)
-      CPASSERT(SIZE(cells, 1) == 3)
-      CPASSERT(SIZE(values_k, 1) == SIZE(values_R, 1))
-      CPASSERT(SIZE(values_k, 2) == SIZE(values_R, 2))
-      CPASSERT(SIZE(values_k, 3) == SIZE(xkp, 2))
       ngrid = bs_env%ri_rs%n_grid_points
       nmesh = bs_env%kpoints_scf_desymm%nkp_grid
-      CPASSERT(ALL(nmesh > 0))
-      IF (first_pair > 0) THEN
-         CPASSERT(ngrid <= HUGE(1)/ngrid)
-         CPASSERT(SIZE(values_R, 2) == 1)
-         CPASSERT(first_pair + SIZE(values_R, 1) - 1 <= ngrid*ngrid)
-      ELSE
-         valid_layout = first_row >= 1 .AND. first_row + SIZE(values_R, 1) - 1 <= ngrid
-         CPASSERT(valid_layout)
-         CPASSERT(SIZE(values_R, 2) == ngrid)
-      END IF
       lower = -nmesh/2
-      CPASSERT(SIZE(cells, 2) == PRODUCT(nmesh))
-      CPASSERT(SIZE(values_R, 3) == SIZE(cells, 2))
       endpoint = COS(twopi*xkp(1:3, 1)*REAL(nmesh, dp))
-      CPASSERT(ALL(ABS(ABS(endpoint) - 1.0_dp) < 1.0E-10_dp))
-      DO ik = 1, SIZE(xkp, 2)
-         delta = COS(twopi*xkp(1:3, ik)*REAL(nmesh, dp)) - endpoint
-         CPASSERT(MAXVAL(ABS(delta)) < 1.0E-10_dp)
-      END DO
       ALLOCATE (fractional_grid(3, ngrid))
       fractional_grid(:, :) = MATMUL(bs_env%ri_rs%cell%h_inv, bs_env%ri_rs%grid_points)
       DO idir = 1, 3
@@ -6508,8 +5136,8 @@ CONTAINS
       TYPE(mp_para_env_type), POINTER                    :: para_env
       INTEGER, INTENT(OUT)                               :: first_row, last_row, nrows_local
 
-      first_row = n_grid*para_env%mepos/para_env%num_pe + 1
-      last_row = n_grid*(para_env%mepos + 1)/para_env%num_pe
+      first_row = INT(INT(n_grid, int_8)*para_env%mepos/para_env%num_pe) + 1
+      last_row = INT(INT(n_grid, int_8)*(para_env%mepos + 1)/para_env%num_pe)
       nrows_local = MAX(0, last_row - first_row + 1)
 
    END SUBROUTINE local_grid_row_range
@@ -6663,40 +5291,6 @@ CONTAINS
    END SUBROUTINE fft_rows_to_q_matrices
 
 ! **************************************************************************************************
-!> \brief Form V_ll'(q) = Σ_PQ Z_lP(q) V_PQ(q) Z_l'Q(q)* and distribute FFT rows.
-!> \param Z_q ...
-!> \param interaction_q ...
-!> \param n_q ...
-!> \param para_env ...
-!> \param fft_rows ...
-! **************************************************************************************************
-   SUBROUTINE project_auxiliary_interaction_q_to_fft_rows(Z_q, interaction_q, n_q, para_env, fft_rows)
-      COMPLEX(KIND=dp), INTENT(IN)                       :: Z_q(:, :, :), interaction_q(:, :, :)
-      INTEGER, INTENT(IN)                                :: n_q
-      TYPE(mp_para_env_type), POINTER                    :: para_env
-      COMPLEX(KIND=dp), INTENT(OUT)                      :: fft_rows(:, :, :)
-
-      COMPLEX(KIND=dp), ALLOCATABLE                      :: q_matrices(:, :, :)
-      INTEGER                                            :: i_q_local, n_grid
-
-      n_grid = SIZE(Z_q, 1)
-      CPASSERT(SIZE(interaction_q, 1) == SIZE(Z_q, 2))
-      CPASSERT(SIZE(interaction_q, 2) == SIZE(Z_q, 2))
-      CPASSERT(SIZE(interaction_q, 3) == SIZE(Z_q, 3))
-      ALLOCATE (q_matrices(n_grid, n_grid, SIZE(Z_q, 3)))
-      !$OMP PARALLEL DO DEFAULT(NONE) SCHEDULE(STATIC) &
-      !$OMP SHARED(Z_q, interaction_q, q_matrices) PRIVATE(i_q_local)
-      DO i_q_local = 1, SIZE(Z_q, 3)
-         CALL contract_auxiliary_interaction_q(Z_q(:, :, i_q_local), &
-                                               interaction_q(:, :, i_q_local), &
-                                               q_matrices(:, :, i_q_local))
-      END DO
-      !$OMP END PARALLEL DO
-      CALL q_matrices_to_fft_rows(q_matrices, n_q, para_env, fft_rows)
-
-   END SUBROUTINE project_auxiliary_interaction_q_to_fft_rows
-
-! **************************************************************************************************
 !> \brief Form V_ll'(q) = Σ_PQ Z_lP(q) V_PQ(q) Z_l'Q(q)* and transfer FFT pairs.
 !> \param Z_q ...
 !> \param interaction_q ...
@@ -6805,34 +5399,29 @@ CONTAINS
    END SUBROUTINE initialize_product_row_transfer
 
 ! **************************************************************************************************
-!> \brief Generate the active peer-stream fragment of L R† or L V R†.
-!> Scratch consists of a bounded matrix block and, for V, its auxiliary-space intermediate.
+!> \brief Generate the active peer-stream fragment of L L†.
+!> Scratch consists of a bounded matrix block.
 !> No complete grid-pair matrix is allocated on the q owner before redistribution.
 !> \param transfer ...
 !> \param i_dest ...
-!> \param left ...
-!> \param right ...
+!> \param factor L
 !> \param n_grid ...
 !> \param n_inner ...
 !> \param i_q_local ...
 !> \param max_rows ...
-!> \param interaction ...
 ! **************************************************************************************************
-   SUBROUTINE pack_product_row_block(transfer, i_dest, left, right, n_grid, n_inner, i_q_local, max_rows, interaction)
+   SUBROUTINE pack_product_row_block(transfer, i_dest, factor, n_grid, n_inner, i_q_local, max_rows)
       TYPE(bounded_transfer_type), INTENT(INOUT)         :: transfer
       INTEGER, INTENT(IN)                                :: i_dest, n_grid, n_inner
-      COMPLEX(KIND=dp), INTENT(IN)                       :: left(n_grid, n_inner), &
-                                                            right(n_grid, n_inner)
+      COMPLEX(KIND=dp), INTENT(IN)                       :: factor(n_grid, n_inner)
       INTEGER, INTENT(IN)                                :: i_q_local, max_rows
-      COMPLEX(KIND=dp), INTENT(IN), OPTIONAL             :: interaction(:, :)
 
-      COMPLEX(KIND=dp), ALLOCATABLE                      :: column_block(:, :), work(:, :)
+      COMPLEX(KIND=dp), ALLOCATABLE                      :: column_block(:, :)
       INTEGER                                            :: i_buffer, i_col, i_first, i_last, i_row, &
                                                             n_col, n_rank, n_row, n_rows
       INTEGER(KIND=int_8)                                :: hi, i_element, lo, n_matrix, stream_start
 
       n_rank = SIZE(transfer%send_total)
-      CPASSERT(SIZE(right, 1) == n_grid .AND. SIZE(right, 2) == n_inner)
       i_first = INT(INT(n_grid, int_8)*i_dest/n_rank) + 1
       i_last = INT(INT(n_grid, int_8)*(i_dest + 1)/n_rank)
       n_rows = i_last - i_first + 1
@@ -6852,20 +5441,8 @@ CONTAINS
             n_col = INT(MIN(INT(n_grid - i_col + 1, int_8), (hi - stream_start - i_element)/n_rows))
          END IF
          ALLOCATE (column_block(n_row, n_col))
-         IF (PRESENT(interaction)) THEN
-            IF (.NOT. (SIZE(interaction, 1) == n_inner .AND. SIZE(interaction, 2) == n_inner)) THEN
-               CPABORT("Internal GW array shape mismatch")
-            END IF
-            ALLOCATE (work(n_row, n_inner))
-            CALL zgemm('N', 'N', n_row, n_inner, n_inner, z_one, left(i_first + i_row, 1), n_grid, &
-                       interaction, n_inner, z_zero, work, n_row)
-            CALL zgemm('N', 'C', n_row, n_col, n_inner, z_one, work, n_row, &
-                       right(i_col, 1), n_grid, z_zero, column_block, n_row)
-            DEALLOCATE (work)
-         ELSE
-            CALL zgemm('N', 'C', n_row, n_col, n_inner, z_one, left(i_first + i_row, 1), n_grid, &
-                       right(i_col, 1), n_grid, z_zero, column_block, n_row)
-         END IF
+         CALL zgemm('N', 'C', n_row, n_col, n_inner, z_one, factor(i_first + i_row, 1), n_grid, &
+                    factor(i_col, 1), n_grid, z_zero, column_block, n_row)
          transfer%send_buffer(i_buffer:i_buffer + n_row*n_col - 1) = RESHAPE(column_block, [n_row*n_col])
          DEALLOCATE (column_block)
          i_buffer = i_buffer + n_row*n_col
@@ -6901,81 +5478,13 @@ CONTAINS
    END SUBROUTINE unpack_product_row_block
 
 ! **************************************************************************************************
-!> \brief Redistribute cyclic q or k matrices to FFT row owners.
-!> The transfer-q owner is iq mod P; the SCF-k owner is (ik-1) mod P.
-!> \param q_matrices ...
-!> \param n_q ...
-!> \param para_env ...
-!> \param fft_rows ...
-!> \param owner_offset ...
-! **************************************************************************************************
-   SUBROUTINE q_matrices_to_fft_rows(q_matrices, n_q, para_env, fft_rows, owner_offset)
-      COMPLEX(KIND=dp), INTENT(IN)                       :: q_matrices(:, :, :)
-      INTEGER, INTENT(IN)                                :: n_q
-      TYPE(mp_para_env_type), POINTER                    :: para_env
-      COMPLEX(KIND=dp), INTENT(OUT)                      :: fft_rows(:, :, :)
-      INTEGER, INTENT(IN), OPTIONAL                      :: owner_offset
-
-      INTEGER                                            :: i_dest, i_first, i_last, i_q, i_q_local, &
-                                                            i_source, n_grid, n_rank, offset
-      INTEGER(KIND=int_8)                                :: i_stream, n_matrix
-      INTEGER(KIND=int_8), ALLOCATABLE                   :: send_total(:)
-      TYPE(bounded_transfer_type)                        :: transfer
-
-      offset = 0
-      IF (PRESENT(owner_offset)) offset = owner_offset
-      n_grid = SIZE(q_matrices, 1)
-      n_rank = para_env%num_pe
-      CPASSERT(SIZE(q_matrices, 2) == n_grid)
-      CPASSERT(SIZE(fft_rows, 2) == n_grid)
-      CPASSERT(SIZE(fft_rows, 3) == n_q)
-      CALL local_grid_row_range(n_grid, para_env, i_first, i_last, i_q_local)
-      CPASSERT(SIZE(fft_rows, 1) == i_q_local)
-      i_q_local = 0
-      DO i_q = 1, n_q
-         IF (MODULO(i_q + offset, n_rank) == para_env%mepos) i_q_local = i_q_local + 1
-      END DO
-      CPASSERT(SIZE(q_matrices, 3) == i_q_local)
-      ALLOCATE (send_total(0:n_rank - 1))
-      DO i_dest = 0, n_rank - 1
-         i_first = INT(INT(n_grid, int_8)*INT(i_dest, int_8)/INT(n_rank, int_8)) + 1
-         i_last = INT(INT(n_grid, int_8)*INT(i_dest + 1, int_8)/INT(n_rank, int_8))
-         send_total(i_dest) = INT(i_last - i_first + 1, int_8)*INT(n_grid, int_8)*SIZE(q_matrices, 3, KIND=int_8)
-      END DO
-      CALL initialize_bounded_transfer(transfer, para_env, send_total)
-      DO WHILE (next_transfer_block(transfer))
-         DO i_dest = 0, n_rank - 1
-            i_first = INT(INT(n_grid, int_8)*INT(i_dest, int_8)/INT(n_rank, int_8)) + 1
-            i_last = INT(INT(n_grid, int_8)*INT(i_dest + 1, int_8)/INT(n_rank, int_8))
-            n_matrix = INT(i_last - i_first + 1, int_8)*INT(n_grid, int_8)
-            i_stream = 0_int_8
-            DO i_q_local = 1, SIZE(q_matrices, 3)
-               CALL pack_transfer_matrix(transfer, i_dest, q_matrices(:, :, i_q_local), i_stream, &
-                                         first_row=i_first, n_rows=i_last - i_first + 1)
-               i_stream = i_stream + n_matrix
-            END DO
-         END DO
-         CALL exchange_transfer_block(transfer, para_env)
-         DO i_source = 0, n_rank - 1
-            i_stream = 0_int_8
-            DO i_q = 1, n_q
-               IF (MODULO(i_q + offset, n_rank) /= i_source) CYCLE
-               CALL unpack_transfer_matrix(transfer, i_source, fft_rows(:, :, i_q), i_stream)
-               i_stream = i_stream + SIZE(fft_rows, 1, KIND=int_8)*INT(n_grid, int_8)
-            END DO
-         END DO
-      END DO
-   END SUBROUTINE q_matrices_to_fft_rows
-
-! **************************************************************************************************
-!> \brief ...
+!> \brief Copy the locally owned X_PQ(q,tau) of one time into a contiguous q array.
 !> \param blocks ...
 !> \param itime ...
 !> \param n_q ...
 !> \param n_RI ...
 !> \param para_env ...
 !> \param matrices ...
-!> Expand X(-q,tau)=X(q,tau)* for one time only, preserving compact persistent storage.
 ! **************************************************************************************************
    SUBROUTINE expand_ri_q_time(blocks, itime, n_q, n_RI, para_env, matrices)
       TYPE(ri_q_matrix_block_type), INTENT(IN)           :: blocks(:)
@@ -6984,10 +5493,8 @@ CONTAINS
       COMPLEX(KIND=dp), ALLOCATABLE, INTENT(OUT)         :: matrices(:, :, :)
 
       INTEGER                                            :: i_local, i_q
-      INTEGER, ALLOCATABLE                               :: partner(:)
 
       ALLOCATE (matrices(n_RI, n_RI, SIZE(blocks)), SOURCE=z_zero)
-      ALLOCATE (partner(n_q), SOURCE=0)
       i_local = 0
       DO i_q = 1, n_q
          IF (MODULO(i_q, para_env%num_pe) /= para_env%mepos) CYCLE
@@ -7216,7 +5723,7 @@ CONTAINS
    END SUBROUTINE pack_transfer_matrix
 
 ! **************************************************************************************************
-!> \brief Unpack the same matrix-section stream; optionally apply conjugation or q-pair averaging.
+!> \brief Unpack the same matrix-section stream.
 !> Each destination element is written once, with no full reshape or temporary matrix.
 !> \param transfer ...
 !> \param i_peer ...
@@ -7224,66 +5731,37 @@ CONTAINS
 !> \param stream_start ...
 !> \param first_row ...
 !> \param n_rows ...
-!> \param first_element ...
-!> \param n_elements ...
-!> \param conjugate ...
-!> \param average ...
 ! **************************************************************************************************
-   SUBROUTINE unpack_transfer_matrix(transfer, i_peer, matrix, stream_start, first_row, n_rows, &
-                                     first_element, n_elements, conjugate, average)
+   SUBROUTINE unpack_transfer_matrix(transfer, i_peer, matrix, stream_start, first_row, n_rows)
       TYPE(bounded_transfer_type), INTENT(IN)            :: transfer
       INTEGER, INTENT(IN)                                :: i_peer
       COMPLEX(KIND=dp), INTENT(INOUT)                    :: matrix(:, :)
       INTEGER(KIND=int_8), INTENT(IN)                    :: stream_start
       INTEGER, INTENT(IN), OPTIONAL                      :: first_row, n_rows
-      INTEGER(KIND=int_8), INTENT(IN), OPTIONAL          :: first_element, n_elements
-      LOGICAL, INTENT(IN), OPTIONAL                      :: conjugate, average
 
       INTEGER                                            :: i_buffer, i_col, i_first, i_row, n_copy, &
                                                             nrow
-      INTEGER(KIND=int_8)                                :: first, hi, i_element, i_end, lo, n
-      LOGICAL                                            :: take_average, take_conjugate
+      INTEGER(KIND=int_8)                                :: hi, i_element, i_end, lo, n
 
-      take_conjugate = .FALSE.
-      take_average = .FALSE.
-      IF (PRESENT(conjugate)) take_conjugate = conjugate
-      IF (PRESENT(average)) take_average = average
       i_first = 1
       nrow = SIZE(matrix, 1)
       IF (PRESENT(first_row)) i_first = first_row
       IF (PRESENT(n_rows)) nrow = n_rows
-      first = 1_int_8
       n = INT(nrow, int_8)*SIZE(matrix, 2, KIND=int_8)
-      IF (PRESENT(first_element)) first = first_element
-      IF (PRESENT(n_elements)) n = n_elements
       CPASSERT(nrow >= 0 .AND. i_first >= 1)
       CPASSERT(i_first + nrow - 1 <= SIZE(matrix, 1))
-      CPASSERT(first >= 1_int_8 .AND. n >= 0_int_8)
-      IF (.NOT. (first - 1_int_8 + n <= INT(nrow, int_8)*SIZE(matrix, 2, KIND=int_8))) THEN
-         CPABORT('Transfer slice exceeds matrix extent')
-      END IF
       lo = MAX(stream_start, transfer%offset)
       hi = MIN(stream_start + n, transfer%offset + INT(transfer%recv_counts(i_peer), int_8))
       IF (hi <= lo) RETURN
       i_buffer = transfer%recv_displs(i_peer) + INT(lo - transfer%offset) + 1
-      i_element = first - 1_int_8 + lo - stream_start
+      i_element = lo - stream_start
       i_end = i_element + hi - lo
       DO WHILE (i_element < i_end)
          i_row = INT(MODULO(i_element, INT(nrow, int_8)))
          i_col = INT(i_element/INT(nrow, int_8)) + 1
          n_copy = INT(MIN(i_end - i_element, INT(nrow - i_row, int_8)))
-         IF (take_average) THEN
-            CPASSERT(take_conjugate)
-            matrix(i_first + i_row:i_first + i_row + n_copy - 1, i_col) = &
-               CMPLX(0.5_dp, 0.0_dp, KIND=dp)*(matrix(i_first + i_row:i_first + i_row + n_copy - 1, i_col) + &
-                                               CONJG(transfer%recv_buffer(i_buffer:i_buffer + n_copy - 1)))
-         ELSE IF (take_conjugate) THEN
-            matrix(i_first + i_row:i_first + i_row + n_copy - 1, i_col) = &
-               CONJG(transfer%recv_buffer(i_buffer:i_buffer + n_copy - 1))
-         ELSE
-            matrix(i_first + i_row:i_first + i_row + n_copy - 1, i_col) = &
-               transfer%recv_buffer(i_buffer:i_buffer + n_copy - 1)
-         END IF
+         matrix(i_first + i_row:i_first + i_row + n_copy - 1, i_col) = &
+            transfer%recv_buffer(i_buffer:i_buffer + n_copy - 1)
          i_buffer = i_buffer + n_copy
          i_element = i_element + INT(n_copy, int_8)
       END DO
@@ -7325,7 +5803,7 @@ CONTAINS
 !> Construct block-cyclic matrices on the MPI ranks assigned to a q group.
 ! **************************************************************************************************
    SUBROUTINE grouped_w_create(matrices, blacs, matrix_struct, group_env, n)
-      TYPE(cp_cfm_type), INTENT(INOUT)                   :: matrices(6)
+      TYPE(cp_cfm_type), INTENT(INOUT)                   :: matrices(n_w_matrices)
       TYPE(cp_blacs_env_type), POINTER                   :: blacs
       TYPE(cp_fm_struct_type), POINTER                   :: matrix_struct
       TYPE(mp_para_env_type), INTENT(INOUT), TARGET      :: group_env
@@ -7337,7 +5815,6 @@ CONTAINS
                                nrow_global=n, ncol_global=n)
       CALL cp_cfm_create(matrices(w_chi), matrix_struct)
       CALL cp_cfm_create(matrices(w_metric), matrix_struct)
-      CALL cp_cfm_create(matrices(w_coulomb), matrix_struct)
       CALL cp_cfm_create(matrices(w_tmp), matrix_struct)
       CALL cp_cfm_create(matrices(w_dielectric), matrix_struct)
       CALL cp_cfm_create(matrices(w_output), matrix_struct)
@@ -7378,37 +5855,9 @@ CONTAINS
    END SUBROUTINE grouped_w_copy_matrix
 
 ! **************************************************************************************************
-!> \brief ...
-!> \param matrices ...
-!> \param group_env ...
-!> \param n ...
-!> \param which ...
-!> \param matrix ...
-!> Install one frequency-independent factor, reusing the root's input buffer.
-! **************************************************************************************************
-   SUBROUTINE grouped_w_set_factor(matrices, group_env, n, which, matrix)
-      TYPE(cp_cfm_type), INTENT(INOUT)                   :: matrices(6)
-      TYPE(mp_para_env_type), INTENT(INOUT)              :: group_env
-      INTEGER, INTENT(IN)                                :: n, which
-      COMPLEX(KIND=dp), INTENT(IN)                       :: matrix(:, :)
-
-      SELECT CASE (which)
-      CASE (1)
-         CALL set_owner_matrix(matrices(w_metric), matrix, group_env, 0, n)
-      CASE (2)
-         CALL set_owner_matrix(matrices(w_coulomb), matrix, group_env, 0, n)
-      CASE DEFAULT
-         CPABORT("Invalid W metric factor")
-      END SELECT
-   END SUBROUTINE grouped_w_set_factor
-
-! **************************************************************************************************
 !> \brief Evaluate screened W with a distributed positive-definite dielectric inverse.
 !> For ε=I+BᴴχB after the unchanged positive χ filter, Cholesky gives ε^-1.
-!> min_dielectric and max_dielectric bound the spectrum by 1 and 1+||BᴴχB||_F;
-!> they are diagnostics only and do not alter the interaction.
-!> Reuse K=M^-1 V^1/2 to form W=K(ε^-1-I)Kᴴ. The optional norm diagnostic
-!> is evaluated only when requested; its output is zero otherwise.
+!> Reuse K=M^-1 V^1/2 to form W=K(ε^-1-I)Kᴴ.
 !> \param matrices ...
 !> \param group_env ...
 !> \param n ...
@@ -7416,26 +5865,16 @@ CONTAINS
 !> \param chi_owner ...
 !> \param cutoff ...
 !> \param output_owner ...
-!> \param metric_chi_norm ...
-!> \param min_dielectric ...
-!> \param max_dielectric ...
-!> \param screened_norm ...
-!> \param compute_screened_norm ...
 ! **************************************************************************************************
-   SUBROUTINE grouped_w_solve(matrices, group_env, n, root, chi_owner, cutoff, output_owner, &
-                              metric_chi_norm, min_dielectric, max_dielectric, screened_norm, compute_screened_norm)
-      TYPE(cp_cfm_type), INTENT(INOUT)                   :: matrices(6)
+   SUBROUTINE grouped_w_solve(matrices, group_env, n, root, chi_owner, cutoff, output_owner)
+      TYPE(cp_cfm_type), INTENT(INOUT)                   :: matrices(n_w_matrices)
       TYPE(mp_para_env_type), INTENT(INOUT)              :: group_env
       INTEGER, INTENT(IN)                                :: n, root
       COMPLEX(KIND=dp), INTENT(IN)                       :: chi_owner(:, :)
       REAL(KIND=dp), INTENT(IN)                          :: cutoff
       COMPLEX(KIND=dp), INTENT(OUT)                      :: output_owner(:, :)
-      REAL(KIND=dp), INTENT(OUT)                         :: metric_chi_norm, min_dielectric, &
-                                                            max_dielectric, screened_norm
-      LOGICAL, INTENT(IN), OPTIONAL                      :: compute_screened_norm
 
       INTEGER                                            :: info
-      LOGICAL                                            :: need_screened_norm
 
       CPASSERT(root >= 0 .AND. root < group_env%num_pe)
       CALL set_owner_matrix(matrices(w_chi), chi_owner, group_env, root, n)
@@ -7449,15 +5888,11 @@ CONTAINS
                          matrices(w_chi), z_zero, matrices(w_tmp))
       CALL parallel_gemm('N', 'N', n, n, n, z_one, matrices(w_tmp), &
                          matrices(w_metric), z_zero, matrices(w_dielectric))
-      metric_chi_norm = cp_cfm_norm(matrices(w_dielectric), 'F')
       CALL cp_cfm_add_on_diag(matrices(w_dielectric), z_one)
       CALL cp_cfm_transpose(matrices(w_dielectric), 'C', matrices(w_output))
       CALL cp_cfm_scale_and_add(CMPLX(0.5_dp, 0.0_dp, KIND=dp), matrices(w_dielectric), &
                                 CMPLX(0.5_dp, 0.0_dp, KIND=dp), matrices(w_output))
       ! χ is positive semidefinite after filtering: ε=I+BᴴχB has λ_min>=1.
-      ! The Frobenius norm gives λ_max<=1+||BᴴχB||_F; these are bounds, not eigenvalues.
-      min_dielectric = 1.0_dp
-      max_dielectric = 1.0_dp + metric_chi_norm
       CALL cp_cfm_cholesky_decompose(matrices(w_dielectric), info_out=info)
       IF (info /= 0) THEN
          CPABORT("Screened dielectric Cholesky factorization failed")
@@ -7466,17 +5901,6 @@ CONTAINS
       IF (info /= 0) CPABORT("Screened dielectric Cholesky inversion failed")
       CALL cp_cfm_uplo_to_full(matrices(w_dielectric), matrices(w_output), uplo='U')
       CALL cp_cfm_add_on_diag(matrices(w_dielectric), -z_one)
-
-      need_screened_norm = .TRUE.
-      IF (PRESENT(compute_screened_norm)) need_screened_norm = compute_screened_norm
-      screened_norm = 0.0_dp
-      IF (need_screened_norm) THEN
-         CALL parallel_gemm('N', 'N', n, n, n, z_one, matrices(w_coulomb), &
-                            matrices(w_dielectric), z_zero, matrices(w_tmp))
-         CALL parallel_gemm('N', 'C', n, n, n, z_one, matrices(w_tmp), &
-                            matrices(w_coulomb), z_zero, matrices(w_output))
-         screened_norm = cp_cfm_norm(matrices(w_output), 'F')
-      END IF
       ! With K=M^-1 V^1/2 and Hermitian M^-1, W=K(ε^-1-I)Kᴴ.
       ! The existing factor removes two matrix products at every later frequency.
       CALL parallel_gemm('N', 'N', n, n, n, z_one, matrices(w_metric), &
@@ -7493,13 +5917,12 @@ CONTAINS
 !> \param blacs ...
 ! **************************************************************************************************
    SUBROUTINE grouped_w_release(matrices, matrix_struct, blacs)
-      TYPE(cp_cfm_type), INTENT(INOUT)                   :: matrices(6)
+      TYPE(cp_cfm_type), INTENT(INOUT)                   :: matrices(n_w_matrices)
       TYPE(cp_fm_struct_type), POINTER                   :: matrix_struct
       TYPE(cp_blacs_env_type), POINTER                   :: blacs
 
       CALL cp_cfm_release(matrices(w_chi))
       CALL cp_cfm_release(matrices(w_metric))
-      CALL cp_cfm_release(matrices(w_coulomb))
       CALL cp_cfm_release(matrices(w_tmp))
       CALL cp_cfm_release(matrices(w_dielectric))
       CALL cp_cfm_release(matrices(w_output))
@@ -7605,65 +6028,5 @@ CONTAINS
       index_to_cell = list(:, 1:n)
       DEALLOCATE (list)
    END SUBROUTINE gw_gamma_cell_index_union
-
-! **************************************************************************************************
-!> \brief Matrix power and optional spectral statistics.
-!> \param matrix ...
-!> \param exponent ...
-!> \param eps ...
-!> \param cond_nr ...
-!> \param min_ev ...
-!> \param max_ev ...
-!> \param relative_eps Cutoff relative to the largest eigenvalue.
-! **************************************************************************************************
-   SUBROUTINE power(matrix, exponent, eps, cond_nr, min_ev, max_ev, &
-                    relative_eps)
-      COMPLEX(KIND=dp), DIMENSION(:, :)                  :: matrix
-      REAL(KIND=dp)                                      :: exponent, eps
-      REAL(KIND=dp), OPTIONAL                            :: cond_nr, min_ev, max_ev, relative_eps
-
-      CHARACTER(len=*), PARAMETER                        :: routineN = 'power'
-
-      COMPLEX(KIND=dp), ALLOCATABLE, DIMENSION(:, :)     :: eigenvectors
-      INTEGER                                            :: handle, i, n
-      REAL(KIND=dp)                                      :: eigenvalue_cutoff, pos_eval
-      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)           :: eigenvalues
-
-      IF (.NOT. PRESENT(relative_eps)) THEN
-         CALL local_complex_power(matrix, exponent, eps, cond_nr, min_ev, max_ev)
-         RETURN
-      END IF
-
-      CALL timeset(routineN, handle)
-
-      ! make matrix perfectly Hermitian
-      matrix(:, :) = 0.5_dp*(matrix(:, :) + CONJG(TRANSPOSE(matrix(:, :))))
-
-      n = SIZE(matrix, 1)
-      ALLOCATE (eigenvalues(n), eigenvectors(n, n))
-      CALL diag_complex(matrix, eigenvectors, eigenvalues)
-
-      eigenvalue_cutoff = MAX(eps, relative_eps*MAXVAL(eigenvalues))
-
-      IF (PRESENT(cond_nr)) cond_nr = MAXVAL(ABS(eigenvalues))/MINVAL(ABS(eigenvalues))
-      IF (PRESENT(min_ev)) min_ev = MINVAL(ABS(eigenvalues))
-      IF (PRESENT(max_ev)) max_ev = MAXVAL(ABS(eigenvalues))
-
-      DO i = 1, n
-         IF (eigenvalue_cutoff < eigenvalues(i)) THEN
-            pos_eval = (eigenvalues(i))**(0.5_dp*exponent)
-         ELSE
-            pos_eval = 0.0_dp
-         END IF
-         eigenvectors(:, i) = eigenvectors(:, i)*pos_eval
-      END DO
-
-      CALL ZGEMM("N", "C", n, n, n, z_one, eigenvectors, n, eigenvectors, n, z_zero, matrix, n)
-
-      DEALLOCATE (eigenvalues, eigenvectors)
-
-      CALL timestop(handle)
-
-   END SUBROUTINE power
 
 END MODULE gw_ri_rs_small_cell_full_kp_utils
