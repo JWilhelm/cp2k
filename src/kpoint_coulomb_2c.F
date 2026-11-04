@@ -55,7 +55,8 @@ MODULE kpoint_coulomb_2c
 
    CHARACTER(len=*), PARAMETER, PRIVATE :: moduleN = 'kpoint_coulomb_2c'
 
-   PUBLIC :: build_2c_coulomb_matrix_kp, build_2c_coulomb_matrix_kp_small_cell
+   PUBLIC :: build_2c_coulomb_matrix_kp, build_2c_coulomb_matrix_kp_dense, &
+             build_2c_coulomb_matrix_kp_ewald
 
 ! **************************************************************************************************
 
@@ -696,38 +697,128 @@ CONTAINS
    END SUBROUTINE deallocate_tmp
 
 ! **************************************************************************************************
-!> \brief ...
+!> \brief Dense 2-center Coulomb matrix V_PQ(k) from a direct real-space lattice sum
 !> \param V_k ...
 !> \param qs_env ...
 !> \param kpoints ...
-!> \param size_lattice_sum range of the direct lattice sum; not used with use_ewald
+!> \param size_lattice_sum ...
 !> \param basis_type ...
 !> \param ikp_start ...
 !> \param ikp_end ...
-!> \param use_ewald replace the direct lattice sum by an Ewald summation
 ! **************************************************************************************************
-   SUBROUTINE build_2c_coulomb_matrix_kp_small_cell(V_k, qs_env, kpoints, size_lattice_sum, &
-                                                    basis_type, ikp_start, ikp_end, use_ewald)
+   SUBROUTINE build_2c_coulomb_matrix_kp_dense(V_k, qs_env, kpoints, size_lattice_sum, &
+                                               basis_type, ikp_start, ikp_end)
       COMPLEX(KIND=dp), DIMENSION(:, :, :)               :: V_k
       TYPE(qs_environment_type), POINTER                 :: qs_env
       TYPE(kpoint_type), POINTER                         :: kpoints
       INTEGER                                            :: size_lattice_sum
       CHARACTER(LEN=*), INTENT(IN)                       :: basis_type
       INTEGER                                            :: ikp_start, ikp_end
-      LOGICAL, INTENT(IN), OPTIONAL                      :: use_ewald
 
-      CHARACTER(LEN=*), PARAMETER :: routineN = 'build_2c_coulomb_matrix_kp_small_cell'
+      CHARACTER(LEN=*), PARAMETER :: routineN = 'build_2c_coulomb_matrix_kp_dense'
 
-      INTEGER :: factor, handle, handle2, i_cell, i_x, i_x_inner, i_x_outer, ik, ikp_local, j_y, &
-         j_y_inner, j_y_outer, k_z, k_z_inner, k_z_outer, n_atom, n_bf, x_max, x_min, y_max, &
-         y_min, z_max, z_min
+      INTEGER                                            :: factor, handle, x_max, x_min, y_max, &
+                                                            y_min, z_max, z_min
+      INTEGER, DIMENSION(3)                              :: nkp_grid
+      REAL(KIND=dp), DIMENSION(3, 3)                     :: hmat
+      TYPE(cell_type), POINTER                           :: cell
+
+      CALL timeset(routineN, handle)
+
+      CALL get_qs_env(qs_env=qs_env, cell=cell)
+
+      CALL get_factor_and_xyz_min_max(cell, kpoints, size_lattice_sum, factor, hmat, &
+                                      x_min, x_max, y_min, y_max, z_min, z_max, nkp_grid)
+
+      CALL lattice_sum_dense(V_k, qs_env, kpoints, basis_type, operator_coulomb, &
+                             x_min, x_max, y_min, y_max, z_min, z_max, ikp_start, ikp_end)
+
+      CALL timestop(handle)
+
+   END SUBROUTINE build_2c_coulomb_matrix_kp_dense
+
+! **************************************************************************************************
+!> \brief Dense 2-center Coulomb matrix V_PQ(k) from an Ewald summation: erfc-attenuated
+!>        real-space lattice sum plus reciprocal-space sum
+!> \param V_k ...
+!> \param qs_env ...
+!> \param kpoints ...
+!> \param basis_type ...
+!> \param ikp_start ...
+!> \param ikp_end ...
+! **************************************************************************************************
+   SUBROUTINE build_2c_coulomb_matrix_kp_ewald(V_k, qs_env, kpoints, basis_type, ikp_start, ikp_end)
+      COMPLEX(KIND=dp), DIMENSION(:, :, :)               :: V_k
+      TYPE(qs_environment_type), POINTER                 :: qs_env
+      TYPE(kpoint_type), POINTER                         :: kpoints
+      CHARACTER(LEN=*), INTENT(IN)                       :: basis_type
+      INTEGER                                            :: ikp_start, ikp_end
+
+      CHARACTER(LEN=*), PARAMETER :: routineN = 'build_2c_coulomb_matrix_kp_ewald'
+
+      INTEGER                                            :: handle, n_atom, n_bf, x_max, x_min, &
+                                                            y_max, y_min, z_max, z_min
+      INTEGER, ALLOCATABLE, DIMENSION(:)                 :: bf_end_from_atom, bf_start_from_atom
+      REAL(KIND=dp)                                      :: omega
+      TYPE(cell_type), POINTER                           :: cell
+      TYPE(qs_kind_type), DIMENSION(:), POINTER          :: qs_kind_set
+
+      CALL timeset(routineN, handle)
+
+      CALL get_qs_env(qs_env=qs_env, cell=cell, qs_kind_set=qs_kind_set)
+
+      CALL ewald_real_space_bounds(cell, qs_kind_set, basis_type, omega, &
+                                   x_min, x_max, y_min, y_max, z_min, z_max)
+
+      CALL lattice_sum_dense(V_k, qs_env, kpoints, basis_type, operator_verfc, &
+                             x_min, x_max, y_min, y_max, z_min, z_max, ikp_start, ikp_end, omega)
+
+      CALL get_basis_sizes(qs_env, n_atom, basis_type, bf_start_from_atom, bf_end_from_atom, n_bf)
+
+      CALL add_ewald_reciprocal(V_k, qs_env, kpoints, basis_type, omega, &
+                                bf_start_from_atom, bf_end_from_atom, ikp_start, ikp_end)
+
+      CALL timestop(handle)
+
+   END SUBROUTINE build_2c_coulomb_matrix_kp_ewald
+
+! **************************************************************************************************
+!> \brief Adds sum_L exp(ik*L) (P 0 | Q L) to the dense V_PQ(k) for the lattice vectors L within
+!>        the given bounds
+!> \param V_k ...
+!> \param qs_env ...
+!> \param kpoints ...
+!> \param basis_type ...
+!> \param operator_type ...
+!> \param x_min ...
+!> \param x_max ...
+!> \param y_min ...
+!> \param y_max ...
+!> \param z_min ...
+!> \param z_max ...
+!> \param ikp_start ...
+!> \param ikp_end ...
+!> \param omega range-separation parameter of operator_type
+! **************************************************************************************************
+   SUBROUTINE lattice_sum_dense(V_k, qs_env, kpoints, basis_type, operator_type, &
+                                x_min, x_max, y_min, y_max, z_min, z_max, ikp_start, ikp_end, omega)
+      COMPLEX(KIND=dp), DIMENSION(:, :, :)               :: V_k
+      TYPE(qs_environment_type), POINTER                 :: qs_env
+      TYPE(kpoint_type), POINTER                         :: kpoints
+      CHARACTER(LEN=*), INTENT(IN)                       :: basis_type
+      INTEGER, INTENT(IN)                                :: operator_type, x_min, x_max, y_min, &
+                                                            y_max, z_min, z_max, ikp_start, ikp_end
+      REAL(KIND=dp), INTENT(IN), OPTIONAL                :: omega
+
+      CHARACTER(LEN=*), PARAMETER                        :: routineN = 'lattice_sum_dense'
+
+      INTEGER :: handle, handle2, i_cell, i_x, i_x_inner, i_x_outer, ik, ikp_local, j_y, &
+         j_y_inner, j_y_outer, k_z, k_z_inner, k_z_outer, n_atom, n_bf
       INTEGER, ALLOCATABLE, DIMENSION(:)                 :: bf_end_from_atom, bf_start_from_atom
       INTEGER, DIMENSION(3)                              :: nkp_grid
-      LOGICAL                                            :: do_ewald
-      REAL(KIND=dp)                                      :: coskl, ewald_omega, sinkl
+      REAL(KIND=dp)                                      :: coskl, sinkl
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :)        :: V_L
       REAL(KIND=dp), DIMENSION(3)                        :: vec_L, vec_s
-      REAL(KIND=dp), DIMENSION(3, 3)                     :: hmat
       TYPE(atomic_kind_type), DIMENSION(:), POINTER      :: atomic_kind_set
       TYPE(cell_type), POINTER                           :: cell
       TYPE(mp_para_env_type), POINTER                    :: para_env
@@ -743,18 +834,9 @@ CONTAINS
                       qs_kind_set=qs_kind_set, &
                       atomic_kind_set=atomic_kind_set)
 
-      CALL get_factor_and_xyz_min_max(cell, kpoints, size_lattice_sum, factor, hmat, &
-                                      x_min, x_max, y_min, y_max, z_min, z_max, nkp_grid)
+      CALL get_kpoint_info(kpoints, nkp_grid=nkp_grid)
 
       CALL get_basis_sizes(qs_env, n_atom, basis_type, bf_start_from_atom, bf_end_from_atom, n_bf)
-
-      do_ewald = .FALSE.
-      IF (PRESENT(use_ewald)) do_ewald = use_ewald
-      ewald_omega = 0.0_dp
-      IF (do_ewald) THEN
-         CALL ewald_real_space_bounds(cell, qs_kind_set, basis_type, ewald_omega, &
-                                      x_min, x_max, y_min, y_max, z_min, z_max)
-      END IF
 
       ALLOCATE (V_L(n_bf, n_bf))
 
@@ -783,11 +865,12 @@ CONTAINS
 
                         IF (MODULO(i_cell, para_env%num_pe) /= para_env%mepos) CYCLE
 
-                        vec_L = MATMUL(hmat, vec_s)
+                        vec_L = MATMUL(cell%hmat, vec_s)
 
                         ! Compute (P 0 | Q vec_L) and add it to V_R
                         CALL add_V_L(V_L, vec_L, n_atom, bf_start_from_atom, bf_end_from_atom, &
-                                     particle_set, qs_kind_set, atomic_kind_set, basis_type, cell, ewald_omega)
+                                     particle_set, qs_kind_set, atomic_kind_set, basis_type, cell, &
+                                     operator_type, omega)
 
                      END DO
                   END DO
@@ -824,13 +907,9 @@ CONTAINS
          END DO
       END DO
 
-      IF (do_ewald) THEN
-         CALL add_ewald_reciprocal(V_k, qs_env, kpoints, basis_type, ewald_omega, &
-                                   bf_start_from_atom, bf_end_from_atom, ikp_start, ikp_end)
-      END IF
       CALL timestop(handle)
 
-   END SUBROUTINE build_2c_coulomb_matrix_kp_small_cell
+   END SUBROUTINE lattice_sum_dense
 
 ! **************************************************************************************************
 !> \brief ...
@@ -900,10 +979,12 @@ CONTAINS
 !> \param atomic_kind_set ...
 !> \param basis_type ...
 !> \param cell ...
-!> \param ewald_omega erfc attenuation of the Ewald real-space sum; 0 for the plain Coulomb kernel
+!> \param operator_type ...
+!> \param omega range-separation parameter of operator_type
 ! **************************************************************************************************
    SUBROUTINE add_V_L(V_L, vec_L, n_atom, bf_start_from_atom, bf_end_from_atom, &
-                      particle_set, qs_kind_set, atomic_kind_set, basis_type, cell, ewald_omega)
+                      particle_set, qs_kind_set, atomic_kind_set, basis_type, cell, &
+                      operator_type, omega)
 
       REAL(KIND=dp), DIMENSION(:, :)                     :: V_L
       REAL(KIND=dp), DIMENSION(3)                        :: vec_L
@@ -914,7 +995,8 @@ CONTAINS
       TYPE(atomic_kind_type), DIMENSION(:), POINTER      :: atomic_kind_set
       CHARACTER(LEN=*), INTENT(IN)                       :: basis_type
       TYPE(cell_type), POINTER                           :: cell
-      REAL(KIND=dp), INTENT(IN)                          :: ewald_omega
+      INTEGER, INTENT(IN)                                :: operator_type
+      REAL(KIND=dp), INTENT(IN), OPTIONAL                :: omega
 
       CHARACTER(LEN=*), PARAMETER                        :: routineN = 'add_V_L'
 
@@ -959,17 +1041,10 @@ CONTAINS
 
             ALLOCATE (V_L_ab(a_2 - a_1 + 1, b_2 - b_1 + 1))
 
-            IF (ewald_omega > 0.0_dp) THEN
-               CALL int_operators_r12_ab_shg(operator_verfc, V_L_ab, rab=rab_L, &
-                                             fba=basis_set_a, fbb=basis_set_b, &
-                                             scona_shg=contr_a, sconb_shg=contr_b, &
-                                             omega=ewald_omega, calculate_forces=.FALSE.)
-            ELSE
-               CALL int_operators_r12_ab_shg(operator_coulomb, V_L_ab, rab=rab_L, &
-                                             fba=basis_set_a, fbb=basis_set_b, &
-                                             scona_shg=contr_a, sconb_shg=contr_b, &
-                                             calculate_forces=.FALSE.)
-            END IF
+            CALL int_operators_r12_ab_shg(operator_type, V_L_ab, rab=rab_L, &
+                                          fba=basis_set_a, fbb=basis_set_b, &
+                                          scona_shg=contr_a, sconb_shg=contr_b, &
+                                          omega=omega, calculate_forces=.FALSE.)
 
             V_L(a_1:a_2, b_1:b_2) = V_L(a_1:a_2, b_1:b_2) + V_L_ab(:, :)
 

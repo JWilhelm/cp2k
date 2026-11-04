@@ -66,7 +66,8 @@ MODULE gw_ri_rs_small_cell_full_kp_utils
                                               evGW0
    USE kinds,                           ONLY: dp,&
                                               int_8
-   USE kpoint_coulomb_2c,               ONLY: build_2c_coulomb_matrix_kp_small_cell
+   USE kpoint_coulomb_2c,               ONLY: build_2c_coulomb_matrix_kp_dense,&
+                                              build_2c_coulomb_matrix_kp_ewald
    USE kpoint_k_r_trafo_simple,         ONLY: rs_to_kp
    USE kpoint_lattice_fft,              ONLY: cell_to_k_grid_fft,&
                                               k_grid_to_cell_execute,&
@@ -1331,9 +1332,8 @@ CONTAINS
       ALLOCATE (K(n_RI, n_RI, nkp_local), M_inv(n_RI, n_RI), V_sqrt(n_RI, n_RI))
       ! The full Ewald Coulomb matrix is finite on the shifted 2D/3D q mesh. No
       ! G=0 auxiliary channel is removed at each transfer point.
-      CALL build_2c_coulomb_matrix_kp_small_cell(V_ref, qs_env, bs_env%kpoints_chi_eps_W, &
-                                                 bs_env%size_lattice_sum_V, basis_type='RI_AUX', &
-                                                 ikp_start=1, ikp_end=nkp, use_ewald=.TRUE.)
+      CALL build_2c_coulomb_matrix_kp_ewald(V_ref, qs_env, bs_env%kpoints_chi_eps_W, &
+                                            basis_type='RI_AUX', ikp_start=1, ikp_end=nkp)
       CALL build_ri_2c_lattice(fm_metric, metric_cells, bs_env%ri_metric, &
                                0.0_dp, bs_env, qs_env, reference_basis=bs_env%auto_ri%enabled)
       CALL ri_2c_lattice_to_owned_q(fm_metric, metric_cells, &
@@ -1557,8 +1557,8 @@ CONTAINS
       gamma%nkp = 1
       gamma%nkp_grid = bs_env%nkp_grid_chi_eps_W_orig
       V_owned = z_zero
-      CALL build_2c_coulomb_matrix_kp_small_cell(V_owned, qs_env, gamma, &
-                                                 bs_env%size_lattice_sum_V, 'RI_AUX', 1, 1)
+      CALL build_2c_coulomb_matrix_kp_dense(V_owned, qs_env, gamma, &
+                                            bs_env%size_lattice_sum_V, 'RI_AUX', 1, 1)
       V_regular(:, :) = z_zero
       CALL gamma_auxiliary_charges(qs_env, charge)
       IF (n_local == 1) THEN
