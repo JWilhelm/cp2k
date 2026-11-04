@@ -789,16 +789,6 @@ CONTAINS
       TYPE(particle_type), POINTER                       :: particles(:)
       TYPE(radial_interpolation_type), ALLOCATABLE       :: aux_potentials(:)
 
-      IF (bs_env%unit_nr > 0) THEN
-         WRITE (bs_env%unit_nr, '(T2,A)') 'dLP timing guide (details in final timing table):'
-         WRITE (bs_env%unit_nr, '(T2,A)') 'd_lP_allocate_thread_buffers: Allocate thread work arrays'
-         WRITE (bs_env%unit_nr, '(T2,A)') 'd_lP_screen_atom_image: Screen atom images and grid points'
-         WRITE (bs_env%unit_nr, '(T2,A)') 'd_lP_wait_for_threads: Wait for other OpenMP threads'
-         WRITE (bs_env%unit_nr, '(T2,A)') 'd_lP_release_thread_buffers: Release thread work arrays'
-         WRITE (bs_env%unit_nr, '(T2,A)') 'd_lP_uniform_exchange: Exchange grid fields between MPI ranks'
-         WRITE (bs_env%unit_nr, '(T2,A)') 'd_lP_prepare_field_bounds: Bound fields for screening'
-         WRITE (bs_env%unit_nr, '(T2,A)') 'd_lP_sum_g_f2_v: Contract potential with squared AO fields'
-      END IF
       nl = bs_env%ri_rs%n_grid_points
       cell => bs_env%ri_rs%cell
       particles => bs_env%ri_rs%particle_set

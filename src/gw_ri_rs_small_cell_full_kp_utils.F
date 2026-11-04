@@ -305,8 +305,7 @@ CONTAINS
       INTEGER :: handle, i_batch, i_group_size, ikp, ikp_local, j_w, my_qgroup, n_batch, &
          n_qgroups, n_RI, nkp, nkp_local, own_q, phase_handle, q_group, q_owner, q_root
       INTEGER, ALLOCATABLE                               :: q_roots(:)
-      REAL(KIND=dp)                                      :: available_GB, phase_elapsed, &
-                                                            phase_start, required_bytes, step_start
+      REAL(KIND=dp)                                      :: available_GB, required_bytes, step_start
       REAL(KIND=dp), ALLOCATABLE                         :: frequency_elapsed(:), time_weights(:)
       TYPE(cp_blacs_env_type), POINTER                   :: w_blacs
       TYPE(cp_cfm_type)                                  :: w_matrices(n_w_matrices)
@@ -316,7 +315,6 @@ CONTAINS
       CALL timeset(routineN, handle)
 
       CALL compute_metric_coulomb_factor(bs_env, qs_env, gwkp_env%metric_coulomb_factor)
-      phase_start = m_walltime()
       n_RI = bs_env%n_RI
       nkp = bs_env%nkp_scf_desymm
       IF (bs_env%nkp_chi_eps_W_orig_plus_extra /= nkp) THEN
@@ -341,9 +339,6 @@ CONTAINS
       END IF
       n_qgroups = bs_env%para_env%num_pe/i_group_size
       CALL grouped_w_partition(bs_env%para_env, n_qgroups, my_qgroup, q_roots)
-      IF (bs_env%unit_nr > 0) THEN
-         WRITE (bs_env%unit_nr, '(T2,A,T72,I9)') 'GW W(q) MPI ranks per matrix:', i_group_size
-      END IF
       ALLOCATE (gwkp_env%W_PQ_tau(nkp_local))
       ALLOCATE (time_weights(bs_env%num_time_freq_points))
       IF (nkp_local > 0 .OR. bs_env%para_env%mepos == q_roots(my_qgroup + 1)) THEN
@@ -435,13 +430,6 @@ CONTAINS
       CPASSERT(gwkp_env%group_env%mepos == bs_env%para_env%mepos)
 
       DEALLOCATE (time_weights)
-      phase_elapsed = m_walltime() - phase_start
-      CALL bs_env%para_env%max(phase_elapsed)
-      IF (bs_env%unit_nr > 0) THEN
-         WRITE (bs_env%unit_nr, '(T2,A,T69,F12.1)') &
-            'GW W(q) wall time [s]:', phase_elapsed
-         FLUSH (bs_env%unit_nr)
-      END IF
       IF (ALLOCATED(gwkp_env%chi_q_frequency)) DEALLOCATE (gwkp_env%chi_q_frequency)
 
       CALL timestop(handle)
@@ -592,15 +580,6 @@ CONTAINS
       ALLOCATE (gwkp_env%group_env)
       CALL gwkp_env%group_env%from_split(bs_env%para_env, gwkp_env%my_group)
       CPASSERT(gwkp_env%group_env%num_pe == i_group_size)
-      IF (bs_env%unit_nr > 0) THEN
-         WRITE (bs_env%unit_nr, '(T2,A,T72,F9.3)') &
-            'GW self-energy workspace budget per rank [GB]', budget_bytes*1.0E-9_dp
-         WRITE (bs_env%unit_nr, '(T2,A,T72,I9)') 'GW self-energy MPI ranks per time group', i_group_size
-         WRITE (bs_env%unit_nr, '(T2,A,T72,I9)') 'GW self-energy number of time groups', gwkp_env%ngroups
-         WRITE (bs_env%unit_nr, '(T2,A,T72,F9.3)') &
-            'GW self-energy additional peak per rank [GB]', peak_bytes*1.0E-9_dp
-         FLUSH (bs_env%unit_nr)
-      END IF
       IF (gwkp_env%ngroups == 1) THEN
          CALL timestop(handle)
          RETURN
@@ -707,10 +686,10 @@ CONTAINS
          n_groups, n_local, n_q_local, n_threads, n_time_local, n_world, nrows_local, phase_handle
       INTEGER, ALLOCATABLE                               :: full_cells(:, :)
       REAL(KIND=dp) :: atom_block_count, available_GB, budget, input_bytes, live_bytes, n_q_max, &
-         n_row_max, n_stored_max, peak, q_bytes, rows_bytes, step_elapsed, step_start, tau, &
-         time_bytes
+         n_row_max, n_stored_max, peak, q_bytes, rows_bytes, step_start, tau, time_bytes
       REAL(KIND=dp), ALLOCATABLE                         :: chi_grid_R(:, :, :), G_occ_R(:, :, :), &
-                                                            green_norm_sq(:), qpoints(:, :)
+                                                            green_norm_sq(:), qpoints(:, :), &
+                                                            step_times(:)
       TYPE(mp_comm_type)                                 :: column_env
       TYPE(mp_para_env_type), POINTER                    :: chi_env
       TYPE(ri_q_matrix_block_type), ALLOCATABLE          :: chi_partial(:)
@@ -724,10 +703,6 @@ CONTAINS
       n_world = gwkp_env%group_env%num_pe
       ALLOCATE (qpoints(3, bs_env%nkp_scf_desymm))
       qpoints(:, :) = bs_env%kpoints_chi_eps_W%xkp(:, 1:bs_env%nkp_scf_desymm)
-      IF (bs_env%unit_nr > 0) THEN
-         WRITE (bs_env%unit_nr, '(T2,A,T72,I9)') 'GW stored response q points:', &
-            SIZE(qpoints, 2)
-      END IF
       CALL mp_mem_avail_per_rank_GB(gwkp_env%group_env, available_GB)
       budget = MAX(0.0_dp, available_GB - MAX(1.0_dp, 0.1_dp*available_GB))*1.0E9_dp
       n_cells = SIZE(full_cells, 2)
@@ -783,11 +758,6 @@ CONTAINS
          Z_time => gwkp_env%Z_lP_q
       END IF
       n_time_local = (bs_env%num_time_freq_points + n_groups - 1 - i_group)/n_groups
-      IF (bs_env%unit_nr > 0) THEN
-         WRITE (bs_env%unit_nr, '(T2,A,T72,I9)') 'GW χ MPI ranks per time group', i_size
-         WRITE (bs_env%unit_nr, '(T2,A,T72,I9)') 'GW χ number of time groups', n_groups
-         CALL m_flush(bs_env%unit_nr)
-      END IF
       CALL local_grid_row_range(n_grid, chi_env, first_row, last_row, nrows_local)
       n_cells = SIZE(full_cells, 2)
       CPASSERT(bs_env%n_atom > 0)
@@ -805,7 +775,7 @@ CONTAINS
          ALLOCATE (chi_partial(iq_local)%values(n_aux, n_aux, n_time_local), SOURCE=z_zero)
       END DO
 
-      IF (bs_env%unit_nr > 0) WRITE (bs_env%unit_nr, '(A)') ' '
+      ALLOCATE (step_times(bs_env%num_time_freq_points), SOURCE=0.0_dp)
       DO i_t = i_group + 1, bs_env%num_time_freq_points, n_groups
          step_start = m_walltime()
          tau = bs_env%time_frequency_grid%imaginary_time(i_t)
@@ -882,15 +852,21 @@ CONTAINS
             chi_partial(iq_local)%values(:, :, i_time_local) = chi_q(:, :, iq_local)
          END DO
          CALL timestop(phase_handle)
-         step_elapsed = m_walltime() - step_start
-         IF (bs_env%unit_nr > 0) THEN
-            WRITE (bs_env%unit_nr, '(T2,A,I3,A,I0,T57,A,T71,F10.1,A)') &
-               'GW χ(iτ) point ', i_t, ' / ', bs_env%num_time_freq_points, &
-               'Exec. time:', step_elapsed, ' s'
-            CALL m_flush(bs_env%unit_nr)
-         END IF
+         IF (chi_env%mepos == 0) step_times(i_t) = m_walltime() - step_start
       END DO
       DEALLOCATE (green_norm_sq)
+
+      CALL bs_env%para_env%sum(step_times)
+      IF (bs_env%unit_nr > 0) THEN
+         WRITE (bs_env%unit_nr, '(A)') ' '
+         DO i_t = 1, bs_env%num_time_freq_points
+            WRITE (bs_env%unit_nr, '(T2,A,I3,A,I0,T57,A,T71,F10.1,A)') &
+               'GW χ(iτ) point ', i_t, ' / ', bs_env%num_time_freq_points, &
+               'Exec. time:', step_times(i_t), ' s'
+         END DO
+         CALL m_flush(bs_env%unit_nr)
+      END IF
+      DEALLOCATE (step_times)
 
       IF (ALLOCATED(psi_time)) DEALLOCATE (psi_time)
       CALL timeset('chi_time_groups_sum', phase_handle)
@@ -959,8 +935,7 @@ CONTAINS
          n_angular, n_directions, n_near, n_w_kpoints
       INTEGER, ALLOCATABLE                               :: metric_cells(:, :)
       LOGICAL                                            :: is_slab
-      REAL(KIND=dp)                                      :: near_q(3, 8), phase_elapsed, &
-                                                            phase_start, q_cart(3), &
+      REAL(KIND=dp)                                      :: near_q(3, 8), q_cart(3), &
                                                             q_direction(3), qnorm, &
                                                             reciprocal(3, 3), volume, weight
       REAL(KIND=dp), ALLOCATABLE                         :: angular_directions(:, :), &
@@ -971,7 +946,6 @@ CONTAINS
 
       CALL timeset(routineN, handle)
 
-      phase_start = m_walltime()
       is_slab = ALL(bs_env%periodic == [1, 1, 0])
       volume = bs_env%ri_rs%cell%deth
       n_w_kpoints = PRODUCT(bs_env%nkp_grid_chi_eps_W_orig)
@@ -1028,7 +1002,7 @@ CONTAINS
       CALL build_ri_2c_lattice(fm_metric, metric_cells, bs_env%ri_metric, &
                                0.0_dp, bs_env, qs_env, reference_basis=bs_env%auto_ri%enabled)
       IF (bs_env%auto_ri%enabled) THEN
-         CALL gamma_metric_contract_atoms(fm_metric, bs_env%auto_ri, metric_zero, bs_env%unit_nr)
+         CALL gamma_metric_contract_atoms(fm_metric, bs_env%auto_ri, metric_zero)
       ELSE
          CALL ri_2c_lattice_to_kp(fm_metric, metric_cells, [0.0_dp, 0.0_dp, 0.0_dp], metric_zero)
       END IF
@@ -1141,13 +1115,6 @@ CONTAINS
                   eps_P_cartesian, F_zero, &
                   pi_cartesian, response_cartesian, schur_cartesian, &
                   F_response_cartesian, wing_cartesian)
-      phase_elapsed = m_walltime() - phase_start
-      CALL bs_env%para_env%max(phase_elapsed)
-      IF (bs_env%unit_nr > 0) THEN
-         WRITE (bs_env%unit_nr, '(T2,A,T69,F12.1)') &
-            'GW Γ-point correction wall time [s]:', phase_elapsed
-         FLUSH (bs_env%unit_nr)
-      END IF
 
       CALL timestop(handle)
 
@@ -1688,16 +1655,11 @@ CONTAINS
       INTEGER, ALLOCATABLE                               :: cells(:, :)
       REAL(KIND=dp)                                      :: a, area, area_bz, b(3, 2), length, &
                                                             projection, q, qcart(3), &
-                                                            radial_weight, rcart(3), start_time
+                                                            radial_weight, rcart(3)
       REAL(KIND=dp), ALLOCATABLE                         :: nodes(:), rule(:)
 
       CALL timeset(routineN, handle)
 
-      start_time = m_walltime()
-      IF (bs_env%unit_nr > 0) THEN
-         WRITE (bs_env%unit_nr, '(T2,A)') 'GW 2D: integrate finite Gamma-correction head and wings'
-         CALL m_flush(bs_env%unit_nr)
-      END IF
       CALL build_full_cell_grid(bs_env, cells)
       CALL slab_reciprocal_vectors(bs_env, b, area)
       area_bz = twopi**2/area
@@ -1747,11 +1709,6 @@ CONTAINS
          END DO
       END DO
       DEALLOCATE (cells, nodes, rule, head_frequency)
-      IF (bs_env%unit_nr > 0) THEN
-         WRITE (bs_env%unit_nr, '(T2,A,T69,F12.1)') &
-            'GW 2D Gamma-correction cell integrals wall time [s]:', m_walltime() - start_time
-         CALL m_flush(bs_env%unit_nr)
-      END IF
 
       CALL timestop(handle)
 
@@ -1913,10 +1870,6 @@ CONTAINS
       END DO
       DEALLOCATE (gwkp_env%metric_coulomb_factor)
       CALL timeset('Sigma_x_project_V_grid', phase_handle)
-      IF (bs_env%unit_nr > 0) THEN
-         WRITE (bs_env%unit_nr, '(T2,A)') 'GW exchange: projecting bare Coulomb onto RI-RS grid'
-         CALL m_flush(bs_env%unit_nr)
-      END IF
       ALLOCATE (q_matrices(n_grid, n_grid, n_q_local))
       !$OMP PARALLEL DO DEFAULT(NONE) SCHEDULE(STATIC) &
       !$OMP SHARED(gwkp_env, interaction_q, q_matrices, n_q_local) PRIVATE(iq_local)
@@ -1931,10 +1884,6 @@ CONTAINS
       CALL q_matrices_to_fft_pairs(q_matrices, bs_env%para_env, V_plan, G_grid_k)
       DEALLOCATE (q_matrices)
       CALL timestop(phase_handle)
-      IF (bs_env%unit_nr > 0) THEN
-         WRITE (bs_env%unit_nr, '(T2,A)') 'GW exchange: bare-Coulomb grid projection complete'
-         CALL m_flush(bs_env%unit_nr)
-      END IF
       CALL build_full_cell_grid(bs_env, full_cells)
       ALLOCATE (V_grid_R(V_plan%n_local, 1, SIZE(full_cells, 2)))
       CALL gw_k_grid_to_real_cells(G_grid_k, qpoints, bs_env%kpoints_scf_desymm%nkp_grid, &
@@ -2951,7 +2900,6 @@ CONTAINS
       TYPE(gamma_ao_time_state_type), INTENT(INOUT)      :: state
 
       INTEGER                                            :: n_rank, n_rows, n_time, rank
-      REAL(KIND=dp)                                      :: cache_gib
 
       CPASSERT(n_grid > 0)
       n_time = bs_env%num_time_freq_points
@@ -2963,13 +2911,6 @@ CONTAINS
       ALLOCATE (state%chi_tau(n_rows, n_grid, n_time), SOURCE=z_zero)
       ALLOCATE (state%wing_tau(n_rows, 3, n_time), SOURCE=z_zero)
       ALLOCATE (state%head_tau(3, 3, n_time), SOURCE=z_zero)
-      cache_gib = 16.0_dp*(REAL(n_rows, dp)*n_grid*n_time + REAL(n_rows, dp)*3*n_time + 9*n_time)/1024.0_dp**3
-      CALL bs_env%para_env%max(cache_gib)
-      IF (bs_env%unit_nr > 0) THEN
-         WRITE (bs_env%unit_nr, '(T2,A,T65,F12.3,A4)') &
-            'Gamma time cache largest rank allocation:', cache_gib, ' GiB'
-         CALL m_flush(bs_env%unit_nr)
-      END IF
    END SUBROUTINE initialize_time_state
 
 ! **************************************************************************************************
@@ -3019,11 +2960,6 @@ CONTAINS
          END DO
       END IF
       CALL bs_env%para_env%max(worst)
-      IF (bs_env%unit_nr > 0) THEN
-         WRITE (bs_env%unit_nr, '(T2,A,T61,ES20.12)') &
-            'Gamma time transform sampled relative error:', worst
-         CALL m_flush(bs_env%unit_nr)
-      END IF
       IF (worst > eps_gamma_time_transform) THEN
          WRITE (error_message, '(A,ES12.4,A,ES12.4,A)') &
             'Gamma time transform relative error ', worst, &
@@ -3257,19 +3193,17 @@ CONTAINS
       COMPLEX(KIND=dp), ALLOCATABLE                      :: aux_y(:, :), direction(:, :), &
                                                             grid_x(:, :), grid_y(:, :), &
                                                             PRODUCT(:, :), r(:, :), true_r(:, :)
-      INTEGER                                            :: handle, i_c, i_iter, iterations, nc
+      INTEGER                                            :: handle, i_c, i_iter, nc
       LOGICAL                                            :: active(SIZE(b, 2)), &
                                                             check_column(SIZE(b, 2))
       REAL(KIND=dp)                                      :: alpha, norm_b(SIZE(b, 2)), relative_r, &
-                                                            residual, rr(SIZE(b, 2)), &
+                                                            rr(SIZE(b, 2)), &
                                                             rr_new(SIZE(b, 2))
 
       CALL timeset('gamma_body_iterative_solve', handle)
 
       nc = SIZE(b, 2)
       x = z_zero
-      iterations = 0
-      residual = 0.0_dp
       DO i_c = 1, nc
          rr(i_c) = REAL(DOT_PRODUCT(b(:, i_c), b(:, i_c)), dp)
       END DO
@@ -3296,7 +3230,6 @@ CONTAINS
             rr_new(i_c) = REAL(DOT_PRODUCT(r(:, i_c), r(:, i_c)), dp)
             check_column(i_c) = SQRT(rr_new(i_c)) <= tolerance*norm_b(i_c)
          END DO
-         iterations = i_iter
          IF (ANY(check_column)) THEN
             CALL apply_gamma_corr_body(bs_env, T_rows, chi, first_row, x, true_r, aux_y, grid_x, grid_y)
             true_r(:, :) = b - x - true_r
@@ -3306,7 +3239,6 @@ CONTAINS
             IF (check_column(i_c)) THEN
                relative_r = SQRT(REAL(DOT_PRODUCT(true_r(:, i_c), true_r(:, i_c)), dp))/norm_b(i_c)
                IF (relative_r <= 5.0_dp*tolerance) THEN
-                  residual = MAX(residual, relative_r)
                   active(i_c) = .FALSE.
                   direction(:, i_c) = z_zero
                ELSE
@@ -3321,10 +3253,6 @@ CONTAINS
          END DO
       END DO
       IF (ANY(active)) CPABORT('Matrix-free Gamma body solve did not converge')
-      IF (bs_env%unit_nr > 0) THEN
-         WRITE (bs_env%unit_nr, '(T2,A,T69,I12)') 'Gamma time response maximum iterations:', iterations
-         WRITE (bs_env%unit_nr, '(T2,A,T61,ES20.12)') 'Gamma time response true relative residual:', residual
-      END IF
 
       CALL timestop(handle)
 
@@ -3340,13 +3268,11 @@ CONTAINS
 !> \param images ...
 !> \param auto_ri ...
 !> \param metric ...
-!> \param unit_nr ...
 ! **************************************************************************************************
-   SUBROUTINE gamma_metric_contract_atoms(images, auto_ri, metric, unit_nr)
+   SUBROUTINE gamma_metric_contract_atoms(images, auto_ri, metric)
       TYPE(cp_fm_type), INTENT(IN)                       :: images(:)
       TYPE(auto_ri_type), INTENT(IN)                     :: auto_ri
       COMPLEX(KIND=dp), INTENT(OUT)                      :: metric(:, :)
-      INTEGER, INTENT(IN)                                :: unit_nr
 
       INTEGER                                            :: handle
       TYPE(gamma_atom_projection_type), ALLOCATABLE      :: left(:), right(:)
@@ -3354,7 +3280,7 @@ CONTAINS
       CALL timeset('gamma_metric_contract_atoms', handle)
 
       CALL prepare_gamma_atom_projections(images, auto_ri, left, right)
-      CALL accumulate_gamma_atom_metric(images, left, right, metric, unit_nr)
+      CALL accumulate_gamma_atom_metric(images, left, right, metric)
       DEALLOCATE (left, right)
 
       CALL timestop(handle)
@@ -3444,22 +3370,14 @@ CONTAINS
 !> \param left ...
 !> \param right ...
 !> \param metric ...
-!> \param unit_nr ...
 ! **************************************************************************************************
-   SUBROUTINE accumulate_gamma_atom_metric(images, left, right, metric, unit_nr)
+   SUBROUTINE accumulate_gamma_atom_metric(images, left, right, metric)
       TYPE(cp_fm_type), INTENT(IN)                       :: images(:)
       TYPE(gamma_atom_projection_type), INTENT(IN)       :: left(:), right(:)
       COMPLEX(KIND=dp), INTENT(OUT)                      :: metric(:, :)
-      INTEGER, INTENT(IN)                                :: unit_nr
 
-      REAL(KIND=dp), PARAMETER :: fractions(9) = [0.001_dp, 0.003_dp, 0.01_dp, 0.03_dp, 0.1_dp, &
-         0.3_dp, 0.6_dp, 0.9_dp, 1.0_dp]
-
-      INTEGER                                            :: ia, ib, icell, iprogress, n_opt_total, &
-                                                            nc, noleft, nopt, noright, nr, nref, &
-                                                            pfirst, qfirst
-      REAL(KIND=dp)                                      :: local_time, reduce_time, start_time, &
-                                                            stats(3), tick
+      INTEGER                                            :: ia, ib, icell, n_opt_total, nc, noleft, &
+                                                            nopt, noright, nr, nref, pfirst, qfirst
       REAL(KIND=dp), ALLOCATABLE                         :: block(:, :), PRODUCT(:, :), value(:, :)
 
       nopt = MAXVAL([(SIZE(left(ia)%values, 2), ia=1, SIZE(left))])
@@ -3469,16 +3387,7 @@ CONTAINS
       CPASSERT(ALL(SHAPE(metric) == n_opt_total))
       ALLOCATE (block(nref, nref), PRODUCT(nref, nopt), value(nopt, nopt))
       metric = z_zero
-      start_time = m_walltime()
-      local_time = 0.0_dp
-      reduce_time = 0.0_dp
-      iprogress = 1
-      IF (unit_nr > 0) THEN
-         WRITE (unit_nr, '(T2,A)') 'Γ RI metric: atom-block contraction started'
-         CALL m_flush(unit_nr)
-      END IF
       DO ib = 1, SIZE(right)
-         tick = m_walltime()
          nc = SIZE(right(ib)%positions)
          noright = SIZE(right(ib)%values, 2)
          qfirst = right(ib)%first
@@ -3499,40 +3408,10 @@ CONTAINS
             metric(pfirst:pfirst + noleft - 1, qfirst:qfirst + noright - 1) = &
                CMPLX(value(1:noleft, 1:noright), 0.0_dp, dp)
          END DO
-         local_time = local_time + m_walltime() - tick
-         tick = m_walltime()
          CPASSERT(noright <= HUGE(0)/SIZE(metric, 1))
          CALL images(1)%matrix_struct%para_env%sum(metric(:, qfirst:qfirst + noright - 1))
-         reduce_time = reduce_time + m_walltime() - tick
-         IF (iprogress <= SIZE(fractions)) THEN
-            IF (REAL(ib, dp) >= fractions(iprogress)*SIZE(right)) THEN
-               IF (unit_nr > 0) THEN
-                  WRITE (unit_nr, '(T2,A,I10,A,I10,T64,F13.3,A4)') &
-                     'Γ metric atoms ', ib, ' / ', SIZE(right), m_walltime() - start_time, ' s  '
-                  CALL m_flush(unit_nr)
-               END IF
-               DO WHILE (iprogress <= SIZE(fractions))
-                  IF (REAL(ib, dp) < fractions(iprogress)*SIZE(right)) EXIT
-                  iprogress = iprogress + 1
-               END DO
-            END IF
-         END IF
       END DO
-      stats = local_time
-      CALL images(1)%matrix_struct%para_env%min(stats(1))
-      CALL images(1)%matrix_struct%para_env%sum(stats(2))
-      CALL images(1)%matrix_struct%para_env%max(stats(3))
-      stats(2) = stats(2)/images(1)%matrix_struct%para_env%num_pe
-      CALL images(1)%matrix_struct%para_env%max(reduce_time)
-      IF (unit_nr > 0) THEN
-         WRITE (unit_nr, '(T2,A,T48,3ES11.3)') 'Γ atom work seconds min/mean/max:', stats
-         WRITE (unit_nr, '(T2,A,T68,ES13.5)') 'Γ atom reduction/wait maximum seconds:', reduce_time
-      END IF
       DEALLOCATE (block, product, value)
-      IF (unit_nr > 0) THEN
-         WRITE (unit_nr, '(T2,A)') 'Γ RI metric: atom-block contraction completed'
-         CALL m_flush(unit_nr)
-      END IF
    END SUBROUTINE accumulate_gamma_atom_metric
 
 ! **************************************************************************************************
