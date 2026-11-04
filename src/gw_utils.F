@@ -263,45 +263,6 @@ CONTAINS
    END SUBROUTINE create_and_init_bs_env_for_gw
 
 ! **************************************************************************************************
-!> \brief Allocate the arrays holding the GW quasiparticle energies
-!> \param bs_env ...
-! **************************************************************************************************
-   SUBROUTINE allocate_GW_eigenvalues(bs_env)
-      TYPE(post_scf_bandstructure_type), POINTER         :: bs_env
-
-      CHARACTER(LEN=*), PARAMETER :: routineN = 'allocate_GW_eigenvalues'
-
-      INTEGER                                            :: handle, n_ao, n_spin, nkp
-
-      CALL timeset(routineN, handle)
-
-      n_ao = bs_env%n_ao
-      nkp = bs_env%nkp_bs_and_DOS
-      n_spin = bs_env%n_spin
-
-      IF (.NOT. ALLOCATED(bs_env%eigenval_GW)) THEN
-         ALLOCATE (bs_env%eigenval_GW(n_ao, nkp, n_spin))
-      END IF
-      IF (.NOT. ALLOCATED(bs_env%eigenval_HF)) THEN
-         ALLOCATE (bs_env%eigenval_HF(n_ao, nkp, n_spin))
-      END IF
-
-      SELECT CASE (bs_env%gw_flavour)
-      CASE (G0W0, evGW0)
-         IF (.NOT. ALLOCATED(bs_env%eigenval_G0W0)) THEN
-            ALLOCATE (bs_env%eigenval_G0W0(n_ao, nkp, n_spin))
-         END IF
-      END SELECT
-
-      IF (bs_env%gw_flavour == evGW0 .AND. .NOT. ALLOCATED(bs_env%eigenval_evGW0)) THEN
-         ALLOCATE (bs_env%eigenval_evGW0(n_ao, nkp, n_spin))
-      END IF
-
-      CALL timestop(handle)
-
-   END SUBROUTINE allocate_GW_eigenvalues
-
-! **************************************************************************************************
 !> \brief Store the QS environment parameters needed by GW.
 !> \param qs_env ...
 !> \param bs_env ...
@@ -2285,6 +2246,45 @@ CONTAINS
       CALL timestop(handle)
 
    END SUBROUTINE create_2c_t
+
+! **************************************************************************************************
+!> \brief Allocate the arrays holding the GW quasiparticle energies
+!> \param bs_env ...
+! **************************************************************************************************
+   SUBROUTINE allocate_GW_eigenvalues(bs_env)
+      TYPE(post_scf_bandstructure_type), POINTER         :: bs_env
+
+      CHARACTER(LEN=*), PARAMETER :: routineN = 'allocate_GW_eigenvalues'
+
+      INTEGER                                            :: handle, n_ao, n_spin, nkp
+
+      CALL timeset(routineN, handle)
+
+      n_ao = bs_env%n_ao
+      nkp = bs_env%nkp_bs_and_DOS
+      n_spin = bs_env%n_spin
+
+      IF (.NOT. ALLOCATED(bs_env%eigenval_GW)) THEN
+         ALLOCATE (bs_env%eigenval_GW(n_ao, nkp, n_spin))
+      END IF
+      IF (.NOT. ALLOCATED(bs_env%eigenval_HF)) THEN
+         ALLOCATE (bs_env%eigenval_HF(n_ao, nkp, n_spin))
+      END IF
+
+      SELECT CASE (bs_env%gw_flavour)
+      CASE (G0W0, evGW0)
+         IF (.NOT. ALLOCATED(bs_env%eigenval_G0W0)) THEN
+            ALLOCATE (bs_env%eigenval_G0W0(n_ao, nkp, n_spin))
+         END IF
+      END SELECT
+
+      IF (bs_env%gw_flavour == evGW0 .AND. .NOT. ALLOCATED(bs_env%eigenval_evGW0)) THEN
+         ALLOCATE (bs_env%eigenval_evGW0(n_ao, nkp, n_spin))
+      END IF
+
+      CALL timestop(handle)
+
+   END SUBROUTINE allocate_GW_eigenvalues
 
 ! **************************************************************************************************
 !> \brief ...
