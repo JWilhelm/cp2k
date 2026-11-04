@@ -35,7 +35,6 @@ MODULE kpoint_coulomb_2c
                                               gaussi,&
                                               pi,&
                                               twopi,&
-                                              z_one,&
                                               z_zero
    USE mathlib,                         ONLY: gauss_legendre,&
                                               vector_product
@@ -799,6 +798,12 @@ CONTAINS
 !> \param ikp_start ...
 !> \param ikp_end ...
 !> \param omega range-separation parameter of operator_type
+!> \par On the k mesh, exp(ik*L) depends on L only modulo 2N (N: mesh size), so the cells are grouped
+!>      into such classes and only occupied classes are kept. The cells are distributed over all ranks.
+!>      With more k points than classes (Ewald), the V_L of a batch of classes are summed over the ranks
+!>      and each rank adds the phases for its own k points with OpenMP. With fewer k points than classes
+!>      (e.g. a long direct sum at a single k), each rank adds its cells directly to all k and only the
+!>      N_k matrices are summed. Communication: n_bf^2 MIN(N_class, N_k) per rank.
 ! **************************************************************************************************
    SUBROUTINE lattice_sum_dense(V_k, qs_env, kpoints, basis_type, operator_type, &
                                 x_min, x_max, y_min, y_max, z_min, z_max, ikp_start, ikp_end, omega)
@@ -811,14 +816,20 @@ CONTAINS
       REAL(KIND=dp), INTENT(IN), OPTIONAL                :: omega
 
       CHARACTER(LEN=*), PARAMETER                        :: routineN = 'lattice_sum_dense'
+      REAL(KIND=dp), PARAMETER :: batch_bytes = 64.0_dp*1024.0_dp**2
 
-      INTEGER :: handle, handle2, i_cell, i_x, i_x_inner, i_x_outer, ik, ikp_local, j_y, &
-         j_y_inner, j_y_outer, k_z, k_z_inner, k_z_outer, n_atom, n_bf
-      INTEGER, ALLOCATABLE, DIMENSION(:)                 :: bf_end_from_atom, bf_start_from_atom
+      COMPLEX(KIND=dp)                                   :: phase
+      COMPLEX(KIND=dp), ALLOCATABLE, DIMENSION(:, :, :)  :: V_part
+      INTEGER :: first_class, first_k, handle, handle2, i_cell, i_class, i_local, i_x, i_x_inner, &
+         i_x_outer, ik, j_y, j_y_inner, j_y_outer, k_z, k_z_inner, k_z_outer, last_class, last_k, &
+         n_atom, n_batch, n_bf, n_cells, n_class, n_local
+      INTEGER, ALLOCATABLE, DIMENSION(:)                 :: bf_end_from_atom, bf_start_from_atom, &
+                                                            cell_class, class_first, k_local
+      INTEGER, ALLOCATABLE, DIMENSION(:, :)              :: cell_s
       INTEGER, DIMENSION(3)                              :: nkp_grid
-      REAL(KIND=dp)                                      :: coskl, sinkl
-      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :)        :: V_L
-      REAL(KIND=dp), DIMENSION(3)                        :: vec_L, vec_s
+      REAL(KIND=dp)                                      :: arg
+      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :, :)     :: V_L
+      REAL(KIND=dp), DIMENSION(3)                        :: vec_L
       TYPE(atomic_kind_type), DIMENSION(:), POINTER      :: atomic_kind_set
       TYPE(cell_type), POINTER                           :: cell
       TYPE(mp_para_env_type), POINTER                    :: para_env
@@ -838,74 +849,124 @@ CONTAINS
 
       CALL get_basis_sizes(qs_env, n_atom, basis_type, bf_start_from_atom, bf_end_from_atom, n_bf)
 
-      ALLOCATE (V_L(n_bf, n_bf))
-
+      ! Cells within the bounds, ordered by their class L mod 2N; classes without a cell are skipped.
+      n_cells = (x_max - x_min + 1)*(y_max - y_min + 1)*(z_max - z_min + 1)
+      ALLOCATE (cell_s(3, n_cells), cell_class(n_cells), class_first(n_cells + 1))
+      n_cells = 0
+      n_class = 0
       DO i_x_inner = 0, 2*nkp_grid(1) - 1
          DO j_y_inner = 0, 2*nkp_grid(2) - 1
             DO k_z_inner = 0, 2*nkp_grid(3) - 1
-
-               V_L(:, :) = 0.0_dp
-               i_cell = 0
-
+               i_cell = n_cells
                DO i_x_outer = x_min, x_max + nkp_grid(1), 2*nkp_grid(1)
                   DO j_y_outer = y_min, y_max + nkp_grid(2), 2*nkp_grid(2)
                      DO k_z_outer = z_min, z_max + nkp_grid(3), 2*nkp_grid(3)
-
                         i_x = i_x_inner + i_x_outer
                         j_y = j_y_inner + j_y_outer
                         k_z = k_z_inner + k_z_outer
-
                         IF (i_x > x_max .OR. i_x < x_min .OR. &
                             j_y > y_max .OR. j_y < y_min .OR. &
                             k_z > z_max .OR. k_z < z_min) CYCLE
-
-                        i_cell = i_cell + 1
-
-                        vec_s = [REAL(i_x, dp), REAL(j_y, dp), REAL(k_z, dp)]
-
-                        IF (MODULO(i_cell, para_env%num_pe) /= para_env%mepos) CYCLE
-
-                        vec_L = MATMUL(cell%hmat, vec_s)
-
-                        ! Compute (P 0 | Q vec_L) and add it to V_R
-                        CALL add_V_L(V_L, vec_L, n_atom, bf_start_from_atom, bf_end_from_atom, &
-                                     particle_set, qs_kind_set, atomic_kind_set, basis_type, cell, &
-                                     operator_type, omega)
-
+                        n_cells = n_cells + 1
+                        cell_s(:, n_cells) = [i_x, j_y, k_z]
+                        cell_class(n_cells) = n_class + 1
                      END DO
                   END DO
                END DO
-
-               CALL para_env%sync()
-               CALL para_env%sum(V_L)
-
-               CALL timeset(routineN//"_R_to_k", handle2)
-
-               ikp_local = 0
-
-               ! add exp(iq*vec_L) * (P 0 | Q vec_L) to V_PQ(q)
-               DO ik = 1, ikp_end
-
-                  IF (MODULO(ik, para_env%num_pe) /= para_env%mepos) CYCLE
-
-                  ikp_local = ikp_local + 1
-
-                  IF (ik < ikp_start) CYCLE
-
-                  ! coskl and sinkl are identical for all i_x_outer, j_y_outer, k_z_outer
-                  coskl = COS(twopi*DOT_PRODUCT(vec_s(1:3), kpoints%xkp(1:3, ik)))
-                  sinkl = SIN(twopi*DOT_PRODUCT(vec_s(1:3), kpoints%xkp(1:3, ik)))
-
-                  V_k(:, :, ikp_local) = V_k(:, :, ikp_local) + z_one*coskl*V_L(:, :) + &
-                                         gaussi*sinkl*V_L(:, :)
-
-               END DO
-
-               CALL timestop(handle2)
-
+               IF (n_cells > i_cell) THEN
+                  n_class = n_class + 1
+                  class_first(n_class) = i_cell + 1
+               END IF
             END DO
          END DO
       END DO
+      class_first(n_class + 1) = n_cells + 1
+
+      ! Local k points in the storage order of V_k.
+      n_local = 0
+      DO ik = 1, ikp_end
+         IF (MODULO(ik, para_env%num_pe) == para_env%mepos) n_local = n_local + 1
+      END DO
+      ALLOCATE (k_local(n_local))
+      n_local = 0
+      DO ik = 1, ikp_end
+         IF (MODULO(ik, para_env%num_pe) /= para_env%mepos) CYCLE
+         n_local = n_local + 1
+         k_local(n_local) = ik
+      END DO
+
+      ! batch_bytes bounds the memory of the summed V_L of one batch [bytes].
+      IF (ikp_end - ikp_start + 1 < n_class) THEN
+         ! Fewer k points than classes: sum each own cell directly into all k, reduce N_k matrices.
+         n_batch = MAX(1, MIN(ikp_end - ikp_start + 1, INT(batch_bytes/(16.0_dp*REAL(n_bf, dp)**2))))
+         ALLOCATE (V_L(n_bf, n_bf, 1), V_part(n_bf, n_bf, n_batch))
+         DO first_k = ikp_start, ikp_end, n_batch
+            last_k = MIN(ikp_end, first_k + n_batch - 1)
+            V_part(:, :, :) = z_zero
+            DO i_cell = 1, n_cells
+               IF (MODULO(i_cell, para_env%num_pe) /= para_env%mepos) CYCLE
+               V_L(:, :, 1) = 0.0_dp
+               vec_L = MATMUL(cell%hmat, REAL(cell_s(:, i_cell), dp))
+               CALL add_V_L(V_L(:, :, 1), vec_L, n_atom, bf_start_from_atom, bf_end_from_atom, &
+                            particle_set, qs_kind_set, atomic_kind_set, basis_type, cell, &
+                            operator_type, omega)
+!$OMP PARALLEL DO DEFAULT(NONE) SCHEDULE(STATIC) &
+!$OMP             SHARED(V_part, V_L, kpoints, cell_s, i_cell, first_k, last_k) PRIVATE(ik, arg, phase)
+               DO ik = first_k, last_k
+                  arg = twopi*DOT_PRODUCT(REAL(cell_s(:, i_cell), dp), kpoints%xkp(1:3, ik))
+                  phase = CMPLX(COS(arg), SIN(arg), KIND=dp)
+                  V_part(:, :, ik - first_k + 1) = V_part(:, :, ik - first_k + 1) + phase*V_L(:, :, 1)
+               END DO
+!$OMP END PARALLEL DO
+            END DO
+            CALL para_env%sum(V_part(:, :, 1:last_k - first_k + 1))
+            DO ik = first_k, last_k
+               IF (MODULO(ik, para_env%num_pe) /= para_env%mepos) CYCLE
+               V_k(:, :, (ik - 1)/para_env%num_pe + 1) = V_k(:, :, (ik - 1)/para_env%num_pe + 1) + &
+                                                         V_part(:, :, ik - first_k + 1)
+            END DO
+         END DO
+         DEALLOCATE (V_L, V_part, cell_s, cell_class, class_first, k_local)
+         CALL timestop(handle)
+         RETURN
+      END IF
+
+      n_batch = MAX(1, MIN(n_class, INT(batch_bytes/(8.0_dp*REAL(n_bf, dp)**2))))
+      ALLOCATE (V_L(n_bf, n_bf, n_batch))
+
+      DO first_class = 1, n_class, n_batch
+         last_class = MIN(n_class, first_class + n_batch - 1)
+         V_L(:, :, :) = 0.0_dp
+         ! Compute (P 0 | Q vec_L) for the cells of this batch, distributed over all ranks
+         DO i_cell = class_first(first_class), class_first(last_class + 1) - 1
+            IF (MODULO(i_cell, para_env%num_pe) /= para_env%mepos) CYCLE
+            vec_L = MATMUL(cell%hmat, REAL(cell_s(:, i_cell), dp))
+            CALL add_V_L(V_L(:, :, cell_class(i_cell) - first_class + 1), vec_L, n_atom, &
+                         bf_start_from_atom, bf_end_from_atom, particle_set, qs_kind_set, &
+                         atomic_kind_set, basis_type, cell, operator_type, omega)
+         END DO
+         CALL para_env%sum(V_L(:, :, 1:last_class - first_class + 1))
+
+         CALL timeset(routineN//"_R_to_k", handle2)
+         ! add exp(iq*vec_L) * (P 0 | Q vec_L) to V_PQ(q); the phase is the same for all cells of a class
+!$OMP PARALLEL DO DEFAULT(NONE) SCHEDULE(STATIC) &
+!$OMP             SHARED(V_k, V_L, k_local, n_local, ikp_start, kpoints, cell_s, class_first, &
+!$OMP                    first_class, last_class) &
+!$OMP             PRIVATE(i_local, ik, i_class, arg, phase)
+         DO i_local = 1, n_local
+            ik = k_local(i_local)
+            IF (ik < ikp_start) CYCLE
+            DO i_class = first_class, last_class
+               arg = twopi*DOT_PRODUCT(REAL(cell_s(:, class_first(i_class)), dp), kpoints%xkp(1:3, ik))
+               phase = CMPLX(COS(arg), SIN(arg), KIND=dp)
+               V_k(:, :, i_local) = V_k(:, :, i_local) + phase*V_L(:, :, i_class - first_class + 1)
+            END DO
+         END DO
+!$OMP END PARALLEL DO
+         CALL timestop(handle2)
+      END DO
+
+      DEALLOCATE (V_L, cell_s, cell_class, class_first, k_local)
 
       CALL timestop(handle)
 
@@ -1134,8 +1195,9 @@ CONTAINS
                                                             ikp_end
 
       COMPLEX(KIND=dp), ALLOCATABLE                      :: fourier_basis(:)
-      INTEGER                                            :: bounds(3), idim, ikp, ikp_local, ix, iy, &
-                                                            iz, n_bf
+      INTEGER                                            :: bounds(3), i_owned, idim, ikp, &
+                                                            ikp_local, ix, iy, iz, n_bf
+      INTEGER, ALLOCATABLE                               :: k_owned(:)
       REAL(KIND=dp)                                      :: cutoff, p(3), p2, prefactor, q(3), &
                                                             reciprocal(3, 3)
       TYPE(cell_type), POINTER                           :: cell
@@ -1150,11 +1212,19 @@ CONTAINS
       ELSE
          CPASSERT(COUNT(cell%perd /= 0) == 3)
          n_bf = SIZE(V_k, 1)
-         ALLOCATE (fourier_basis(n_bf))
          reciprocal = twopi*TRANSPOSE(cell%h_inv)
          cutoff = 2.0_dp*omega*SQRT(ewald_tail_exponent + ewald_lmax_margin*basis_lmax(qs_kinds, basis_type))
-         DO ikp = ikp_start, ikp_end
-            IF (MODULO(ikp, para_env%num_pe) /= para_env%mepos) CYCLE
+         k_owned = PACK([(ikp, ikp=ikp_start, ikp_end)], &
+                        MODULO([(ikp, ikp=ikp_start, ikp_end)], para_env%num_pe) == para_env%mepos)
+         ! Each thread handles its own k points of this rank.
+!$OMP PARALLEL DEFAULT(NONE) &
+!$OMP          SHARED(V_k, k_owned, kpoints, para_env, cell, reciprocal, cutoff, omega, particles, &
+!$OMP                 qs_kinds, basis_type, bf_start, bf_end, n_bf) &
+!$OMP          PRIVATE(i_owned, ikp, ikp_local, q, idim, bounds, ix, iy, iz, p, p2, prefactor, fourier_basis)
+         ALLOCATE (fourier_basis(n_bf))
+!$OMP DO SCHEDULE(DYNAMIC)
+         DO i_owned = 1, SIZE(k_owned)
+            ikp = k_owned(i_owned)
             ikp_local = (ikp - para_env%mepos)/para_env%num_pe + 1
             IF (para_env%mepos == 0) ikp_local = ikp/para_env%num_pe
             q = kpoints%xkp(:, ikp)
@@ -1180,7 +1250,9 @@ CONTAINS
                END DO
             END DO
          END DO
+!$OMP END DO
          DEALLOCATE (fourier_basis)
+!$OMP END PARALLEL
       END IF
    END SUBROUTINE add_ewald_reciprocal
 
@@ -1212,8 +1284,10 @@ CONTAINS
       COMPLEX(KIND=dp), ALLOCATABLE                      :: delta_minus(:), delta_plus(:), &
                                                             delta_sum(:), f_minus(:), f_plus(:), &
                                                             f_zero(:)
-      INTEGER                                            :: free_axis, ikp, ikp_local, inode, ix, &
-                                                            iy, n_bf, nx, ny, periodic_axis(2)
+      INTEGER                                            :: free_axis, i_owned, ikp, ikp_local, &
+                                                            inode, ix, iy, n_bf, nx, ny, &
+                                                            periodic_axis(2)
+      INTEGER, ALLOCATABLE                               :: k_owned(:)
       REAL(KIND=dp)                                      :: a1(3), a2(3), area, b1(3), b2(3), &
                                                             cutoff, factor, kz, nodes(n_kz), &
                                                             normal(3), p(3), pnorm, q(3), weight, &
@@ -1237,15 +1311,25 @@ CONTAINS
       b1 = twopi*vector_product(a2, normal)/area
       b2 = twopi*vector_product(normal, a1)/area
       n_bf = SIZE(V_k, 1)
-      ALLOCATE (f_zero(n_bf), f_plus(n_bf), f_minus(n_bf), &
-                delta_plus(n_bf), delta_minus(n_bf), delta_sum(n_bf))
       cutoff = 2.0_dp*omega*SQRT(ewald_tail_exponent + ewald_lmax_margin*basis_lmax(qs_kinds, basis_type))
       ! Legendre nodes and weights on [0, cutoff] for the free momentum.
       CALL gauss_legendre(n_kz, nodes, weights)
       nodes(:) = 0.5_dp*cutoff*(nodes + 1.0_dp)
       weights(:) = 0.5_dp*cutoff*weights
-      DO ikp = ikp_start, ikp_end
-         IF (MODULO(ikp, para_env%num_pe) /= para_env%mepos) CYCLE
+      k_owned = PACK([(ikp, ikp=ikp_start, ikp_end)], &
+                     MODULO([(ikp, ikp=ikp_start, ikp_end)], para_env%num_pe) == para_env%mepos)
+      ! Each thread handles its own k points of this rank.
+!$OMP PARALLEL DEFAULT(NONE) &
+!$OMP          SHARED(V_k, k_owned, kpoints, para_env, free_axis, periodic_axis, cutoff, a1, a2, b1, b2, &
+!$OMP                 normal, area, omega, nodes, weights, particles, qs_kinds, cell, basis_type, &
+!$OMP                 bf_start, bf_end, n_bf) &
+!$OMP          PRIVATE(i_owned, ikp, ikp_local, q, nx, ny, ix, iy, p, pnorm, factor, inode, kz, weight, &
+!$OMP                  f_zero, f_plus, f_minus, delta_plus, delta_minus, delta_sum)
+      ALLOCATE (f_zero(n_bf), f_plus(n_bf), f_minus(n_bf), &
+                delta_plus(n_bf), delta_minus(n_bf), delta_sum(n_bf))
+!$OMP DO SCHEDULE(DYNAMIC)
+      DO i_owned = 1, SIZE(k_owned)
+         ikp = k_owned(i_owned)
          ikp_local = (ikp - para_env%mepos)/para_env%num_pe + 1
          IF (para_env%mepos == 0) ikp_local = ikp/para_env%num_pe
          q = kpoints%xkp(:, ikp)
@@ -1296,7 +1380,9 @@ CONTAINS
             END DO
          END DO
       END DO
+!$OMP END DO
       DEALLOCATE (f_zero, f_plus, f_minus, delta_plus, delta_minus, delta_sum)
+!$OMP END PARALLEL
    END SUBROUTINE add_ewald_reciprocal_2d
 
 ! **************************************************************************************************
