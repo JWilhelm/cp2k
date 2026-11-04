@@ -10,12 +10,11 @@
 !> \author Jan Wilhelm (with help of ChatGPT, GPT-6 Sol and GPT-6 Astra)
 ! **************************************************************************************************
 MODULE gw_ri_rs_small_cell_full_kp
+   USE gw_ri_rs_small_cell_full_kp_types,ONLY: gwkp_type
    USE gw_ri_rs_small_cell_full_kp_utils,ONLY: compute_Sigma_x,&
                                               compute_W0,&
                                               compute_g_and_chi,&
                                               compute_sigma_c_from_w_pq,&
-                                              get_gw_work,&
-                                              gwkp_type,&
                                               prepare_ri_rs,&
                                               release_gw_work
    USE gw_utils,                        ONLY: analyt_conti_and_print,&
@@ -119,7 +118,7 @@ CONTAINS
 
       CALL timeset(routineN, handle)
 
-      CALL get_gw_work(bs_env, gwkp_env)
+      gwkp_env => bs_env%gwkp_env
 
       ! Sample AO/Bloch orbitals and fit the auxiliary functions: Eqs. (1)-(2).
       CALL prepare_ri_rs(bs_env, gwkp_env)
@@ -339,7 +338,7 @@ CONTAINS
       CHARACTER(LEN=*), PARAMETER :: routineN = 'compute_QP_energies'
 
       COMPLEX(KIND=dp), ALLOCATABLE                      :: Sigma_c_ikp_n_freq(:, :)
-      INTEGER                                            :: handle, i_owned, ikp, ispin, j_t, nowned
+      INTEGER                                            :: handle, ikp, ispin
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)           :: Sigma_x_ikp_n
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :, :)     :: Sigma_c_ikp_n_time
 
@@ -349,11 +348,7 @@ CONTAINS
       CPASSERT(SIZE(sigma_x_bands, 3) == bs_env%n_spin)
       CPASSERT(SIZE(sigma_c_bands, 1) == bs_env%n_ao)
       CPASSERT(SIZE(sigma_c_bands, 2) == bs_env%nkp_bs_and_DOS)
-      nowned = (bs_env%num_time_freq_points + bs_env%para_env%num_pe - 1)/ &
-               bs_env%para_env%num_pe
-      IF (SIZE(sigma_c_bands, 3) /= bs_env%num_time_freq_points) THEN
-         CPASSERT(SIZE(sigma_c_bands, 3) >= nowned)
-      END IF
+      CPASSERT(SIZE(sigma_c_bands, 3) == bs_env%num_time_freq_points)
       CPASSERT(SIZE(sigma_c_bands, 4) == 2)
       CPASSERT(SIZE(sigma_c_bands, 5) == bs_env%n_spin)
 
@@ -365,31 +360,15 @@ CONTAINS
 
          DO ikp = 1, bs_env%nkp_bs_and_DOS
 
-            ! 1. get C_µn(k)
-
-            ! 2. Σ^x_µν(k) = sum_R Σ^x_µν^R e^ikR
-            !    Σ^x_nn(k) = sum_µν C^*_µn(k) Σ^x_µν(k) C_νn(k)
+            ! 1. Σ^x_nn(k) and Σ^c_nn(k,±i|τ_j|), projected in compute_Sigma_x / compute_Sigma_c
             Sigma_x_ikp_n(:) = sigma_x_bands(:, ikp, ispin)
+            Sigma_c_ikp_n_time(:, :, :) = sigma_c_bands(:, ikp, :, :, ispin)
 
-            ! 3. Σ^c_µν(k,+/-i|τ_j|) = sum_R Σ^c_µν^R(+/-i|τ_j|) e^ikR
-            !    Σ^c_nn(k,+/-i|τ_j|) = sum_µν C^*_µn(k) Σ^c_µν(k,+/-i|τ_j|) C_νn(k)
-            IF (SIZE(sigma_c_bands, 3) == bs_env%num_time_freq_points) THEN
-               Sigma_c_ikp_n_time(:, :, :) = sigma_c_bands(:, ikp, :, :, ispin)
-            ELSE
-               Sigma_c_ikp_n_time = 0.0_dp
-               DO j_t = 1, bs_env%num_time_freq_points
-                  IF (MODULO(j_t - 1, bs_env%para_env%num_pe) /= bs_env%para_env%mepos) CYCLE
-                  i_owned = (j_t - 1)/bs_env%para_env%num_pe + 1
-                  Sigma_c_ikp_n_time(:, j_t, :) = sigma_c_bands(:, ikp, i_owned, :, ispin)
-               END DO
-               CALL bs_env%para_env%sum(Sigma_c_ikp_n_time)
-            END IF
-
-            ! 4. Σ^c_nn(k_i,iω) = ∫ from -∞ to ∞ dτ e^-iωτ Σ^c_nn(k_i,iτ)
+            ! 2. Σ^c_nn(k_i,iω) = ∫ from -∞ to ∞ dτ e^-iωτ Σ^c_nn(k_i,iτ)
             CALL transform_time_to_frequency(bs_env%time_frequency_grid, Sigma_c_ikp_n_time, Sigma_c_ikp_n_freq)
             Sigma_c_ikp_n_freq(1:bs_env%n_occ(ispin), :) = CONJG(Sigma_c_ikp_n_freq(1:bs_env%n_occ(ispin), :))
 
-            ! 5. Analytic continuation Σ^c_nn(k_i,iω) -> Σ^c_nn(k_i,ϵ) and
+            ! 3. Analytic continuation Σ^c_nn(k_i,iω) -> Σ^c_nn(k_i,ϵ) and
             !    ϵ_nk_i^GW = ϵ_nk_i^DFT + Σ^c_nn(k_i,ϵ) + Σ^x_nn(k_i) - v^xc_nn(k_i)
             CALL analyt_conti_and_print(bs_env, &
                                         Sigma_c_ikp_n_freq, &

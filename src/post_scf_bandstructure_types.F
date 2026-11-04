@@ -23,6 +23,7 @@ MODULE post_scf_bandstructure_types
                                               dbt_type
    USE gw_auto_ri_types,                ONLY: auto_ri_release,&
                                               auto_ri_type
+   USE gw_ri_rs_small_cell_full_kp_types,ONLY: gwkp_type
    USE input_constants,                 ONLY: G0W0,&
                                               cohsex_off,&
                                               tensor_small_cell_full_kp
@@ -64,8 +65,8 @@ MODULE post_scf_bandstructure_types
 
    TYPE post_scf_bandstructure_type
 
-      ! Concrete RI-RS full-k work type and lifecycle are defined in its utils module.
-      CLASS(*), ALLOCATABLE :: gwkp_env
+      ! Work data of periodic RI-RS GW with full k-point sampling
+      TYPE(gwkp_type), ALLOCATABLE                    :: gwkp_env
 
       ! decide which calculations will be done
       LOGICAL                                         :: do_gw = .FALSE., &

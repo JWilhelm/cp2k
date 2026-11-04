@@ -32,6 +32,10 @@ MODULE ri_rs_kp_integrals
    USE particle_types,                  ONLY: particle_type
    USE physcon,                         ONLY: angstrom
    USE post_scf_bandstructure_types,    ONLY: post_scf_bandstructure_type
+   USE ri_rs_kp_types,                  ONLY: ao_image_type,&
+                                              l_block_partition_type,&
+                                              radial_interpolation_type,&
+                                              uniform_settings_type
    USE ri_rs_utils,                     ONLY: evaluate_ao_basis_on_points
 #include "./base/base_uses.f90"
 
@@ -53,62 +57,6 @@ MODULE ri_rs_kp_integrals
              compute_d_lP_cutoffs, &
              get_local_l_range, &
              write_ri_rs_progress
-
-   TYPE                                 :: uniform_settings_type
-      REAL(dp)                          :: accuracy = 0.0_dp, &
-                                           spacing = 0.0_dp, padding = 0.0_dp, &
-                                           l_block_edge = 0.0_dp
-      INTEGER                           :: counts(3) = 0
-      REAL(dp)                          :: lower(3) = 0.0_dp, &
-                                           origin(3) = 0.0_dp, &
-                                           step(3, 3) = 0.0_dp, &
-                                           weight = 0.0_dp
-   END TYPE uniform_settings_type
-
-   TYPE                                 :: l_block_partition_type
-      INTEGER                           :: nblocks = 0
-      INTEGER, ALLOCATABLE              :: first(:), indices(:)
-      REAL(dp), ALLOCATABLE             :: lower(:, :), upper(:, :)
-   END TYPE l_block_partition_type
-
-   TYPE                                 :: ao_image_type
-      TYPE(gto_basis_set_type), POINTER :: basis => NULL()
-      REAL(dp)                          :: center(3) = 0.0_dp
-      REAL(dp)                          :: bound = 0.0_dp, decay = 0.0_dp
-      REAL(dp), ALLOCATABLE             :: primary(:, :)
-      INTEGER, ALLOCATABLE              :: primary_l(:)
-      REAL(dp), ALLOCATABLE             :: envelope_exponents(:), &
-                                           radial_envelope(:, :)
-   END TYPE ao_image_type
-
-   ! Per-atom interpolation tables for the erfc kernel.
-   TYPE                                 :: radial_interpolation_type
-      REAL(dp), ALLOCATABLE             :: short_abscissae(:)
-      REAL(dp), ALLOCATABLE             :: coefficients(:, :), &
-                                           series(:, :, :), &
-                                           short_series(:, :, :), &
-                                           short_moments(:, :, :, :)
-      ! Radial value and derivative, indexed (2, primitive/angular channel,
-      ! squared-radius index).
-      REAL(dp), ALLOCATABLE             :: mesh_moments(:, :, :)
-      INTEGER, ALLOCATABLE              :: mesh_first(:, :), &
-                                           spherical_mesh_first(:, :)
-      ! An optional exact factorization of primitive Cartesian rows through
-      ! spherical RI functions.
-      REAL(dp), ALLOCATABLE             :: spherical_selection(:, :), &
-                                           spherical_angular(:, :, :, :), &
-                                           spherical_primitive(:, :, :)
-      LOGICAL                           :: spherical_factorized = .FALSE.
-      REAL(dp)                          :: mesh_spacing = 0.0_dp, &
-                                           mesh_offset = 0.0_dp, &
-                                           mesh_exponent = 0.0_dp
-      REAL(dp)                          :: attenuation = 0.0_dp
-   END TYPE radial_interpolation_type
-
-   TYPE                                 :: radial_work_type
-      REAL(dp), ALLOCATABLE             :: jet(:), gaussian(:), derivative(:), &
-                                           bracket(:)
-   END TYPE radial_work_type
 
 CONTAINS
 
@@ -1030,7 +978,6 @@ CONTAINS
       CALL timeset('d_lP_uniform_reduce', handle)
 
       DEALLOCATE (field, send_fields, receive_fields, kept_per_rank, recv_counts, recv_offsets)
-      CALL apply_d_lP_distance_cutoff(bs_env, grid_points, local_cells, local_d_lP_R)
       CALL sum_d_lP_R_over_mpi_ranks(integration_comm, local_d_lP_R, cyclic_d_lP_R)
       DEALLOCATE (local_d_lP_R, local_cells)
       CALL distribute_d_lP_R_by_l(bs_env%para_env, cyclic_d_lP_R, first_l, d_lP_R)
@@ -1845,43 +1792,6 @@ CONTAINS
    END FUNCTION distance_to_box_squared
 
 ! **************************************************************************************************
-!> \brief Apply the established l/P/T distance criterion after Eq. (2).
-!> \param bs_env ...
-!> \param grid_points ...
-!> \param cells_R_d_lP Retained integer cell vectors R, indexed (3,R).
-!> \param d_lP_R Numerical integrals indexed by local point l, RI function P and cell R.
-! **************************************************************************************************
-   SUBROUTINE apply_d_lP_distance_cutoff(bs_env, grid_points, cells_R_d_lP, d_lP_R)
-      TYPE(post_scf_bandstructure_type), POINTER         :: bs_env
-      REAL(dp), INTENT(IN)                               :: grid_points(:, :)
-      INTEGER, INTENT(IN)                                :: cells_R_d_lP(:, :)
-      REAL(dp), INTENT(INOUT)                            :: d_lP_R(:, :, :)
-
-      INTEGER                                            :: firstp, iatom, il, it, lastp
-      REAL(dp)                                           :: center(3), cutoff
-      REAL(dp), ALLOCATABLE                              :: cutoffs_lP(:)
-      TYPE(cell_type), POINTER                           :: cell
-      TYPE(particle_type), POINTER                       :: particles(:)
-
-      cell => bs_env%ri_rs%cell
-      particles => bs_env%ri_rs%particle_set
-      CALL compute_d_lP_cutoffs(bs_env, cutoffs_lP)
-      DO it = 1, SIZE(cells_R_d_lP, 2)
-         DO iatom = 1, bs_env%n_atom
-            center = pbc(particles(iatom)%r, cell) + MATMUL(bs_env%hmat, REAL(cells_R_d_lP(:, it), dp))
-            firstp = bs_env%i_RI_start_from_atom(iatom)
-            lastp = bs_env%i_RI_end_from_atom(iatom)
-            cutoff = cutoffs_lP(iatom)
-            DO il = 1, bs_env%ri_rs%n_grid_points
-               IF (NORM2(grid_points(:, il) - center) > cutoff) d_lP_R(il, firstp:lastp, it) = 0.0_dp
-            END DO
-         END DO
-      END DO
-      DEALLOCATE (cutoffs_lP)
-
-   END SUBROUTINE apply_d_lP_distance_cutoff
-
-! **************************************************************************************************
 !> \brief Transform spherical coefficients once; bound the radial tables by radial_table_bytes.
 !> \param basis ...
 !> \param U_Pp ...
@@ -2165,7 +2075,6 @@ CONTAINS
          monomial(:), radial(:), radial_channels(:, :, :), radial_mesh(:), work(:, :)
       REAL(dp), CONTIGUOUS, POINTER                      :: coefficient_matrix(:, :)
       REAL(dp), POINTER                                  :: series(:, :, :), short_series(:, :, :)
-      TYPE(radial_work_type)                             :: radial_work
 
       CALL timeset('d_lP_potential_prepare', handle)
 
@@ -2237,11 +2146,10 @@ CONTAINS
       !$OMP SHARED(ng, points, center, basis, series, short_series, omega, &
       !$OMP work, indco, ncoset, lmax, angular_used, minimum_l, contracted, tabulated, &
       !$OMP nchannels, nrows, nwork, factorized, mesh_channel, angular_index, nso, angular_count, angular_term) &
-      !$OMP PRIVATE(ig, ico, relative, radius, radius2, iset, ipgf, radial, monomial, l, irow, radial_work, long_radial, &
+      !$OMP PRIVATE(ig, ico, relative, radius, radius2, iset, ipgf, radial, monomial, l, irow, long_radial, &
       !$OMP x, in_table, coordinate_power, imesh, mesh_delta, mesh_position, use_mesh, radial_mesh, &
       !$OMP radial_channels, angular_values, isgf, m, radial_sum, spherical_value, iangular)
-      ALLOCATE (radial(0:lmax), long_radial(0:lmax), radial_work%jet(0:lmax), &
-                radial_work%gaussian(0:lmax), radial_work%derivative(0:lmax), radial_work%bracket(0:lmax))
+      ALLOCATE (radial(0:lmax), long_radial(0:lmax))
       ALLOCATE (monomial(ncoset(lmax)), coordinate_power(3, 0:lmax), radial_mesh(nchannels))
       IF (factorized) ALLOCATE (radial_channels(0:lmax, MAXVAL(basis%npgf), basis%nset), &
                                 angular_values(MAXVAL(nso(0:lmax)), 0:lmax, basis%nset))
@@ -2308,7 +2216,7 @@ CONTAINS
                   ELSE
                      CALL radial_potential_short(radius, basis%zet(ipgf, iset), omega, &
                                                  series(:, ipgf, iset), short_series(:, ipgf, iset), &
-                                                 radial(0:basis%lmax(iset)), radial_work, long_radial)
+                                                 radial(0:basis%lmax(iset)), long_radial)
                   END IF
                   IF (factorized) THEN
                      DO l = 0, basis%lmax(iset)
@@ -2360,8 +2268,7 @@ CONTAINS
          END IF
       END DO
       !$OMP END DO
-      DEALLOCATE (radial, long_radial, radial_work%jet, radial_work%gaussian, &
-                  radial_work%derivative, radial_work%bracket)
+      DEALLOCATE (radial, long_radial)
       DEALLOCATE (monomial, coordinate_power, radial_mesh)
       IF (factorized) DEALLOCATE (radial_channels, angular_values)
       !$OMP END PARALLEL
@@ -2396,15 +2303,13 @@ CONTAINS
 !> \param coefficients ...
 !> \param short_coefficients ...
 !> \param radial ...
-!> \param radial_work ...
 !> \param long_radial ...
 ! **************************************************************************************************
-   SUBROUTINE radial_potential_short(radius, exponent, omega, coefficients, short_coefficients, radial, radial_work, long_radial)
+   SUBROUTINE radial_potential_short(radius, exponent, omega, coefficients, short_coefficients, radial, long_radial)
       REAL(dp), INTENT(IN)                               :: radius, exponent, omega, &
                                                             coefficients(0:), &
                                                             short_coefficients(0:)
       REAL(dp), INTENT(OUT)                              :: radial(0:)
-      TYPE(radial_work_type), INTENT(INOUT)              :: radial_work
       REAL(dp), INTENT(INOUT)                            :: long_radial(0:)
 
       INTEGER                                            :: il
@@ -2412,7 +2317,7 @@ CONTAINS
                                                             ratio_power, root_x, upper_exp, x
 
       IF (exponent*radius**2 < 0.5_dp) THEN
-         CALL radial_potential(radius, exponent, short_coefficients, radial, radial_work)
+         CALL radial_potential(radius, exponent, short_coefficients, radial)
          RETURN
       END IF
       beta_ratio = omega**2/(exponent + omega**2)
@@ -2435,8 +2340,8 @@ CONTAINS
          END DO
          RETURN
       END IF
-      CALL radial_potential(radius, exponent, coefficients, radial, radial_work)
-      CALL radial_potential(radius, beta, coefficients, long_radial(0:UBOUND(radial, 1)), radial_work)
+      CALL radial_potential(radius, exponent, coefficients, radial)
+      CALL radial_potential(radius, beta, coefficients, long_radial(0:UBOUND(radial, 1)))
       DO il = 0, UBOUND(radial, 1)
          radial(il) = radial(il) - beta_ratio**(REAL(il, dp) + 1.5_dp)*long_radial(il)
       END DO
@@ -2477,15 +2382,15 @@ CONTAINS
 !> \param exponent ...
 !> \param coefficients ...
 !> \param radial ...
-!> \param radial_work ...
 ! **************************************************************************************************
-   SUBROUTINE radial_potential(radius, exponent, coefficients, radial, radial_work)
+   SUBROUTINE radial_potential(radius, exponent, coefficients, radial)
       REAL(dp), INTENT(IN)                               :: radius, exponent, coefficients(0:)
       REAL(dp), INTENT(OUT)                              :: radial(0:)
-      TYPE(radial_work_type), INTENT(INOUT)              :: radial_work
 
       INTEGER                                            :: ij, il, in, lmax
-      REAL(dp)                                           :: factor, power, prefactor, value, x
+      REAL(dp) :: factor, power, prefactor, value, x, jet(0:UBOUND(radial, 1)), &
+         gaussian(0:UBOUND(radial, 1)), derivative(0:UBOUND(radial, 1)), &
+         bracket(0:UBOUND(radial, 1))
 
       lmax = UBOUND(radial, 1)
       x = exponent*radius**2
@@ -2505,32 +2410,32 @@ CONTAINS
          END DO
          RETURN
       END IF
-      radial_work%bracket(0:lmax) = 0.0_dp
-      radial_work%gaussian(0) = EXP(-exponent*radius**2)
-      IF (lmax > 0) radial_work%gaussian(1) = -2.0_dp*exponent*radius*radial_work%gaussian(0)
+      bracket(0:lmax) = 0.0_dp
+      gaussian(0) = EXP(-exponent*radius**2)
+      IF (lmax > 0) gaussian(1) = -2.0_dp*exponent*radius*gaussian(0)
       DO in = 2, lmax
-         radial_work%gaussian(in) = -2.0_dp*exponent* &
-                                    (radius*radial_work%gaussian(in - 1) + radial_work%gaussian(in - 2))/REAL(in, dp)
+         gaussian(in) = -2.0_dp*exponent* &
+                        (radius*gaussian(in - 1) + gaussian(in - 2))/REAL(in, dp)
       END DO
       DO in = 1, lmax
-         radial_work%bracket(in) = radial_work%bracket(in) + &
-                                   4.0_dp*SQRT(exponent/pi)*radial_work%gaussian(in - 1)/REAL(in, dp)
+         bracket(in) = bracket(in) + &
+                       4.0_dp*SQRT(exponent/pi)*gaussian(in - 1)/REAL(in, dp)
       END DO
-      radial_work%bracket(0) = 2.0_dp*ERF(SQRT(exponent)*radius)
+      bracket(0) = 2.0_dp*ERF(SQRT(exponent)*radius)
       prefactor = pi**1.5_dp/(2.0_dp*exponent**1.5_dp)
-      radial_work%jet(0) = radial_work%bracket(0)/radius
+      jet(0) = bracket(0)/radius
       DO in = 1, lmax
-         radial_work%jet(in) = (radial_work%bracket(in) - radial_work%jet(in - 1))/radius
+         jet(in) = (bracket(in) - jet(in - 1))/radius
       END DO
-      radial(0) = prefactor*radial_work%jet(0)
+      radial(0) = prefactor*jet(0)
       DO il = 1, lmax
-         radial_work%derivative(0:lmax) = 0.0_dp
-         radial_work%derivative(0) = radial_work%jet(1)/(2.0_dp*radius)
+         derivative(0:lmax) = 0.0_dp
+         derivative(0) = jet(1)/(2.0_dp*radius)
          DO in = 1, lmax - il
-            radial_work%derivative(in) = (REAL(in + 1, dp)*radial_work%jet(in + 1)/2.0_dp - radial_work%derivative(in - 1))/radius
+            derivative(in) = (REAL(in + 1, dp)*jet(in + 1)/2.0_dp - derivative(in - 1))/radius
          END DO
-         radial_work%jet(0:lmax) = radial_work%derivative(0:lmax)
-         radial(il) = prefactor*(-1.0_dp/exponent)**il*radial_work%jet(0)
+         jet(0:lmax) = derivative(0:lmax)
+         radial(il) = prefactor*(-1.0_dp/exponent)**il*jet(0)
       END DO
 
    END SUBROUTINE radial_potential

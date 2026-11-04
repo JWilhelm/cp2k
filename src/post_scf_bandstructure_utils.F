@@ -1463,6 +1463,8 @@ CONTAINS
                CALL cp_cfm_geeig(cfm_ks_ikp, cfm_s_ikp_copy, cfm_mos_ikp(ispin), &
                                  eigenval, cfm_work_ikp)
 
+               bs_env%eigenval_scf(:, ikp, ispin) = eigenval(:)
+
             CASE (tensor_small_cell_full_kp, ri_rs_small_cell_full_kp)
 
                ! 1. get H^KS_µν(k_i)

@@ -2817,7 +2817,7 @@ CONTAINS
                           "3-center integrals and enables reduced computational cost. "// &
                           "See details in \[Duchemin2019\].", &
                           citations=[Duchemin2019, Duchemin2021], &
-                          n_keywords=12, n_subsections=1, repeats=.FALSE.)
+                          n_keywords=11, n_subsections=1, repeats=.FALSE.)
 
       NULLIFY (keyword)
       CALL keyword_create(keyword, __LOCATION__, &
@@ -2928,7 +2928,8 @@ CONTAINS
       CALL keyword_create( &
          keyword, __LOCATION__, name="CUTOFF_ATOMIC_CLUSTER", &
          description="Radius of the atom-centred cluster used to optimize the grid points. "// &
-         "All atoms within this distance of the centre atom are included.", &
+         "All atoms within this distance of the centre atom are included. "// &
+         "A negative value selects 1.4 times the distance to the nearest neighbouring atom.", &
          usage="CUTOFF_ATOMIC_CLUSTER -1", type_of_var=real_t, &
          default_r_val=cp_unit_to_cp2k(value=-1.0_dp, unit_str="angstrom"), &
          unit_str="angstrom")

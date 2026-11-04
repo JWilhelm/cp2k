@@ -100,8 +100,6 @@ MODULE ri_rs_types
       LOGICAL                                          :: V_grid_built = .FALSE.
       LOGICAL                                          :: W0_grid_built = .FALSE.
 
-      ! Additional state for periodic RI-RS GW.
-      REAL(KIND=dp), ALLOCATABLE                       :: atom_centers(:, :)
    END TYPE ri_rs_env
 
 CONTAINS
@@ -131,7 +129,6 @@ CONTAINS
       IF (ALLOCATED(ri_rs%atomic_grids)) DEALLOCATE (ri_rs%atomic_grids)
       IF (ALLOCATED(ri_rs%radius_ao_per_atom)) DEALLOCATE (ri_rs%radius_ao_per_atom)
       IF (ALLOCATED(ri_rs%radius_ri_per_atom)) DEALLOCATE (ri_rs%radius_ri_per_atom)
-      IF (ALLOCATED(ri_rs%atom_centers)) DEALLOCATE (ri_rs%atom_centers)
       IF (ALLOCATED(ri_rs%chunk_centroids)) DEALLOCATE (ri_rs%chunk_centroids)
       IF (ALLOCATED(ri_rs%grid_atom_boundaries)) DEALLOCATE (ri_rs%grid_atom_boundaries)
       IF (ALLOCATED(ri_rs%pan_first)) DEALLOCATE (ri_rs%pan_first)
