@@ -708,9 +708,9 @@ CONTAINS
                                                             G_grid_k(:, :, :), work(:, :)
       COMPLEX(KIND=dp), ALLOCATABLE, TARGET              :: psi_time(:, :, :, :), Z_group(:, :, :)
       COMPLEX(KIND=dp), POINTER                          :: psi_values(:, :, :, :), Z_time(:, :, :)
-      INTEGER :: first_row, handle, i_cell, i_group, i_q_world, i_rank, i_root, i_size, i_t, &
-         i_time_group, i_time_local, iq, iq_local, ispin, n_aux, n_cells, n_grid, n_groups, &
-         n_local, n_q_local, n_threads, n_time_local, n_world, nrows_local, phase_handle
+      INTEGER :: first_row, handle, i_cell, i_group, i_q_world, i_rank, i_root, i_size, i_source, &
+         i_t, i_tag, i_time_group, i_time_local, iq, iq_local, ispin, n_aux, n_cells, n_grid, &
+         n_groups, n_local, n_q_local, n_threads, n_time_local, n_world, nrows_local, phase_handle
       INTEGER, ALLOCATABLE                               :: full_cells(:, :)
       REAL(KIND=dp) :: atom_block_count, available_GB, budget, input_bytes, live_bytes, n_q_max, &
          n_row_max, n_stored_max, peak, q_bytes, rows_bytes, step_start, tau, time_bytes
@@ -908,18 +908,23 @@ CONTAINS
             ALLOCATE (gwkp_env%chi_q_frequency(i_q_world)%values(n_aux, n_aux, &
                                                                  bs_env%num_time_freq_points), SOURCE=z_zero)
          END IF
-         ! Transfer each computed time slice once. Only its world q owner forms
-         ! the complete frequency result; partial frequency sets are never replicated.
+         ! Send each computed time slice once, point to point, to the world q owner, which alone
+         ! forms the complete frequency result; slices and frequency sets are never replicated.
          DO i_t = 1, bs_env%num_time_freq_points
             i_time_group = MODULO(i_t - 1, n_groups)
             i_time_local = (i_t - 1)/n_groups + 1
-            IF (column_env%mepos == i_time_group) THEN
-               chi_q(:, :, iq_local) = chi_partial(iq_local)%values(:, :, i_time_local)
-            END IF
-            IF (n_groups > 1) CALL column_env%bcast(chi_q(:, :, iq_local), i_time_group)
             IF (column_env%mepos == i_root) THEN
+               IF (i_time_group == i_root) THEN
+                  chi_q(:, :, iq_local) = chi_partial(iq_local)%values(:, :, i_time_local)
+               ELSE
+                  i_source = i_time_group
+                  i_tag = 0
+                  CALL column_env%recv(chi_q(:, :, iq_local), i_source, i_tag)
+               END IF
                CALL accumulate_ri_q_cosine(gwkp_env%chi_q_frequency(i_q_world), chi_q(:, :, iq_local), &
                                            bs_env%time_frequency_grid%cosine_time_to_frequency(:, i_t))
+            ELSE IF (column_env%mepos == i_time_group) THEN
+               CALL column_env%send(chi_partial(iq_local)%values(:, :, i_time_local), i_root, 0)
             END IF
          END DO
          DEALLOCATE (chi_partial(iq_local)%values)
