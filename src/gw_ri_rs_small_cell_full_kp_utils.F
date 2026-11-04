@@ -2448,59 +2448,77 @@ CONTAINS
       COMPLEX(KIND=dp), ALLOCATABLE, INTENT(OUT)         :: psi_lm_k(:, :, :, :)
 
       CHARACTER(LEN=*), PARAMETER                        :: routineN = 'build_all_psi_k'
-      REAL(KIND=dp), PARAMETER :: coefficient_batch_bytes = 128.0E6_dp
 
-      COMPLEX(KIND=dp), ALLOCATABLE                      :: mo_coeff_batch(:, :)
-      INTEGER                                            :: batch_size, first_owned, handle, &
-                                                            i_batch, ikp, ikp_local, ispin, &
-                                                            n_batch, n_owned, n_owned_max, &
-                                                            root_rank
-      TYPE(gwkp_type), POINTER                           :: gwkp_env
+      COMPLEX(KIND=dp), ALLOCATABLE                      :: mo_coeff(:, :, :, :)
+      INTEGER                                            :: handle, ikp_local, ispin
 
       CALL timeset(routineN, handle)
 
-      gwkp_env => bs_env%gwkp_env
-
-      n_owned_max = (bs_env%nkp_scf_desymm + bs_env%para_env%num_pe - 1)/ &
-                    bs_env%para_env%num_pe
+      CALL owned_mo_coefficients(bs_env, bs_env%cfm_mo_coeff_kp(1:bs_env%nkp_scf_desymm, :), mo_coeff)
       ALLOCATE (psi_lm_k(bs_env%ri_rs%n_grid_points, bs_env%n_ao, SIZE(phi_lmu_k, 3), &
                          bs_env%n_spin), SOURCE=z_zero)
-      batch_size = MAX(1, INT(coefficient_batch_bytes/ &
-                              (16.0_dp*REAL(bs_env%n_ao, dp)**2)))
-      batch_size = MIN(batch_size, n_owned_max)
-      ALLOCATE (mo_coeff_batch(bs_env%n_ao, bs_env%n_ao*batch_size))
       DO ispin = 1, bs_env%n_spin
-         DO root_rank = 0, MIN(bs_env%para_env%num_pe, bs_env%nkp_scf_desymm) - 1
-            n_owned = (bs_env%nkp_scf_desymm - root_rank - 1)/bs_env%para_env%num_pe + 1
-            DO first_owned = 1, n_owned, batch_size
-               n_batch = MIN(batch_size, n_owned - first_owned + 1)
-               mo_coeff_batch(:, 1:bs_env%n_ao*n_batch) = z_zero
-               DO i_batch = 1, n_batch
-                  ikp = root_rank + 1 + &
-                        (first_owned + i_batch - 2)*bs_env%para_env%num_pe
-                  CALL copy_local_cfm(bs_env%cfm_mo_coeff_kp(ikp, ispin), &
-                                      mo_coeff_batch(:, (i_batch - 1)*bs_env%n_ao + 1: &
-                                                     i_batch*bs_env%n_ao))
-               END DO
-               CALL bs_env%para_env%sum(mo_coeff_batch(:, 1:bs_env%n_ao*n_batch), root_rank)
-               IF (root_rank == bs_env%para_env%mepos) THEN
-                  DO i_batch = 1, n_batch
-                     ikp = root_rank + 1 + &
-                           (first_owned + i_batch - 2)*bs_env%para_env%num_pe
-                     ikp_local = (ikp - 1)/bs_env%para_env%num_pe + 1
-                     psi_lm_k(:, :, ikp_local, ispin) = MATMUL( &
-                                                        phi_lmu_k(:, :, ikp_local), &
-                                                        mo_coeff_batch(:, (i_batch - 1)*bs_env%n_ao + 1:i_batch*bs_env%n_ao))
-                  END DO
-               END IF
-            END DO
+         DO ikp_local = 1, SIZE(mo_coeff, 3)
+            psi_lm_k(:, :, ikp_local, ispin) = MATMUL(phi_lmu_k(:, :, ikp_local), mo_coeff(:, :, ikp_local, ispin))
          END DO
       END DO
-      DEALLOCATE (mo_coeff_batch)
+      DEALLOCATE (mo_coeff)
 
       CALL timestop(handle)
 
    END SUBROUTINE build_all_psi_k
+
+! **************************************************************************************************
+!> \brief Dense MO coefficients of the cyclically owned SCF k points (owner of k: MODULO(k-1, ranks)).
+!> The locally stored parts of the distributed matrices are summed to the owner in batches of
+!> k points: few large reductions instead of one global gather per k, and no rank stores the
+!> coefficients of k points it does not own.
+!> \param bs_env ...
+!> \param mo_coeff distributed MO coefficients per k point and spin
+!> \param coeff coeff(:, :, k_local, spin) for the owned k points
+! **************************************************************************************************
+   SUBROUTINE owned_mo_coefficients(bs_env, mo_coeff, coeff)
+      TYPE(post_scf_bandstructure_type), POINTER         :: bs_env
+      TYPE(cp_cfm_type), DIMENSION(:, :), INTENT(IN)     :: mo_coeff
+      COMPLEX(KIND=dp), ALLOCATABLE, INTENT(OUT)         :: coeff(:, :, :, :)
+
+      CHARACTER(LEN=*), PARAMETER :: routineN = 'owned_mo_coefficients'
+      REAL(KIND=dp), PARAMETER                           :: batch_bytes = 128.0E6_dp
+
+      COMPLEX(KIND=dp), ALLOCATABLE                      :: batch(:, :, :)
+      INTEGER                                            :: batch_size, first_owned, handle, &
+                                                            i_batch, ikp, ispin, n_ao, n_batch, &
+                                                            n_k, n_mo, n_owned, num_pe, root_rank
+
+      CALL timeset(routineN, handle)
+
+      n_k = SIZE(mo_coeff, 1)
+      num_pe = bs_env%para_env%num_pe
+      CALL cp_cfm_get_info(mo_coeff(1, 1), nrow_global=n_ao, ncol_global=n_mo)
+      ALLOCATE (coeff(n_ao, n_mo, (n_k + num_pe - 1 - bs_env%para_env%mepos)/num_pe, SIZE(mo_coeff, 2)))
+      batch_size = MAX(1, MIN((n_k + num_pe - 1)/num_pe, INT(batch_bytes/(16.0_dp*REAL(n_ao*n_mo, dp)))))
+      ALLOCATE (batch(n_ao, n_mo, batch_size))
+      DO ispin = 1, SIZE(mo_coeff, 2)
+         DO root_rank = 0, MIN(num_pe, n_k) - 1
+            n_owned = (n_k - root_rank - 1)/num_pe + 1
+            DO first_owned = 1, n_owned, batch_size
+               n_batch = MIN(batch_size, n_owned - first_owned + 1)
+               DO i_batch = 1, n_batch
+                  ikp = root_rank + 1 + (first_owned + i_batch - 2)*num_pe
+                  CALL copy_local_cfm(mo_coeff(ikp, ispin), batch(:, :, i_batch))
+               END DO
+               CALL bs_env%para_env%sum(batch(:, :, 1:n_batch), root_rank)
+               IF (root_rank == bs_env%para_env%mepos) THEN
+                  coeff(:, :, first_owned:first_owned + n_batch - 1, ispin) = batch(:, :, 1:n_batch)
+               END IF
+            END DO
+         END DO
+      END DO
+      DEALLOCATE (batch)
+
+      CALL timestop(handle)
+
+   END SUBROUTINE owned_mo_coefficients
 
 ! **************************************************************************************************
 !> \brief Cache Bloch sums of the RI-RS grid values for the k-points owned by this rank.
@@ -3650,7 +3668,7 @@ CONTAINS
 
       REAL(KIND=dp), PARAMETER                           :: eps_degenerate = 1.0E-10_dp
 
-      COMPLEX(KIND=dp), ALLOCATABLE :: coeff_dense(:, :), d_k(:, :), dh_k(:, :), ds_k(:, :), &
+      COMPLEX(KIND=dp), ALLOCATABLE :: coeff_owned(:, :, :, :), d_k(:, :), dh_k(:, :), ds_k(:, :), &
          projected_d(:, :), projected_h(:, :), projected_s(:, :)
       INTEGER                                            :: handle, i_dir, i_k, i_k_local, i_mo_a, &
                                                             i_mo_i, i_spin, n_ao, n_img, n_k, &
@@ -3706,13 +3724,13 @@ CONTAINS
       n_k_local = (n_k + para_env%num_pe - 1 - para_env%mepos)/para_env%num_pe
       ALLOCATE (dipole(n_spin, n_k_local, 3, MAXVAL(nocc_spin), MAXVAL(nmo_spin - nocc_spin)), source=z_zero)
       ALLOCATE (dh_k(n_ao, n_ao), ds_k(n_ao, n_ao), d_k(n_ao, n_ao))
-      DO i_k = 1, n_k
+      ! Each rank works only on its own k points, with their MO coefficients summed to it.
+      CALL owned_mo_coefficients(bs_env, mo_coeff(1:n_k, :), coeff_owned)
+      DO i_k_local = 1, n_k_local
+         i_k = para_env%mepos + 1 + (i_k_local - 1)*para_env%num_pe
          DO i_spin = 1, n_spin
             n_mo = nmo_spin(i_spin)
-            ALLOCATE (coeff_dense(n_ao, n_mo))
-            CALL cp_cfm_get_submatrix(mo_coeff(i_k, i_spin), coeff_dense)
-            IF (MODULO(i_k - 1, para_env%num_pe) == para_env%mepos) THEN
-               i_k_local = (i_k - 1)/para_env%num_pe + 1
+            ASSOCIATE (coeff_dense => coeff_owned(:, 1:n_mo, i_k_local, i_spin))
                IF (nocc_spin(i_spin) > 0 .AND. n_mo > nocc_spin(i_spin)) THEN
                   ALLOCATE (projected_h(n_mo - nocc_spin(i_spin), nocc_spin(i_spin)), &
                             projected_s(n_mo - nocc_spin(i_spin), nocc_spin(i_spin)), &
@@ -3744,11 +3762,10 @@ CONTAINS
                   END DO
                   DEALLOCATE (projected_h, projected_s, projected_d)
                END IF
-            END IF
-            DEALLOCATE (coeff_dense)
+            END ASSOCIATE
          END DO
       END DO
-      DEALLOCATE (dh_k, ds_k, d_k, h_rs, s_rs, d_rs, nmo_spin)
+      DEALLOCATE (dh_k, ds_k, d_k, h_rs, s_rs, d_rs, nmo_spin, coeff_owned)
       DEALLOCATE (gwkp_env%gamma_corr_index_to_cell, gwkp_env%gamma_corr_cell_to_index)
       NULLIFY (gwkp_env%gamma_corr_index_to_cell, gwkp_env%gamma_corr_cell_to_index)
 
