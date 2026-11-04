@@ -65,6 +65,10 @@ MODULE gw_ri_rs_small_cell_full_kp_types
                                                    Z_lP_q(:, :, :), Z_lP_zero(:, :, :)
       REAL(dp), ALLOCATABLE                     :: sigma_c_bands(:, :, :, :, :), sigma_x_bands(:, :, :)
       COMPLEX(dp), ALLOCATABLE                  :: band_orbitals(:, :, :, :)
+      ! Charge neutralisation of the fitted pair densities in χ(q), see compute_W0: e(q) = M(q) c/|c| and
+      ! X(q,iω) = M(q) (s/N_k) Σ_k,ia d_ia m_ia* w_ia(iω) per owned q, L0(iω) = (s/N_k) Σ_k,ia |m_ia|² w_ia(iω).
+      COMPLEX(dp), ALLOCATABLE                  :: leak_e(:, :), leak_x(:, :, :)
+      REAL(dp), ALLOCATABLE                     :: leak_l0(:)
       TYPE(mp_para_env_type), POINTER           :: group_env => NULL()
       INTEGER                                   :: ngroups = 1, my_group = 0
       TYPE(gamma_correction_type)               :: gamma_correction

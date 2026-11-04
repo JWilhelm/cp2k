@@ -278,8 +278,6 @@ CONTAINS
       CALL gamma_point_correction(bs_env, qs_env, gwkp_env)
       CPASSERT(.NOT. ALLOCATED(gwkp_env%band_orbitals))
       CALL compute_chi(bs_env, gwkp_env)
-      ! Σˣ and Σᶜ use the band-path orbitals, which include the SCF mesh.
-      DEALLOCATE (gwkp_env%psi_lm_k)
 
       CALL timestop(handle)
 
@@ -311,7 +309,9 @@ CONTAINS
 
       CALL timeset(routineN, handle)
 
-      CALL compute_metric_coulomb_factor(bs_env, qs_env, gwkp_env%metric_coulomb_factor)
+      CALL compute_metric_coulomb_factor(bs_env, qs_env, gwkp_env)
+      ! Σˣ and Σᶜ use the band-path orbitals, which include the SCF mesh.
+      DEALLOCATE (gwkp_env%psi_lm_k)
       n_RI = bs_env%n_RI
       nkp = bs_env%nkp_scf_desymm
       IF (bs_env%nkp_chi_eps_W_orig_plus_extra /= nkp) THEN
@@ -381,6 +381,18 @@ CONTAINS
                ikp_local = 1 + (ikp - 1)/bs_env%para_env%num_pe
                IF (bs_env%para_env%mepos == q_owner) THEN
                   MWM_k_w(:, :) = gwkp_env%chi_q_frequency(ikp_local)%values(:, :, j_w)
+                  ! The RI fit gives occupied-virtual pair densities a spurious charge m_ia that makes
+                  ! ε_00 - 1 ~ C(ω)/q and the q sum log-divergent. As in the Γ model (P = 1 - c c^H),
+                  ! remove it from the fitted coefficients, d' = d - (c/|c|) m, i.e. Z^H ρ' = Z^H ρ - e m:
+                  ! χ' = χ - e X^H - X e^H + L0 e e^H. m and d are taken at q = 0, so the physical
+                  ! O(q) dipole charge is kept; the error is O(q).
+                  CALL zgerc(n_RI, n_RI, CMPLX(gwkp_env%leak_l0(j_w), 0.0_dp, dp), &
+                             gwkp_env%leak_e(:, ikp_local), 1, gwkp_env%leak_e(:, ikp_local), 1, &
+                             MWM_k_w, n_RI)
+                  CALL zgerc(n_RI, n_RI, -z_one, gwkp_env%leak_e(:, ikp_local), 1, &
+                             gwkp_env%leak_x(:, j_w, ikp_local), 1, MWM_k_w, n_RI)
+                  CALL zgerc(n_RI, n_RI, -z_one, gwkp_env%leak_x(:, j_w, ikp_local), 1, &
+                             gwkp_env%leak_e(:, ikp_local), 1, MWM_k_w, n_RI)
                END IF
                CALL grouped_w_copy_matrix(bs_env%para_env, n_RI, q_owner, &
                                           q_roots(MODULO(ikp, n_qgroups) + 1), MWM_k_w, chi_k_w)
@@ -426,7 +438,7 @@ CONTAINS
       CPASSERT(gwkp_env%group_env%num_pe == bs_env%para_env%num_pe)
       CPASSERT(gwkp_env%group_env%mepos == bs_env%para_env%mepos)
 
-      DEALLOCATE (time_weights)
+      DEALLOCATE (time_weights, gwkp_env%leak_e, gwkp_env%leak_x, gwkp_env%leak_l0)
       IF (ALLOCATED(gwkp_env%chi_q_frequency)) DEALLOCATE (gwkp_env%chi_q_frequency)
 
       CALL timestop(handle)
@@ -951,9 +963,8 @@ CONTAINS
          j_cartesian, j_w, n_angular, n_directions, n_near, n_w_kpoints
       INTEGER, ALLOCATABLE                               :: metric_cells(:, :)
       LOGICAL                                            :: is_slab
-      REAL(KIND=dp)                                      :: near_q(3, 8), q_cart(3), &
-                                                            q_direction(3), qnorm, &
-                                                            reciprocal(3, 3), volume, weight
+      REAL(KIND=dp)                                      :: near_q(3, 8), q_cart(3), q_direction(3), &
+                                                            qnorm, reciprocal(3, 3), volume, weight
       REAL(KIND=dp), ALLOCATABLE                         :: angular_directions(:, :), &
                                                             angular_radii(:), angular_weights(:), &
                                                             V_zero_real(:, :)
@@ -1283,21 +1294,22 @@ CONTAINS
    END SUBROUTINE gamma_ri_coulomb_g0
 
 ! **************************************************************************************************
-!> \brief Build K(q) = M(q)^-1 V(q)^1/2 from the Gaussian RI metric M and the Ewald Coulomb matrix V.
+!> \brief Build K(q) = M(q)^-1 V(q)^1/2 from the Gaussian RI metric M and the Ewald Coulomb matrix V,
+!>        and the charge-neutralisation vectors e(q) = M(q) c/|c| and X(q,iω) = M(q) M(0)^-1 X0(iω).
 !> The Gamma-cell head is corrected separately from these operators.
 !> \param bs_env ...
 !> \param qs_env ...
-!> \param K K(q) for the q points owned by this rank
+!> \param gwkp_env K(q) and the neutralisation vectors for the q points owned by this rank
 ! **************************************************************************************************
-   SUBROUTINE compute_metric_coulomb_factor(bs_env, qs_env, K)
+   SUBROUTINE compute_metric_coulomb_factor(bs_env, qs_env, gwkp_env)
       TYPE(post_scf_bandstructure_type), POINTER         :: bs_env
       TYPE(qs_environment_type), POINTER                 :: qs_env
-      COMPLEX(KIND=dp), ALLOCATABLE, INTENT(OUT)         :: K(:, :, :)
+      TYPE(gwkp_type), INTENT(INOUT)                     :: gwkp_env
 
       CHARACTER(LEN=*), PARAMETER :: routineN = 'compute_metric_coulomb_factor'
 
-      COMPLEX(KIND=dp), ALLOCATABLE                      :: M_inv(:, :), M_ref(:, :, :), U_Pp(:, :), &
-                                                            V_ref(:, :, :), V_sqrt(:, :)
+      COMPLEX(KIND=dp), ALLOCATABLE :: charge(:), charge_hat(:), M_inv(:, :), M_ref(:, :, :), &
+         M_zero(:, :), U_Pp(:, :), V_ref(:, :, :), V_sqrt(:, :), X0(:, :), X_coef(:, :)
       INTEGER                                            :: handle, ikp, ilocal, n_ref, n_RI, nkp, &
                                                             nkp_local
       INTEGER, ALLOCATABLE                               :: metric_cells(:, :)
@@ -1313,7 +1325,7 @@ CONTAINS
       nkp_local = COUNT([(MODULO(ikp, bs_env%para_env%num_pe) == &
                           bs_env%para_env%mepos, ikp=1, nkp)])
       ALLOCATE (M_ref(n_ref, n_ref, nkp_local), V_ref(n_ref, n_ref, nkp_local), source=z_zero)
-      ALLOCATE (K(n_RI, n_RI, nkp_local), M_inv(n_RI, n_RI), V_sqrt(n_RI, n_RI))
+      ALLOCATE (gwkp_env%metric_coulomb_factor(n_RI, n_RI, nkp_local), M_inv(n_RI, n_RI), V_sqrt(n_RI, n_RI))
       ! The full Ewald Coulomb matrix is finite on the shifted 2D/3D q mesh. No
       ! G=0 auxiliary channel is removed at each transfer point.
       CALL build_2c_coulomb_matrix_kp_ewald(V_ref, qs_env, bs_env%kpoints_chi_eps_W, &
@@ -1322,9 +1334,30 @@ CONTAINS
                                0.0_dp, bs_env, qs_env, reference_basis=bs_env%auto_ri%enabled)
       CALL ri_2c_lattice_to_owned_q(fm_metric, metric_cells, &
                                     bs_env%kpoints_chi_eps_W%xkp(1:3, 1:nkp), M_ref)
+      ALLOCATE (M_zero(n_ref, n_ref), charge(n_ref), charge_hat(n_RI))
+      CALL ri_2c_lattice_to_kp(fm_metric, metric_cells, [0.0_dp, 0.0_dp, 0.0_dp], M_zero)
+      CALL gamma_auxiliary_charges(qs_env, charge)
       CALL cp_fm_release(fm_metric)
       DEALLOCATE (metric_cells)
       IF (bs_env%auto_ri%enabled) CALL assemble_AA_contraction(bs_env, U_Pp)
+      IF (bs_env%auto_ri%enabled) THEN
+         M_inv(:, :) = MATMUL(CONJG(TRANSPOSE(U_Pp)), MATMUL(M_zero, U_Pp))
+         charge_hat(:) = MATMUL(CONJG(TRANSPOSE(U_Pp)), charge)
+      ELSE
+         M_inv(:, :) = M_zero
+         charge_hat(:) = charge
+      END IF
+      DEALLOCATE (M_zero, charge)
+      charge_hat(:) = charge_hat/SQRT(REAL(DOT_PRODUCT(charge_hat, charge_hat), dp))
+      CALL local_complex_power(M_inv, -1.0_dp, 0.0_dp, relative_eps=bs_env%regularization_RI)
+      ! The pair densities enter χ as Z^H ρ = M d. Neutralise the fitted coefficients d, which are
+      ! continuous in q: X0 = Σ (Z(0)^H ρ) m* becomes M(0)^-1 X0 = Σ d m*, and M(q) M(0)^-1 X0 at q.
+      ! Carrying X0 itself to q would let M(q)^-1 amplify its O(q) mismatch in ill-conditioned metrics.
+      CALL compute_charge_leak_q0(bs_env, gwkp_env, MATMUL(M_inv, charge_hat), X0)
+      ALLOCATE (X_coef(n_RI, SIZE(X0, 2)))
+      X_coef(:, :) = MATMUL(M_inv, X0)
+      DEALLOCATE (X0)
+      ALLOCATE (gwkp_env%leak_e(n_RI, nkp_local), gwkp_env%leak_x(n_RI, SIZE(X_coef, 2), nkp_local))
       DO ilocal = 1, nkp_local
          IF (bs_env%auto_ri%enabled) THEN
             M_inv(:, :) = MATMUL(CONJG(TRANSPOSE(U_Pp)), MATMUL(M_ref(:, :, ilocal), U_Pp))
@@ -1333,16 +1366,106 @@ CONTAINS
             M_inv(:, :) = M_ref(:, :, ilocal)
             V_sqrt(:, :) = V_ref(:, :, ilocal)
          END IF
+         gwkp_env%leak_e(:, ilocal) = MATMUL(M_inv, charge_hat)
+         gwkp_env%leak_x(:, :, ilocal) = MATMUL(M_inv, X_coef)
          CALL local_complex_power(M_inv, -1.0_dp, 0.0_dp, relative_eps=bs_env%regularization_RI)
          CALL local_complex_power(V_sqrt, 0.5_dp, 0.0_dp)
-         K(:, :, ilocal) = MATMUL(M_inv, V_sqrt)
+         gwkp_env%metric_coulomb_factor(:, :, ilocal) = MATMUL(M_inv, V_sqrt)
       END DO
-      DEALLOCATE (M_ref, V_ref, M_inv, V_sqrt)
+      DEALLOCATE (M_ref, V_ref, M_inv, V_sqrt, charge_hat, X_coef)
       IF (ALLOCATED(U_Pp)) DEALLOCATE (U_Pp)
 
       CALL timestop(handle)
 
    END SUBROUTINE compute_metric_coulomb_factor
+
+! **************************************************************************************************
+!> \brief Spurious charge of the fitted q = 0 occupied-virtual pair densities.
+!> The RI fit gives ρ_ia = ψ_ik* ψ_ak (exactly neutral) the charge m_ia(k) = Σ_l g_l* ψ_ik(r_l) ψ_ak(r_l)*
+!> with g = Z(0) v0. With the time dependence and cosine transform of compute_chi,
+!> L0(iω) = (s/N_k) Σ_k,ia |m_ia|² w_ia(iω) and X0(iω) = Z(0)^H T(iω), T_l = (s/N_k) Σ_k,ia ψ_i ψ_a* m_ia* w_ia.
+!> \param bs_env ...
+!> \param gwkp_env ...
+!> \param v0 M(0)^-1 c/|c|
+!> \param X0 X(iω) in the projection space Z(0)^H ρ
+! **************************************************************************************************
+   SUBROUTINE compute_charge_leak_q0(bs_env, gwkp_env, v0, X0)
+      TYPE(post_scf_bandstructure_type), POINTER         :: bs_env
+      TYPE(gwkp_type), INTENT(INOUT)                     :: gwkp_env
+      COMPLEX(KIND=dp), INTENT(IN)                       :: v0(:)
+      COMPLEX(KIND=dp), ALLOCATABLE, INTENT(OUT)         :: X0(:, :)
+
+      CHARACTER(LEN=*), PARAMETER :: routineN = 'compute_charge_leak_q0'
+
+      COMPLEX(KIND=dp), ALLOCATABLE                      :: cross(:, :), g0(:), m(:, :), psi(:, :), &
+                                                            T_tau(:, :), work(:, :), X_tau(:, :), &
+                                                            Y(:, :)
+      INTEGER                                            :: a, handle, i, ikp, ispin, j_w, n_ao, &
+                                                            n_grid, n_occ, n_t, n_vir, nkp, &
+                                                            num_pe, t
+      REAL(KIND=dp)                                      :: prefactor, x
+      REAL(KIND=dp), ALLOCATABLE                         :: L_tau(:)
+
+      CALL timeset(routineN, handle)
+
+      n_grid = bs_env%ri_rs%n_grid_points
+      n_ao = SIZE(gwkp_env%psi_lm_k, 2)
+      nkp = bs_env%nkp_scf_desymm
+      n_t = bs_env%num_time_freq_points
+      num_pe = bs_env%para_env%num_pe
+      ALLOCATE (g0(n_grid), psi(n_grid, n_ao), work(n_grid, n_ao), T_tau(n_grid, n_t), L_tau(n_t))
+      g0(:) = MATMUL(gwkp_env%Z_lP_zero(:, 2:, 1), v0)
+      T_tau(:, :) = z_zero
+      L_tau(:) = 0.0_dp
+      DO ispin = 1, bs_env%n_spin
+         n_occ = bs_env%n_occ(ispin)
+         n_vir = n_ao - n_occ
+         IF (n_occ == 0 .OR. n_vir == 0) CYCLE
+         ALLOCATE (m(n_occ, n_vir), cross(n_occ, n_vir), Y(n_grid, n_occ))
+         DO ikp = 1, nkp
+            IF (MODULO(ikp - 1, num_pe) /= bs_env%para_env%mepos) CYCLE
+            psi(:, :) = gwkp_env%psi_lm_k(:, :, (ikp - 1)/num_pe + 1, ispin)
+            DO i = 1, n_occ
+               work(:, i) = CONJG(g0)*psi(:, i)
+            END DO
+            m(:, :) = MATMUL(TRANSPOSE(work(:, 1:n_occ)), CONJG(psi(:, n_occ + 1:n_ao)))
+            DO t = 1, n_t
+               cross(:, :) = z_zero
+               DO a = 1, n_vir
+                  DO i = 1, n_occ
+                     x = bs_env%time_frequency_grid%imaginary_time(t)* &
+                         (gwkp_env%eigenvalues_G(n_occ + a, ikp, ispin) - gwkp_env%eigenvalues_G(i, ikp, ispin))
+                     IF (x < 700.0_dp) THEN
+                        cross(i, a) = CONJG(m(i, a))*EXP(-x)
+                        L_tau(t) = L_tau(t) + ABS(m(i, a))**2*EXP(-x)
+                     END IF
+                  END DO
+               END DO
+               Y(:, :) = MATMUL(CONJG(psi(:, n_occ + 1:n_ao)), TRANSPOSE(cross))
+               T_tau(:, t) = T_tau(:, t) + SUM(psi(:, 1:n_occ)*Y, DIM=2)
+            END DO
+         END DO
+         DEALLOCATE (m, cross, Y)
+      END DO
+      CALL bs_env%para_env%sum(T_tau)
+      CALL bs_env%para_env%sum(L_tau)
+      prefactor = bs_env%spin_degeneracy/REAL(nkp, dp)
+      ALLOCATE (X_tau(bs_env%n_RI, n_t))
+      X_tau(:, :) = prefactor*MATMUL(CONJG(TRANSPOSE(gwkp_env%Z_lP_zero(:, 2:, 1))), T_tau)
+      ALLOCATE (X0(bs_env%n_RI, n_t), SOURCE=z_zero)
+      ALLOCATE (gwkp_env%leak_l0(n_t), SOURCE=0.0_dp)
+      DO t = 1, n_t
+         DO j_w = 1, n_t
+            X0(:, j_w) = X0(:, j_w) + bs_env%time_frequency_grid%cosine_time_to_frequency(j_w, t)*X_tau(:, t)
+            gwkp_env%leak_l0(j_w) = gwkp_env%leak_l0(j_w) + &
+                                    bs_env%time_frequency_grid%cosine_time_to_frequency(j_w, t)*prefactor*L_tau(t)
+         END DO
+      END DO
+      DEALLOCATE (g0, psi, work, L_tau, T_tau, X_tau)
+
+      CALL timestop(handle)
+
+   END SUBROUTINE compute_charge_leak_q0
 
 ! **************************************************************************************************
 !> \brief Angular cubature over the cells adjacent to Gamma.
@@ -3171,8 +3294,7 @@ CONTAINS
       LOGICAL                                            :: active(SIZE(b, 2)), &
                                                             check_column(SIZE(b, 2))
       REAL(KIND=dp)                                      :: alpha, norm_b(SIZE(b, 2)), relative_r, &
-                                                            rr(SIZE(b, 2)), &
-                                                            rr_new(SIZE(b, 2))
+                                                            rr(SIZE(b, 2)), rr_new(SIZE(b, 2))
 
       CALL timeset('gamma_body_iterative_solve', handle)
 
