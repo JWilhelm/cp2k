@@ -65,9 +65,7 @@ MODULE qs_kpoint_operators
                                               rskp_transform_grid_extract,&
                                               rskp_transform_grid_prepare,&
                                               rskp_transform_grid_release
-   USE kpoint_types,                    ONLY: kpoint_create,&
-                                              kpoint_env_type,&
-                                              kpoint_release,&
+   USE kpoint_types,                    ONLY: kpoint_env_type,&
                                               kpoint_type
    USE mathconstants,                   ONLY: gaussi,&
                                               twopi,&
@@ -87,7 +85,6 @@ MODULE qs_kpoint_operators
    CHARACTER(len=*), PARAMETER, PRIVATE :: moduleN = 'qs_kpoint_operators'
 
    PUBLIC :: kpoint_operator_context_create, kpoint_operator_context_release
-   PUBLIC :: kpoint_operator_context_create_global
    PUBLIC :: kpoint_operator_start, kpoint_operator_finish
    PUBLIC :: kpoint_operator_get, kpoint_operator_prepare
    PUBLIC :: kpoint_operator_evaluate, kpoint_operator_work_size
@@ -176,7 +173,6 @@ MODULE qs_kpoint_operators
       ! second, so callers address operator rows through matrix_row instead.
       INTEGER                                            :: nspin = 0
       LOGICAL                                            :: overlap_stored = .FALSE.
-      LOGICAL                                            :: owns_kpoints = .FALSE.
       ! Borrowed host/distribution references; the context cannot span an energy evaluation.
       TYPE(kpoint_type), POINTER                          :: kpoints => NULL()
       TYPE(cp_fm_struct_type), POINTER                    :: ao_ao_fmstruct => NULL()
@@ -420,54 +416,6 @@ CONTAINS
    END SUBROUTINE kpoint_operator_context_create
 
 ! **************************************************************************************************
-!> \brief Prepare the existing operator service for arbitrary points on the global matrix layout.
-!>        The context owns only its k-point description; the source matrices and neighbor list
-!>        belong to the caller. Call prepare with an explicit global target before get.
-!> \param ctx operator context
-!> \param kpoints real-space cell mapping and neighbor list
-!> \param ao_ao_fm global matrix template
-!> \param xkp target reciprocal coordinates, including any band path
-!> \param nspin number of spin rows
-! **************************************************************************************************
-   SUBROUTINE kpoint_operator_context_create_global(ctx, kpoints, ao_ao_fm, xkp, nspin)
-      TYPE(kpoint_operator_context_type), INTENT(OUT)    :: ctx
-      TYPE(kpoint_type), POINTER                         :: kpoints
-      TYPE(cp_fm_type), INTENT(IN)                       :: ao_ao_fm
-      REAL(KIND=dp), INTENT(IN)                          :: xkp(:, :)
-      INTEGER, INTENT(IN)                                :: nspin
-
-      TYPE(kpoint_type), POINTER                         :: points
-      TYPE(mp_para_env_type), POINTER                    :: world
-
-      world => ao_ao_fm%matrix_struct%para_env
-      NULLIFY (points)
-      CALL kpoint_create(points)
-      points%nkp = SIZE(xkp, 2)
-      ALLOCATE (points%xkp(3, points%nkp), points%kp_dist(2, 1))
-      points%xkp = xkp
-      points%kp_range = [1, points%nkp]
-      points%kp_dist(:, 1) = points%kp_range
-      points%nkp_groups = 1
-      points%use_real_wfn = .FALSE.
-      points%nkp_grid = kpoints%nkp_grid
-      points%lattice_fft = kpoints%lattice_fft
-      points%sab_nl => kpoints%sab_nl
-      DEALLOCATE (points%cell_to_index, points%index_to_cell)
-      ALLOCATE (points%cell_to_index, SOURCE=kpoints%cell_to_index)
-      ALLOCATE (points%index_to_cell, SOURCE=kpoints%index_to_cell)
-      points%para_env => world
-      CALL points%para_env%retain()
-      points%para_env_kp => world
-      CALL points%para_env_kp%retain()
-      points%blacs_env_all => kpoints%blacs_env_all
-      CALL points%blacs_env_all%retain()
-      ALLOCATE (points%para_env_inter_kp)
-      CALL points%para_env_inter_kp%from_split(world, world%mepos)
-      CALL kpoint_operator_context_create(ctx, points, ao_ao_fm, nspin)
-      ctx%owns_kpoints = .TRUE.
-   END SUBROUTINE kpoint_operator_context_create_global
-
-! **************************************************************************************************
 !> \brief Release the context together with every buffer it created.
 !>        Call once, at the end of the fixed-layout scope that created the context.
 !>        Every started instance must be idle at this point. The call aborts
@@ -523,8 +471,6 @@ CONTAINS
       END IF
       IF (ALLOCATED(ctx%info)) DEALLOCATE (ctx%info)
       IF (ALLOCATED(ctx%status)) DEALLOCATE (ctx%status)
-      IF (ctx%owns_kpoints) CALL kpoint_release(ctx%kpoints)
-      ctx%owns_kpoints = .FALSE.
       NULLIFY (ctx%kpoints, ctx%ao_ao_fmstruct, ctx%group_fm_pool)
       ctx%overlap_stored = .FALSE.
 
@@ -637,8 +583,7 @@ CONTAINS
 
       INTEGER                                            :: compatible, handle, ispin, jslot, nrow, &
                                                             row
-      INTEGER(KIND=int_8)                                :: fft_bytes, retained, snapshot_bytes, &
-                                                            storage
+      INTEGER(KIND=int_8)                                :: retained, storage
       LOGICAL                                            :: ready
       TYPE(cp_fm_struct_type), POINTER                   :: fms
       TYPE(mp_para_env_type), POINTER                    :: para_env
@@ -670,12 +615,9 @@ CONTAINS
          CPASSERT(SIZE(rsmat, 1) == ctx%nspin)
       END IF
       para_env => ctx%kpoints%blacs_env_all%para_env
-      IF (PRESENT(TARGET)) THEN
-         fms => target%matrix_struct
-      ELSE
-         CALL kpoint_operator_ensure_group(ctx)
-         fms => ctx%fmlocal%matrix_struct
-      END IF
+      CALL kpoint_operator_ensure_group(ctx)
+      fms => ctx%fmlocal%matrix_struct
+      IF (PRESENT(TARGET)) fms => target%matrix_struct
       CPASSERT(ASSOCIATED(fms))
       ! Routing uses the host group-rank numbering. Different BLACS layouts
       ! on that communicator are supported, foreign communicators are not.
@@ -685,13 +627,9 @@ CONTAINS
          CALL timestop(handle)
          RETURN
       END IF
-      snapshot_bytes = rs_snapshot_bytes
-      ! Global post-SCF layouts may concentrate the real-space blocks on few FM ranks.
-      ! Share the existing FFT allowance with capture rather than falling back per k point.
-      IF (ctx%owns_kpoints) snapshot_bytes = snapshot_bytes + rs_fft_bytes
       IF (.NOT. ALLOCATED(ctx%rs_route)) THEN
          ALLOCATE (ctx%rs_route)
-         CALL kpoint_operator_rs_plan_create(ctx%kpoints, rsmat, fms, snapshot_bytes, ctx%rs_route, ready)
+         CALL kpoint_operator_rs_plan_create(ctx%kpoints, rsmat, fms, rs_snapshot_bytes, ctx%rs_route, ready)
          IF (.NOT. ready) THEN
             DEALLOCATE (ctx%rs_route)
             CALL timestop(handle)
@@ -710,9 +648,6 @@ CONTAINS
       retained = 0_int_8
       DO jslot = kpoint_slot_ks, kpoint_slot_t
          DO ispin = 1, ctx%nspin
-            IF (ctx%owns_kpoints .AND. ALLOCATED(ctx%rs_batch(ispin, jslot)%data)) THEN
-               retained = retained + 16_int_8*SIZE(ctx%rs_batch(ispin, jslot)%data, KIND=int_8)
-            END IF
             IF (.NOT. ALLOCATED(ctx%rs(ispin, jslot)%blocks)) CYCLE
             retained = retained + 128_int_8*SIZE(ctx%rs(ispin, jslot)%blocks, KIND=int_8)
             IF (ASSOCIATED(ctx%rs(ispin, jslot)%values)) THEN
@@ -724,16 +659,14 @@ CONTAINS
                 (MERGE(0_int_8, 8_int_8*ctx%rs_route%nvalue, para_env%num_pe == 1) + &
                  128_int_8*SIZE(ctx%rs_route%entry, 2))
       CALL para_env%max(storage)
-      ready = compatible == 1 .AND. storage <= snapshot_bytes
-      fft_bytes = rs_fft_bytes
-      IF (ctx%owns_kpoints) fft_bytes = MIN(fft_bytes, MAX(0_int_8, snapshot_bytes - storage))
+      ready = compatible == 1 .AND. storage <= rs_snapshot_bytes
       IF (ready) THEN
          DO ispin = 1, nrow
             row = ispin
             IF (PRESENT(matrix_row)) row = matrix_row
             CALL kpoint_operator_rs_capture(rsmat, row, ctx%rs_route, ctx%kpoints, ctx%rs(ispin, slot))
             CALL kpoint_operator_fft_prepare(ctx%rs(ispin, slot), ctx%rs_route, ctx%kpoints, &
-                                             ctx%rs_batch(ispin, slot), fft_bytes/INT(ctx%nspin*kpoint_num_slots, int_8))
+                                             ctx%rs_batch(ispin, slot), rs_fft_bytes/INT(ctx%nspin*kpoint_num_slots, int_8))
          END DO
       END IF
       IF (PRESENT(prepared)) prepared = ready

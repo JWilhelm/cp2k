@@ -28,7 +28,8 @@ MODULE gw_utils
    USE cp_blacs_env,                    ONLY: cp_blacs_env_create,&
                                               cp_blacs_env_release,&
                                               cp_blacs_env_type
-   USE cp_cfm_types,                    ONLY: cp_cfm_create,&
+   USE cp_cfm_types,                    ONLY: cp_cfm_copy_general,&
+                                              cp_cfm_create,&
                                               cp_cfm_release,&
                                               cp_cfm_to_cfm,&
                                               cp_cfm_to_fm,&
@@ -85,8 +86,8 @@ MODULE gw_utils
                                               dp,&
                                               int_8
    USE kpoint_k_r_trafo_simple,         ONLY: rs_to_kp
-   USE kpoint_types,                    ONLY: get_kpoint_info,&
-                                              kpoint_create,&
+   USE kpoint_types,                    ONLY: kpoint_create,&
+                                              kpoint_release,&
                                               kpoint_type
    USE libint_wrapper,                  ONLY: cp_libint_static_cleanup,&
                                               cp_libint_static_init
@@ -105,8 +106,8 @@ MODULE gw_utils
    USE physcon,                         ONLY: angstrom,&
                                               evolt
    USE post_scf_bandstructure_types,    ONLY: post_scf_bandstructure_type
-   USE post_scf_bandstructure_utils,    ONLY: gw_flavour_label,&
-                                              rsmat_to_kp
+   USE post_scf_bandstructure_utils,    ONLY: create_operator_kpoints,&
+                                              gw_flavour_label
    USE qs_energy_types,                 ONLY: qs_energy_type
    USE qs_environment_types,            ONLY: get_qs_env,&
                                               qs_env_part_release,&
@@ -115,14 +116,13 @@ MODULE gw_utils
    USE qs_interactions,                 ONLY: init_interaction_radii_orb_basis
    USE qs_kind_types,                   ONLY: get_qs_kind,&
                                               qs_kind_type
-   USE qs_kpoint_operators,             ONLY: kpoint_operator_context_create_global,&
+   USE qs_kpoint_operators,             ONLY: kpoint_operator_context_create,&
                                               kpoint_operator_context_release,&
                                               kpoint_operator_context_type,&
                                               kpoint_operator_get,&
                                               kpoint_operator_prepare,&
                                               kpoint_slot_ks
    USE qs_ks_methods,                   ONLY: qs_ks_build_kohn_sham_matrix
-   USE qs_neighbor_list_types,          ONLY: neighbor_list_set_p_type
    USE qs_rho_methods,                  ONLY: qs_rho_update_rho
    USE qs_rho_types,                    ONLY: qs_rho_type
    USE qs_tensors,                      ONLY: build_3c_integrals,&
@@ -3269,24 +3269,18 @@ CONTAINS
       CHARACTER(LEN=*), PARAMETER :: routineN = 'trafo_V_xc_R_to_kp'
 
       INTEGER                                            :: handle, ikp, img, ispin, n_ao
-      INTEGER, DIMENSION(:, :, :), POINTER               :: cell_to_index_scf
-      LOGICAL                                            :: prepared
-      TYPE(cp_cfm_type)                                  :: cfm_mo_coeff, cfm_V_xc
+      TYPE(cp_cfm_type)                                  :: cfm_kp_group, cfm_mo_coeff, cfm_V_xc
       TYPE(cp_fm_type)                                   :: fm_V_xc_re
       TYPE(dbcsr_p_type), DIMENSION(:, :), POINTER       :: matrix_ks
       TYPE(kpoint_operator_context_type)                 :: operators
-      TYPE(kpoint_type), POINTER                         :: kpoints_scf
-      TYPE(neighbor_list_set_p_type), DIMENSION(:), &
-         POINTER                                         :: sab_nl
+      TYPE(kpoint_type), POINTER                         :: kpoints_bs
+      TYPE(mp_para_env_type), POINTER                    :: para_env
 
       CALL timeset(routineN, handle)
 
       n_ao = bs_env%n_ao
 
-      CALL get_qs_env(qs_env, matrix_ks_kp=matrix_ks, kpoints=kpoints_scf)
-
-      NULLIFY (sab_nl)
-      CALL get_kpoint_info(kpoints_scf, sab_nl=sab_nl, cell_to_index=cell_to_index_scf)
+      CALL get_qs_env(qs_env, para_env=para_env, matrix_ks_kp=matrix_ks)
 
       CALL cp_cfm_create(cfm_V_xc, bs_env%cfm_work_mo%matrix_struct)
       CALL cp_cfm_create(cfm_mo_coeff, bs_env%cfm_work_mo%matrix_struct)
@@ -3300,23 +3294,19 @@ CONTAINS
          END DO
       END DO
 
-      CALL kpoint_operator_context_create_global(operators, kpoints_scf, bs_env%fm_work_mo(1), &
-                                                 bs_env%kpoints_DOS%xkp, bs_env%n_spin)
-      CALL kpoint_operator_prepare(operators, matrix_ks, kpoint_slot_ks, prepared, &
-                                   TARGET=bs_env%fm_work_mo(1))
+      CALL create_operator_kpoints(qs_env, bs_env, kpoints_bs, cfm_kp_group)
+      CALL kpoint_operator_context_create(operators, kpoints_bs, bs_env%fm_work_mo(1), bs_env%n_spin)
+      CALL kpoint_operator_prepare(operators, matrix_ks, kpoint_slot_ks)
+
       ALLOCATE (bs_env%v_xc_n(n_ao, bs_env%nkp_bs_and_DOS, bs_env%n_spin))
 
       DO ispin = 1, bs_env%n_spin
          DO ikp = 1, bs_env%nkp_bs_and_DOS
 
             ! v^xc^R -> v^xc(k)  (matrix_ks stores v^xc^R, see SUBROUTINE compute_V_xc)
-            IF (prepared) THEN
-               CALL kpoint_operator_get(operators, ikp, ispin, matrix_ks, cmat=cfm_V_xc, &
-                                        matrix_row=ispin, slot=kpoint_slot_ks)
-            ELSE
-               CALL rsmat_to_kp(matrix_ks, ispin, bs_env%kpoints_DOS%xkp(1:3, ikp), &
-                                cell_to_index_scf, sab_nl, bs_env, cfm_V_xc)
-            END IF
+            CALL kpoint_operator_get(operators, ikp, ispin, matrix_ks, cmat=cfm_kp_group, &
+                                     matrix_row=ispin, slot=kpoint_slot_ks)
+            CALL cp_cfm_copy_general(cfm_kp_group, cfm_V_xc, para_env)
 
             ! get C_µn(k)
             CALL cp_cfm_to_cfm(bs_env%cfm_mo_coeff_kp(ikp, ispin), cfm_mo_coeff)
@@ -3333,6 +3323,8 @@ CONTAINS
       END DO
 
       CALL kpoint_operator_context_release(operators)
+      CALL cp_cfm_release(cfm_kp_group)
+      CALL kpoint_release(kpoints_bs)
 
       ! just rebuild the overwritten KS matrix again
       CALL build_periodic_ks_with_gapw_density(qs_env)

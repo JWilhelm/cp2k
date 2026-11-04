@@ -26,7 +26,8 @@ MODULE post_scf_bandstructure_utils
    USE cp_cfm_diag,                     ONLY: cp_cfm_geeig,&
                                               cp_cfm_geeig_canon,&
                                               cp_cfm_heevd
-   USE cp_cfm_types,                    ONLY: cp_cfm_create,&
+   USE cp_cfm_types,                    ONLY: cp_cfm_copy_general,&
+                                              cp_cfm_create,&
                                               cp_cfm_get_info,&
                                               cp_cfm_release,&
                                               cp_cfm_set_all,&
@@ -51,6 +52,8 @@ MODULE post_scf_bandstructure_utils
    USE cp_files,                        ONLY: close_file,&
                                               open_file
    USE cp_fm_diag,                      ONLY: cp_fm_geeig_canon
+   USE cp_fm_pool_types,                ONLY: cp_fm_pool_type,&
+                                              fm_pool_get_el_struct
    USE cp_fm_struct,                    ONLY: cp_fm_struct_create,&
                                               cp_fm_struct_release,&
                                               cp_fm_struct_type
@@ -65,8 +68,8 @@ MODULE post_scf_bandstructure_utils
    USE cp_log_handling,                 ONLY: cp_logger_get_default_io_unit,&
                                               cp_to_string
    USE cp_parser_methods,               ONLY: read_float_object
-   USE dft_plus_u,                      ONLY: apply_orbital_potential => lowdin_kp_apply,&
-                                              prepare_orbital_projectors => lowdin_kp_prepare
+   USE dft_plus_u,                      ONLY: lowdin_kp_apply,&
+                                              lowdin_kp_prepare
    USE input_constants,                 ONLY: &
         G0W0, bse_fulldiag, cohsex_off, evGW0, int_ldos_z, ri_rs_large_cell_Gamma, &
         ri_rs_non_periodic, ri_rs_small_cell_full_kp, smear_fermi_dirac, smear_gaussian, smear_mp, &
@@ -79,11 +82,14 @@ MODULE post_scf_bandstructure_utils
                                               dp,&
                                               max_line_length
    USE kpoint_k_r_trafo_simple,         ONLY: fm_gamma_to_kp
-   USE kpoint_methods,                  ONLY: kpoint_init_cell_index,&
+   USE kpoint_methods,                  ONLY: kpoint_env_initialize,&
+                                              kpoint_init_cell_index,&
+                                              kpoint_initialize_mos,&
                                               rskp_transform
    USE kpoint_types,                    ONLY: get_kpoint_info,&
                                               kpoint_create,&
                                               kpoint_env_type,&
+                                              kpoint_release,&
                                               kpoint_type
    USE machine,                         ONLY: m_walltime
    USE mathconstants,                   ONLY: gaussi,&
@@ -106,9 +112,10 @@ MODULE post_scf_bandstructure_utils
    USE pw_types,                        ONLY: pw_c1d_gs_type,&
                                               pw_r3d_rs_type
    USE qs_collocate_density,            ONLY: calculate_rho_elec
+   USE qs_band_structure,               ONLY: calculate_kpoints_for_bs
    USE qs_environment_types,            ONLY: get_qs_env,&
                                               qs_environment_type
-   USE qs_kpoint_operators,             ONLY: kpoint_operator_context_create_global,&
+   USE qs_kpoint_operators,             ONLY: kpoint_operator_context_create,&
                                               kpoint_operator_context_release,&
                                               kpoint_operator_context_type,&
                                               kpoint_operator_get,&
@@ -116,6 +123,7 @@ MODULE post_scf_bandstructure_utils
                                               kpoint_slot_ks,&
                                               kpoint_slot_s
    USE qs_ks_types,                     ONLY: qs_ks_env_type
+   USE qs_matrix_pools,                 ONLY: mpools_get
    USE qs_mo_types,                     ONLY: get_mo_set,&
                                               mo_set_type
    USE qs_neighbor_list_types,          ONLY: neighbor_list_set_p_type
@@ -141,8 +149,8 @@ MODULE post_scf_bandstructure_utils
    PUBLIC :: create_and_init_bs_env, &
              eval_bandstructure_properties, cfm_ikp_from_fm_Gamma, &
              MIC_contribution_from_ikp, compute_xkp, kpoint_init_cell_index_simple, &
-             rsmat_to_kp, soc, get_VBM_CBM_bandgaps, get_all_VBM_CBM_bandgaps, &
-             diagonalize_ks_matrix, gw_flavour_label
+             rsmat_to_kp, create_operator_kpoints, soc, get_VBM_CBM_bandgaps, &
+             get_all_VBM_CBM_bandgaps, diagonalize_ks_matrix, gw_flavour_label
 
    CHARACTER(len=*), PARAMETER, PRIVATE :: moduleN = 'post_scf_bandstructure_utils'
 
@@ -715,30 +723,31 @@ CONTAINS
 
       INTEGER                                            :: handle, ikp, ispin, nkp_bs_and_DOS, &
                                                             nmo_retained
-      INTEGER, POINTER                                   :: cell_to_index_scf(:, :, :)
-      LOGICAL                                            :: prepared_ks, prepared_s
       REAL(KIND=dp)                                      :: CBM, VBM
-      REAL(KIND=dp), DIMENSION(3)                        :: xkp
-      TYPE(cp_cfm_type)                                  :: cfm_ks, cfm_mos, cfm_s
+      TYPE(cp_cfm_type)                                  :: cfm_kp_group, cfm_ks, cfm_mos, cfm_s
       TYPE(dbcsr_p_type), DIMENSION(:, :), POINTER       :: matrix_ks, matrix_s
-      TYPE(kpoint_env_type), POINTER                     :: orbital_potential_work
+      TYPE(kpoint_env_type), POINTER                     :: lowdin_kp
       TYPE(kpoint_operator_context_type)                 :: operators
-      TYPE(kpoint_type), POINTER                         :: kpoints_scf
-      TYPE(neighbor_list_set_p_type), DIMENSION(:), &
-         POINTER                                         :: sab_nl
+      TYPE(kpoint_type), POINTER                         :: kpoints_bs, kpoints_scf
+      TYPE(mp_para_env_type), POINTER                    :: para_env
 
       CALL timeset(routineN, handle)
 
       CALL get_qs_env(qs_env, &
+                      para_env=para_env, &
                       matrix_ks_kp=matrix_ks, &
                       matrix_s_kp=matrix_s, &
                       kpoints=kpoints_scf)
 
-      NULLIFY (sab_nl, orbital_potential_work)
+      NULLIFY (lowdin_kp)
       IF (ALLOCATED(kpoints_scf%lowdin_v)) THEN
-         IF (ANY(kpoints_scf%lowdin_v /= 0.0_dp)) ALLOCATE (orbital_potential_work)
+         IF (ANY(kpoints_scf%lowdin_v /= 0.0_dp)) ALLOCATE (lowdin_kp)
       END IF
-      CALL get_kpoint_info(kpoints_scf, sab_nl=sab_nl, cell_to_index=cell_to_index_scf)
+
+      CALL create_operator_kpoints(qs_env, bs_env, kpoints_bs, cfm_kp_group)
+      CALL kpoint_operator_context_create(operators, kpoints_bs, bs_env%fm_work_mo(1), bs_env%n_spin)
+      CALL kpoint_operator_prepare(operators, matrix_s, kpoint_slot_s, matrix_row=1)
+      CALL kpoint_operator_prepare(operators, matrix_ks, kpoint_slot_ks)
 
       CALL cp_cfm_create(cfm_ks, bs_env%cfm_work_mo%matrix_struct)
       CALL cp_cfm_create(cfm_s, bs_env%cfm_work_mo%matrix_struct)
@@ -755,76 +764,109 @@ CONTAINS
          CALL cp_cfm_create(bs_env%cfm_mo_coeff_kp(ikp, ispin), bs_env%cfm_work_mo%matrix_struct)
          CALL cp_cfm_create(bs_env%cfm_ks_kp(ikp, ispin), bs_env%cfm_work_mo%matrix_struct)
       END DO
-
       CALL cp_cfm_create(bs_env%cfm_s_kp(ikp), bs_env%cfm_work_mo%matrix_struct)
       END DO
 
-      CALL kpoint_operator_context_create_global(operators, kpoints_scf, bs_env%fm_work_mo(1), &
-                                                 bs_env%kpoints_DOS%xkp, bs_env%n_spin)
-      CALL kpoint_operator_prepare(operators, matrix_s, kpoint_slot_s, prepared_s, &
-                                   matrix_row=1, TARGET=bs_env%fm_work_mo(1))
-      CALL kpoint_operator_prepare(operators, matrix_ks, kpoint_slot_ks, prepared_ks, &
-                                   TARGET=bs_env%fm_work_mo(1))
       DO ikp = 1, nkp_bs_and_DOS
-         xkp(:) = bs_env%kpoints_DOS%xkp(:, ikp)
-         ! The overlap and orbital-potential projectors are common to both spin channels.
-         IF (prepared_s) THEN
-            CALL kpoint_operator_get(operators, ikp, 1, matrix_s, cmat=cfm_s, &
-                                     matrix_row=1, slot=kpoint_slot_s)
-         ELSE
-            CALL rsmat_to_kp(matrix_s, 1, xkp, cell_to_index_scf, sab_nl, bs_env, cfm_s)
-         END IF
+
+         ! S(k) and its Lowdin projectors are shared by both spin channels.
+         CALL kpoint_operator_get(operators, ikp, 1, matrix_s, cmat=cfm_kp_group, matrix_row=1, slot=kpoint_slot_s)
+         CALL cp_cfm_copy_general(cfm_kp_group, cfm_s, para_env)
          CALL cp_cfm_to_cfm(cfm_s, bs_env%cfm_s_kp(ikp))
-         IF (ASSOCIATED(orbital_potential_work)) THEN
-            CALL prepare_orbital_projectors(orbital_potential_work, kpoints_scf%lowdin_orbitals, .FALSE., cfm_s)
+         IF (ASSOCIATED(lowdin_kp)) THEN
+            CALL lowdin_kp_prepare(lowdin_kp, kpoints_scf%lowdin_orbitals, .FALSE., cfm_s)
          END IF
          DO ispin = 1, bs_env%n_spin
-            ! H^KS(R) -> H^KS(k)
-            IF (prepared_ks) THEN
-               CALL kpoint_operator_get(operators, ikp, ispin, matrix_ks, cmat=cfm_ks, &
-                                        matrix_row=ispin, slot=kpoint_slot_ks)
-            ELSE
-               CALL rsmat_to_kp(matrix_ks, ispin, xkp, cell_to_index_scf, sab_nl, bs_env, cfm_ks)
+            ! h^KS^R -> h^KS(k)
+            CALL kpoint_operator_get(operators, ikp, ispin, matrix_ks, cmat=cfm_kp_group, &
+                                     matrix_row=ispin, slot=kpoint_slot_ks)
+            CALL cp_cfm_copy_general(cfm_kp_group, cfm_ks, para_env)
+            IF (ASSOCIATED(lowdin_kp)) THEN
+               CALL lowdin_kp_apply(lowdin_kp, kpoints_scf%lowdin_v(:, ispin), cmat=cfm_ks)
             END IF
-            IF (ASSOCIATED(orbital_potential_work)) THEN
-               CALL apply_orbital_potential(orbital_potential_work, kpoints_scf%lowdin_v(:, ispin), cmat=cfm_ks)
-            END IF
+
+            ! we store the complex KS matrix as fm matrix because the infrastructure for fm is
+            ! much nicer compared to cfm
             CALL cp_cfm_to_cfm(cfm_ks, bs_env%cfm_ks_kp(ikp, ispin))
-            ! The generalized eigensolver overwrites its overlap work matrix.
             CALL cp_cfm_to_cfm(bs_env%cfm_s_kp(ikp), cfm_s)
-            ! Diagonalize KS-matrix via Roothaan-Hall equation:
+
+            ! Diagonalize KS-matrix via Rothaan-Hall equation:
             ! H^KS(k) C(k) = S(k) C(k) ε(k)
             CALL cp_cfm_geeig_canon(cfm_ks, cfm_s, cfm_mos, &
                                     bs_env%eigenval_scf(:, ikp, ispin), &
                                     bs_env%cfm_work_mo, bs_env%eps_eigval_mat_s, &
                                     nmo_retained=nmo_retained)
             bs_env%n_mo_retained = MIN(bs_env%n_mo_retained, nmo_retained)
+
+            ! we store the complex MO coeff as fm matrix because the infrastructure for fm is
+            ! much nicer compared to cfm
             CALL cp_cfm_to_cfm(cfm_mos, bs_env%cfm_mo_coeff_kp(ikp, ispin))
+
          END DO
       END DO
 
       DO ispin = 1, bs_env%n_spin
          VBM = MAXVAL(bs_env%eigenval_scf(bs_env%n_occ(ispin), :, ispin))
          CBM = MINVAL(bs_env%eigenval_scf(bs_env%n_occ(ispin) + 1, :, ispin))
+
          bs_env%e_fermi(ispin) = 0.5_dp*(VBM + CBM)
+
       END DO
 
       CALL get_VBM_CBM_bandgaps(bs_env%band_edges_scf, bs_env%eigenval_scf, bs_env)
 
       CALL kpoint_operator_context_release(operators)
+      CALL cp_cfm_release(cfm_kp_group)
+      CALL kpoint_release(kpoints_bs)
       CALL cp_cfm_release(cfm_ks)
       CALL cp_cfm_release(cfm_s)
       CALL cp_cfm_release(cfm_mos)
-      IF (ASSOCIATED(orbital_potential_work)) THEN
-         CALL cp_cfm_release(orbital_potential_work%lowdin_cb)
-         CALL cp_cfm_release(orbital_potential_work%lowdin_cwork)
-         CALL orbital_potential_work%lowdin_gemm%destroy()
-         DEALLOCATE (orbital_potential_work)
+      IF (ASSOCIATED(lowdin_kp)) THEN
+         CALL cp_cfm_release(lowdin_kp%lowdin_cb)
+         CALL cp_cfm_release(lowdin_kp%lowdin_cwork)
+         CALL lowdin_kp%lowdin_gemm%destroy()
+         DEALLOCATE (lowdin_kp)
       END IF
 
       CALL timestop(handle)
 
    END SUBROUTINE compute_cfm_mo_coeff_kp_and_eigenval_scf_kp
+
+! **************************************************************************************************
+!> \brief Set up the bandstructure and DOS k-points as one k-point group spanning all ranks, as
+!>        calculate_kp_orbitals does, so that the k-point operators evaluate H(k) and S(k) there
+!> \param qs_env ...
+!> \param bs_env ...
+!> \param kpoints k-points of bs_env%kpoints_DOS, to be released by the caller
+!> \param cfm_kp_group work matrix on the layout of the k-point group
+! **************************************************************************************************
+   SUBROUTINE create_operator_kpoints(qs_env, bs_env, kpoints, cfm_kp_group)
+      TYPE(qs_environment_type), POINTER                 :: qs_env
+      TYPE(post_scf_bandstructure_type), POINTER         :: bs_env
+      TYPE(kpoint_type), POINTER                         :: kpoints
+      TYPE(cp_cfm_type), INTENT(OUT)                     :: cfm_kp_group
+
+      TYPE(cp_blacs_env_type), POINTER                   :: blacs_env
+      TYPE(cp_fm_pool_type), POINTER                     :: ao_ao_fm_pool
+      TYPE(dft_control_type), POINTER                    :: dft_control
+      TYPE(mo_set_type), DIMENSION(:), POINTER           :: mos
+      TYPE(mp_para_env_type), POINTER                    :: para_env
+      TYPE(neighbor_list_set_p_type), DIMENSION(:), &
+         POINTER                                         :: sab_kp
+
+      CALL get_qs_env(qs_env, para_env=para_env, blacs_env=blacs_env, mos=mos, &
+                      sab_kp=sab_kp, dft_control=dft_control)
+
+      NULLIFY (kpoints)
+      CALL calculate_kpoints_for_bs(kpoints, "GENERAL", group_size_ext=0, kpgeneral=bs_env%kpoints_DOS%xkp)
+      CALL kpoint_env_initialize(kpoints, para_env, blacs_env)
+      CALL kpoint_initialize_mos(kpoints, mos)
+      CALL kpoint_init_cell_index(kpoints, sab_kp, para_env, dft_control%nimages)
+
+      CALL mpools_get(kpoints%mpools, ao_ao_fm_pool=ao_ao_fm_pool)
+      CALL cp_cfm_create(cfm_kp_group, fm_pool_get_el_struct(ao_ao_fm_pool))
+
+   END SUBROUTINE create_operator_kpoints
 
 ! **************************************************************************************************
 !> \brief ...
